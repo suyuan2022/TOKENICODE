@@ -43,3 +43,8 @@ package-lock.json
 
 # Obsidian
 .obsidian/
+
+# Trellis workflow (local-only, not shared)
+.claude/
+.trellis/
+AGENTS.md
