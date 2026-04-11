@@ -49,5 +49,5 @@ package-lock.json
 .trellis/
 AGENTS.md
 
-# Test run reports (large JSON, local only)
-.test/runs/
+# Test infrastructure (local-only, not shared)
+.test/
