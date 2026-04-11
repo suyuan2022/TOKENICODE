@@ -88,6 +88,7 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
           text-xs text-text-muted hover:text-text-primary
           hover:bg-bg-secondary transition-smooth
           disabled:opacity-40 disabled:cursor-not-allowed"
+        {...(import.meta.env.DEV && { 'data-testid': 'model-selector' })}
       >
         <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
           stroke="currentColor" strokeWidth="1.5" className="flex-shrink-0">
@@ -137,6 +138,7 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
                     ? 'text-accent bg-accent/5'
                     : 'text-text-muted hover:text-text-primary hover:bg-bg-secondary'
                   }`}
+                {...(import.meta.env.DEV && { 'data-testid': `model-option-${option.id}` })}
               >
                 <div className="min-w-0">
                   <div className={`font-medium truncate ${option.mapped ? 'font-mono' : ''}`}>{option.label}</div>

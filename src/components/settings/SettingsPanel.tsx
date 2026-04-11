@@ -66,6 +66,7 @@ export function SettingsPanel() {
     <div
       className="fixed inset-0 z-[9999] flex items-center justify-center"
       onMouseDown={(e) => { if (e.target === e.currentTarget) toggleSettings(); }}
+      {...(import.meta.env.DEV && { 'data-testid': 'settings-panel' })}
     >
       {/* Backdrop */}
       <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" />
@@ -83,7 +84,8 @@ export function SettingsPanel() {
           </h2>
           <button onClick={toggleSettings}
             className="p-1.5 rounded-lg hover:bg-bg-tertiary
-              text-text-tertiary transition-smooth">
+              text-text-tertiary transition-smooth"
+            {...(import.meta.env.DEV && { 'data-testid': 'settings-close-button' })}>
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
               stroke="currentColor" strokeWidth="1.5">
               <path d="M4 4l8 8M12 4l-8 8" />
@@ -105,6 +107,7 @@ export function SettingsPanel() {
                     ? 'bg-accent/10 text-accent'
                     : 'text-text-muted hover:bg-bg-secondary hover:text-text-primary'
                   }`}
+                {...(import.meta.env.DEV && { 'data-testid': `settings-tab-${tab.id}` })}
               >
                 <span className="flex-shrink-0 opacity-70">{TAB_ICONS[tab.id]}</span>
                 {t(tab.labelKey)}

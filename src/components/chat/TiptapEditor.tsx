@@ -194,6 +194,12 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
       });
     }, [editor, placeholder]);
 
+    // Expose editor instance to window for test harness (debug builds only).
+    // Allows execute_js to call: window.__tokenicode_editor.commands.insertContent('text')
+    if (import.meta.env.DEV && editor) {
+      (window as any).__tokenicode_editor = editor;
+    }
+
     useImperativeHandle(ref, () => ({
       getText() {
         return editorToPlainText(editor);
@@ -243,6 +249,7 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
         ref={wrapperRef}
         className={className}
         data-chat-input={props['data-chat-input'] ? '' : undefined}
+        {...(import.meta.env.DEV && { 'data-testid': 'chat-input-editor' })}
       >
         <EditorContent editor={editor} />
       </div>

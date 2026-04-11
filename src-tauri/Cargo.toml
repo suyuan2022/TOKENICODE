@@ -37,6 +37,10 @@ tar = "0.4"
 zip = "2"
 sha2 = "0.10"
 
+# Test harness transport (socket server for tokenicode-cli.mjs). Debug builds only.
+[target.'cfg(debug_assertions)'.dependencies]
+tauri-plugin-mcp = { git = "https://github.com/P3GLEG/tauri-plugin-mcp" }
+
 [dev-dependencies]
 tempfile = "3"
 

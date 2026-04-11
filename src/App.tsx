@@ -17,6 +17,7 @@ import { useSessionStore } from './stores/sessionStore';
 import { APP_NAME, IS_ALPHA } from './lib/edition';
 import { useAgentStore } from './stores/agentStore';
 import { bridge, onFileChange } from './lib/tauri-bridge';
+import { parseSessionMessages } from './lib/session-loader';
 import { useAutoUpdateCheck } from './hooks/useAutoUpdateCheck';
 import { useT } from './lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -149,6 +150,304 @@ function App() {
       }).then((fn) => { unlisten = fn; });
     });
     return () => { unlisten?.(); };
+  }, []);
+
+  // Initialize test harness plugin listeners (debug builds only).
+  // The Rust side is gated behind debug_assertions, so this is a no-op in release.
+  useEffect(() => {
+    let cleanup: (() => void) | null = null;
+    import('tauri-plugin-mcp').then(({ setupPluginListeners, cleanupPluginListeners }) => {
+      setupPluginListeners().catch(() => {});
+      cleanup = cleanupPluginListeners;
+    }).catch(() => {});
+    return () => { cleanup?.(); };
+  }, []);
+
+  // Expose test helpers and testid discovery for test harness (debug builds only).
+  // IMPORTANT: DOM click does NOT work on React components — use these helpers instead.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const TESTID_DESCRIPTIONS: Record<string, string> = {
+      'chat-input-editor': 'TipTap rich text editor — input via window.__tokenicode_test.type("text")',
+      'send-button': 'Submit message — use window.__tokenicode_test.send()',
+      'stop-button': 'Stop running CLI session — use window.__tokenicode_test.stop()',
+      'chat-messages': 'Message scroll container — read via __tokenicode_test.getMessages()',
+      'model-selector': 'Model dropdown (info only) — switch via __tokenicode_test.switchModel(id)',
+      'model-option-{id}': 'Model option (info only)',
+      'new-session-button': 'New session button — use __tokenicode_test.newSession()',
+      'current-session-card': 'Current session info card (info only)',
+      'session-item-{sessionId}': 'Session list item — switch via __tokenicode_test.switchSession(id)',
+      'permission-card': 'Permission request card — respond via __tokenicode_test.allowPermission() / denyPermission()',
+      'permission-allow-button': 'Approve permission — use __tokenicode_test.allowPermission()',
+      'permission-deny-button': 'Deny permission — use __tokenicode_test.denyPermission()',
+      'settings-button': 'Settings button (info only) — use __tokenicode_test.openSettings() / closeSettings()',
+      'settings-panel': 'Settings modal overlay (detect if open)',
+      'settings-close-button': 'Close settings — use __tokenicode_test.closeSettings()',
+      'settings-tab-{id}': 'Settings tab — switch via __tokenicode_test.switchSettingsTab(id)',
+      'provider-card-{id}': 'Provider card — activate via __tokenicode_test.switchProvider(id)',
+      'provider-inherit-button': 'Reset to system default — use __tokenicode_test.switchProvider(null)',
+    };
+    (window as any).__TOKENICODE_TESTIDS = TESTID_DESCRIPTIONS;
+
+    // Comprehensive test helper object
+    (window as any).__tokenicode_test = {
+      // --- Read state ---
+      getMessages(optsOrTabId?: string | { tabId?: string; last?: number; summary?: boolean }) {
+        const opts = typeof optsOrTabId === 'string' ? { tabId: optsOrTabId } : (optsOrTabId || {});
+        const id = opts.tabId || useSessionStore.getState().selectedSessionId;
+        if (!id) return { messages: [], total: 0 };
+        const tab = useChatStore.getState().tabs.get(id);
+        const all = tab?.messages || [];
+        const total = all.length;
+        const messages = opts.last != null ? all.slice(-opts.last) : all;
+        if (opts.summary) {
+          return {
+            messages: messages.map((m: any) => ({
+              id: m.id,
+              role: m.role,
+              type: m.type,
+              toolName: m.toolName || undefined,
+              content: m.type === 'tool_result'
+                ? `[tool_result: ${(m.content || '').slice(0, 80)}...]`
+                : m.type === 'thinking'
+                  ? '[thinking]'
+                  : (m.content || '').slice(0, 150),
+              subAgentDepth: m.subAgentDepth,
+              timestamp: m.timestamp,
+            })),
+            total,
+          };
+        }
+        return { messages, total };
+      },
+      getLastMessage(tabId?: string) {
+        const { messages } = (window as any).__tokenicode_test.getMessages({ tabId, last: 1 });
+        return messages[0] || null;
+      },
+      getActiveSessionId() {
+        return useSessionStore.getState().selectedSessionId;
+      },
+      getAllSessions() {
+        return useSessionStore.getState().sessions;
+      },
+      getCurrentModel() {
+        return useSettingsStore.getState().selectedModel;
+      },
+      getCurrentProvider() {
+        return useProviderStore.getState().activeProviderId;
+      },
+      isStreaming(tabId?: string) {
+        const id = tabId || useSessionStore.getState().selectedSessionId;
+        if (!id) return false;
+        const tab = useChatStore.getState().tabs.get(id);
+        if (!tab) return false;
+        return !!(tab.partialText || tab.activityStatus?.phase === 'thinking');
+      },
+      isSettingsOpen() {
+        return useSettingsStore.getState().settingsOpen;
+      },
+      status() {
+        const sessionId = useSessionStore.getState().selectedSessionId;
+        const tab = sessionId ? useChatStore.getState().tabs.get(sessionId) : null;
+        const phase = tab?.activityStatus?.phase;
+        // "active" covers all phases where the session is still doing something
+        const activePhases = new Set(['thinking', 'writing', 'tool', 'awaiting']);
+        const active = !!(tab?.partialText || (phase && activePhases.has(phase)));
+        return {
+          session: sessionId,
+          sessionCount: useSessionStore.getState().sessions.length,
+          model: useSettingsStore.getState().selectedModel,
+          provider: useProviderStore.getState().activeProviderId,
+          active,
+          phase: phase || null,
+          pendingPermission: !!(window as any).__tokenicode_respond_permission,
+          settingsOpen: useSettingsStore.getState().settingsOpen,
+          messageCount: tab?.messages?.length || 0,
+        };
+      },
+
+      // --- Input & Send ---
+      type(text: string) {
+        const editor = (window as any).__tokenicode_editor;
+        if (!editor) return { error: 'Editor not available (no active session)' };
+        editor.commands.clearContent();
+        editor.commands.insertContent(text);
+        return { typed: text };
+      },
+      send() {
+        const fn = (window as any).__tokenicode_send;
+        if (!fn) return { error: 'Send handler not available' };
+        fn();
+        return { sent: true };
+      },
+
+      // --- Session management ---
+      /** Full session load: saves current, switches, loads JSONL from disk, sets working directory. */
+      async loadSession(sessionId: string) {
+        const sessions = useSessionStore.getState().sessions;
+        const session = sessions.find((s: any) => s.id === sessionId);
+        if (!session) return { error: `Session ${sessionId} not found` };
+
+        const currentId = useSessionStore.getState().selectedSessionId;
+        // Save current to cache
+        if (currentId) {
+          useChatStore.getState().saveToCache(currentId);
+          useAgentStore.getState().saveToCache(currentId);
+        }
+        useFileStore.getState().closePreview();
+        useSessionStore.getState().setSelectedSession(sessionId);
+
+        // Try cache first
+        const restored = useChatStore.getState().restoreFromCache(sessionId);
+        if (restored) {
+          useAgentStore.getState().restoreFromCache(sessionId);
+          if (session.project) {
+            const dir = session.project.startsWith('/') ? session.project : session.projectDir || session.project;
+            useSettingsStore.getState().setWorkingDirectory(dir);
+          }
+          return { switchedTo: sessionId, restored: true, messageCount: useChatStore.getState().tabs.get(sessionId)?.messages?.length || 0 };
+        }
+
+        // Draft sessions (no JSONL file)
+        if (!session.path) {
+          useChatStore.getState().ensureTab(sessionId);
+          useChatStore.getState().resetTab(sessionId);
+          useAgentStore.getState().clearAgents();
+          return { switchedTo: sessionId, restored: false, messageCount: 0, note: 'draft session (no JSONL)' };
+        }
+
+        useChatStore.getState().ensureTab(sessionId);
+        const dir = session.project?.startsWith('/') ? session.project : session.projectDir || session.project || '';
+        useSettingsStore.getState().setWorkingDirectory(dir);
+        const { clearMessages, addMessage, setSessionStatus, setSessionMeta } = useChatStore.getState();
+        clearMessages(sessionId);
+        useAgentStore.getState().clearAgents();
+        setSessionStatus(sessionId, 'running');
+        setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+
+        try {
+          const rawMessages = await bridge.loadSession(session.path);
+          // Guard: if user switched away while loading, don't write stale data
+          if (useSessionStore.getState().selectedSessionId !== sessionId) {
+            return { switchedTo: sessionId, aborted: true, note: 'User switched away during load' };
+          }
+          const { messages, agents } = parseSessionMessages(rawMessages);
+          for (const agent of agents) {
+            useAgentStore.getState().upsertAgent(agent);
+          }
+          for (const msg of messages) {
+            if ((msg as any).toolResultContent) {
+              const { toolResultContent, ...baseMsg } = msg as any;
+              addMessage(sessionId, baseMsg);
+              useChatStore.getState().updateMessage(sessionId, msg.id, { toolResultContent });
+            } else {
+              addMessage(sessionId, msg);
+            }
+          }
+          setSessionStatus(sessionId, 'completed');
+          return { switchedTo: sessionId, restored: false, messageCount: messages.length };
+        } catch (err: any) {
+          if (useSessionStore.getState().selectedSessionId !== sessionId) {
+            return { switchedTo: sessionId, aborted: true, note: 'User switched away during load' };
+          }
+          setSessionStatus(sessionId, 'error');
+          return { switchedTo: sessionId, error: `Failed to load: ${err.message}` };
+        }
+      },
+      switchSession(sessionId: string) {
+        // Lightweight switch (cache only, no disk load). Use loadSession for full load.
+        const sessionState = useSessionStore.getState();
+        const currentId = sessionState.selectedSessionId;
+        if (currentId) {
+          useChatStore.getState().saveToCache(currentId);
+          useAgentStore.getState().saveToCache(currentId);
+        }
+        sessionState.setSelectedSession(sessionId);
+        const restored = useChatStore.getState().restoreFromCache(sessionId);
+        if (restored) {
+          useAgentStore.getState().restoreFromCache(sessionId);
+        }
+        useFileStore.getState().closePreview();
+        return { switchedTo: sessionId, restored };
+      },
+      newSession(cwd?: string) {
+        const currentTabId = useSessionStore.getState().selectedSessionId;
+        if (currentTabId) {
+          useChatStore.getState().saveToCache(currentTabId);
+          useAgentStore.getState().saveToCache(currentTabId);
+          // Clean up previous desk_ test session if it had no messages.
+          // Prevents tab map bloat when running hundreds of test iterations.
+          if (currentTabId.startsWith('desk_')) {
+            const tabState = useChatStore.getState().tabs.get(currentTabId);
+            if (!tabState || tabState.messages.length === 0) {
+              useSessionStore.getState().removeDraft(currentTabId);
+              useChatStore.getState().removeTab(currentTabId);
+            }
+          }
+        }
+        if (!cwd) {
+          // No cwd = original behavior (welcome page, no editor)
+          useSessionStore.getState().setSelectedSession(null);
+          useSettingsStore.getState().setWorkingDirectory('');
+          return { action: 'newSession' };
+        }
+        // With cwd = create a usable new session with editor
+        const newId = `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        useSessionStore.getState().setSelectedSession(newId);
+        useSettingsStore.getState().setWorkingDirectory(cwd);
+        useChatStore.getState().restoreFromCache(newId); // empty cache = clean tab
+        return { action: 'newSession', session: newId };
+      },
+
+      // --- Model & Provider ---
+      switchModel(modelId: string) {
+        useSettingsStore.getState().setSelectedModel(modelId);
+        return { model: modelId };
+      },
+      switchProvider(providerId: string | null) {
+        useProviderStore.getState().setActive(providerId);
+        return { provider: providerId };
+      },
+
+      // --- Settings panel ---
+      openSettings() {
+        useSettingsStore.setState({ settingsOpen: true });
+        return { settingsOpen: true };
+      },
+      closeSettings() {
+        useSettingsStore.setState({ settingsOpen: false });
+        return { settingsOpen: false };
+      },
+      switchSettingsTab(tabId: string) {
+        // Settings tabs are rendered by SettingsPanel component state.
+        // Click the tab button via data-testid.
+        const btn = document.querySelector(`[data-testid="settings-tab-${tabId}"]`);
+        if (btn) { (btn as HTMLElement).click(); return { tab: tabId }; }
+        return { error: `Tab ${tabId} not found` };
+      },
+
+      // --- Permission ---
+      allowPermission() {
+        const fn = (window as any).__tokenicode_respond_permission;
+        if (!fn) return { error: 'No pending permission request' };
+        fn(true);
+        return { allowed: true };
+      },
+      denyPermission() {
+        const fn = (window as any).__tokenicode_respond_permission;
+        if (!fn) return { error: 'No pending permission request' };
+        fn(false);
+        return { denied: true };
+      },
+
+      // --- Stop ---
+      stop() {
+        const btn = document.querySelector('[data-testid="stop-button"]') as HTMLElement;
+        if (!btn) return { stopped: false, reason: 'no running session' };
+        btn.click();
+        return { stopped: true };
+      },
+    };
   }, []);
 
   // TK-329: On app startup (incl. browser refresh), detect and kill orphaned backend processes.

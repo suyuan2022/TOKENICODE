@@ -691,7 +691,8 @@ export function InputBar() {
       useCommandStore.getState().clearPrefix();
     }
 
-    if (!text) return;
+    // Check if text is visually empty (strip invisible Unicode chars for the check only)
+    if (!text.replace(/[\u200B-\u200D\uFEFF\u00A0\u2060\u200E\u200F]/g, '').trim()) return;
 
     // Intercept immediate (built-in) commands even when submitted directly
     // (e.g. user types "/help" and presses Enter without using the popover)
@@ -876,18 +877,6 @@ export function InputBar() {
             // System message already inserted by ModelSelector — no duplicate here.
             // Keep sessionId so we attempt resume (preserving context).
             setSessionMeta(tabId, { stdinId: undefined, spawnedModel: undefined, modelSwitched: true, modelSwitchPendingText: text });
-            // Clean thinking blocks from history to avoid signature mismatch on resume.
-            // Thinking signatures are model-specific; resuming with a different model
-            // causes the API to reject the request (400).
-            useChatStore.setState((state) => {
-              const tab = state.tabs.get(tabId);
-              if (!tab) return {};
-              const cleanedMessages = tab.messages.filter(m => m.type !== 'thinking');
-              if (cleanedMessages.length === tab.messages.length) return {}; // nothing to clean
-              const newTabs = new Map(state.tabs);
-              newTabs.set(tabId, { ...tab, messages: cleanedMessages });
-              return { tabs: newTabs, sessionCache: newTabs };
-            });
             stdinId = undefined;
           } else {
           // ===== Send via stdin to existing persistent process (pre-warmed or follow-up) =====
@@ -954,6 +943,10 @@ export function InputBar() {
         if (earlyTabId) {
           useSessionStore.getState().registerStdinTab(preGeneratedId, earlyTabId);
         }
+
+        // Write stdinId to sessionMeta BEFORE startSession so stale guards
+        // can detect ownership during the await window. Rolled back in catch.
+        setSessionMeta(tabId, { stdinId: preGeneratedId });
 
         // Register listeners BEFORE starting the session
         const unlisten = await onClaudeStream(
@@ -1073,8 +1066,22 @@ export function InputBar() {
         });
         console.log('[TOKENICODE:session] started successfully', { sessionId: session.session_id, pid: session.pid, cli: session.cli_path });
 
-        // Store both: session_id for tracking, stdinId (preGeneratedId) for stdin communication
-        setSessionMeta(tabId, { sessionId: session.session_id, stdinId: preGeneratedId, envFingerprint: envFingerprint(), spawnedModel: resolveModelForProvider(selectedModel) });
+        // Guard: if stop was pressed during the await, stdinId was cleared.
+        // Kill the just-spawned orphan process and bail out.
+        const postSpawnState = useChatStore.getState().getTab(tabId);
+        if (postSpawnState?.sessionMeta.stdinId !== preGeneratedId) {
+          console.warn('[TOKENICODE] Session cancelled during spawn — killing orphan process');
+          bridge.killSession(preGeneratedId).catch(() => {});
+          if ((window as any).__claudeUnlisteners?.[preGeneratedId]) {
+            (window as any).__claudeUnlisteners[preGeneratedId]();
+            delete (window as any).__claudeUnlisteners[preGeneratedId];
+          }
+          useSessionStore.getState().unregisterStdinTab(preGeneratedId);
+          return;
+        }
+
+        // Store session_id + env snapshot (stdinId already written before startSession)
+        setSessionMeta(tabId, { sessionId: session.session_id, envFingerprint: envFingerprint(), spawnedModel: resolveModelForProvider(selectedModel) });
         // Note: stdinId → tabId mapping already registered before listener setup (TK-329)
 
         // Track the session and refresh conversation list
@@ -1093,6 +1100,7 @@ export function InputBar() {
       }
       if (sessionStdinId) {
         useSessionStore.getState().unregisterStdinTab(sessionStdinId);
+        setSessionMeta(tabId, { stdinId: undefined });
       }
       setSessionStatus(tabId, 'error');
       addMessage(tabId, {
@@ -1107,6 +1115,12 @@ export function InputBar() {
 
   // Keep ref in sync so executeImmediateCommand can call latest handleSubmit
   handleSubmitRef.current = handleSubmit;
+
+  // Expose submit handler for test harness (debug builds only).
+  // Usage via execute_js: window.__tokenicode_send()
+  if (import.meta.env.DEV) {
+    (window as any).__tokenicode_send = handleSubmit;
+  }
 
   // handleStreamMessage and handleBackgroundStreamMessage are provided by
   // useStreamProcessor hook (see src/hooks/useStreamProcessor.ts).
@@ -1450,6 +1464,7 @@ export function InputBar() {
                 flex items-center justify-center
                 hover:bg-red-500/25 transition-smooth"
               title={t('input.stop')}
+              {...(import.meta.env.DEV && { 'data-testid': 'stop-button' })}
             >
               <svg width="14" height="14" viewBox="0 0 16 16"
                 fill="currentColor">
@@ -1468,6 +1483,7 @@ export function InputBar() {
                 : 'bg-accent hover:bg-accent-hover text-text-inverse hover:shadow-glow cursor-pointer'
               }`}
             title={isAwaiting ? t('input.awaitingInteraction') : undefined}
+            {...(import.meta.env.DEV && { 'data-testid': 'send-button' })}
           >
             <svg width="16" height="16" viewBox="0 0 16 16"
               fill="none" stroke="currentColor" strokeWidth="2"

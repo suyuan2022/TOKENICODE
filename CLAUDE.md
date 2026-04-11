@@ -231,3 +231,7 @@ src/
 | Translations | `src/lib/i18n.ts` |
 | Tauri config | `src-tauri/tauri.conf.json` |
 | Build script (macOS local) | `scripts/build-macos-local.sh` |
+| 自动化测试指南 | `.test/README.md` |
+| CLI 测试工具参考 | `.test/CLI-TEST-TOOL.md` |
+| 测试 suite 定义 | `.test/suites/` |
+| 测试运行记录 | `.test/runs/` |

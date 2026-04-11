@@ -93,7 +93,8 @@ export function Sidebar() {
         className="w-full py-2.5 px-4 rounded-[20px] text-sm font-medium
           bg-accent hover:bg-accent-hover text-text-inverse
           hover:shadow-glow transition-smooth mb-4
-          flex items-center justify-center gap-2">
+          flex items-center justify-center gap-2"
+        {...(import.meta.env.DEV && { 'data-testid': 'new-session-button' })}>
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
           stroke="currentColor" strokeWidth="2" strokeLinecap="round">
           <path d="M8 3v10M3 8h10" />
@@ -104,7 +105,8 @@ export function Sidebar() {
       {/* Current Session — compressed single-line card */}
       {sessionMeta.sessionId && (
         <div className="px-3 py-2 rounded-xl bg-bg-secondary border border-border-subtle mb-3
-          flex items-center gap-2">
+          flex items-center gap-2"
+          {...(import.meta.env.DEV && { 'data-testid': 'current-session-card' })}>
           <span className={`w-2 h-2 rounded-full flex-shrink-0 transition-smooth
             ${sessionStatus === 'running'
               ? 'bg-success shadow-[0_0_8px_var(--color-accent-glow)] animate-pulse-soft'
@@ -137,7 +139,8 @@ export function Sidebar() {
         <button onClick={toggleSettings}
           className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl
             text-sm text-text-muted hover:bg-bg-secondary hover:text-text-primary
-            transition-smooth">
+            transition-smooth"
+          {...(import.meta.env.DEV && { 'data-testid': 'settings-button' })}>
           <div className="relative">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
               stroke="currentColor" strokeWidth="1.5">

@@ -1116,6 +1116,15 @@ async fn start_claude_session(
 
     // Extended thinking + effort level
     let thinking_level = params.thinking_level.as_deref().unwrap_or("high");
+    // Haiku 4.5 has a narrower budget_tokens range (max 16384). Higher effort
+    // levels can exceed this limit, causing the API to silently reject the request.
+    // Clamp effort to "low" for haiku models to stay within budget.
+    let is_haiku = params
+        .model
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase()
+        .contains("haiku");
     if thinking_level == "off" {
         // Explicitly disable thinking — CLI defaults to enabled, so we must pass false
         args.push("--settings".to_string());
@@ -1147,11 +1156,20 @@ async fn start_claude_session(
     // Append provider-specific CLI args (e.g. --setting-sources project,local)
     args.extend(provider_extra_args);
 
-    // Inject effort level env var for non-off thinking levels
+    // Inject effort level env var for non-off thinking levels.
+    // For haiku models, clamp effort to "low" to stay within budget_tokens limits.
     if thinking_level != "off" {
+        let effective_effort = if is_haiku {
+            match thinking_level {
+                "medium" | "high" | "max" => "low",
+                other => other,
+            }
+        } else {
+            thinking_level
+        };
         resolved_env.insert(
             "CLAUDE_CODE_EFFORT_LEVEL".to_string(),
-            thinking_level.to_string(),
+            effective_effort.to_string(),
         );
     }
 
@@ -6439,6 +6457,20 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
 
+            // Register test harness socket server (debug builds only).
+            // Provides a Unix socket that tokenicode-cli.mjs connects to for
+            // automated GUI testing. Release builds never include this.
+            #[cfg(debug_assertions)]
+            {
+                let mcp_config = tauri_plugin_mcp::PluginConfig::new("TOKENICODE".to_string())
+                    .start_socket_server(true)
+                    .socket_path(std::path::PathBuf::from("/tmp/tokenicode-test.sock"));
+                app.handle().plugin(
+                    tauri_plugin_mcp::init_with_config(mcp_config)
+                )?;
+                eprintln!("[TOKENICODE] Test harness registered on /tmp/tokenicode-test.sock");
+            }
+
             #[cfg(not(desktop))]
             let _ = app;
 
@@ -6570,3 +6602,4 @@ mod decode_tests {
         assert_eq!(result, "/Users/tinyzhuang/Desktop/jd 设计");
     }
 }
+

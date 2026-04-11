@@ -48,3 +48,6 @@ package-lock.json
 .claude/
 .trellis/
 AGENTS.md
+
+# Test run reports (large JSON, local only)
+.test/runs/

@@ -87,6 +87,19 @@ function _scheduleStreamFlush(stdinId: string) {
   });
 }
 
+/** Discard a stale session's stream buffer without flushing to UI.
+ *  Use in stale stdinId guards to prevent cross-session partial text pollution. */
+function discardStreamBuffer(stdinId: string) {
+  const buf = _streamBuffers.get(stdinId);
+  if (buf) {
+    if (buf.raf) {
+      cancelAnimationFrame(buf.raf);
+      buf.raf = 0;
+    }
+    _streamBuffers.delete(stdinId);
+  }
+}
+
 /** Flush any buffered streaming text immediately (call before clearPartial).
  *  If stdinId is provided, flush only that session's buffer.
  *  If omitted, flush ALL buffers (backward compat). */
@@ -537,6 +550,21 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'result': {
+        // --- Stale stdinId guard: skip state updates if this result belongs to a killed process ---
+        const bgCurrentStdinId = store.getTab(tabId)?.sessionMeta.stdinId;
+        if (msg.__stdinId && bgCurrentStdinId && msg.__stdinId !== bgCurrentStdinId) {
+          discardStreamBuffer(msg.__stdinId);
+          if ((window as any).__claudeUnlisteners?.[msg.__stdinId]) {
+            (window as any).__claudeUnlisteners[msg.__stdinId]();
+            delete (window as any).__claudeUnlisteners[msg.__stdinId];
+          }
+          useSessionStore.getState().unregisterStdinTab(msg.__stdinId);
+          break;
+        }
+
+        // Sub-agent results must not terminate the background session
+        if (msg.parent_tool_use_id) break;
+
         store.setSessionStatus(tabId, msg.subtype === 'success' ? 'completed' : 'error');
         {
           const bgTab = store.getTab(tabId);
@@ -646,13 +674,25 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'process_exit': {
+        // --- Stale stdinId guard: don't clobber state if a newer session is already active ---
+        const bgStdinId = msg.__stdinId;
+        const bgExitCurrentStdinId = store.getTab(tabId)?.sessionMeta.stdinId;
+        if (bgStdinId && bgExitCurrentStdinId && bgStdinId !== bgExitCurrentStdinId) {
+          discardStreamBuffer(bgStdinId);
+          if ((window as any).__claudeUnlisteners?.[bgStdinId]) {
+            (window as any).__claudeUnlisteners[bgStdinId]();
+            delete (window as any).__claudeUnlisteners[bgStdinId];
+          }
+          useSessionStore.getState().unregisterStdinTab(bgStdinId);
+          break;
+        }
+
         // Flush any remaining stream buffer before cleanup (#64)
         flushStreamBuffer(msg.__stdinId);
 
         // P0-5: Clean up Tauri event listeners for background tab.
         // __claudeUnlisteners is keyed by stdinId (desk_xxx), NOT tabId (session uuid).
         // Use msg.__stdinId (tagged by the listener closure) to find the correct entry.
-        const bgStdinId = msg.__stdinId;
         if (bgStdinId && (window as any).__claudeUnlisteners?.[bgStdinId]) {
           (window as any).__claudeUnlisteners[bgStdinId]();
           delete (window as any).__claudeUnlisteners[bgStdinId];
@@ -1422,6 +1462,21 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
       case 'result': {
 
+        // --- Stale stdinId guard: skip ALL state updates (including sub-agent) if this
+        // result belongs to a killed process. Must be before parent_tool_use_id check
+        // to prevent stale sub-agent results from affecting the current session's agents.
+        const currentStdinId_result = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
+        if (msgStdinId && currentStdinId_result && msgStdinId !== currentStdinId_result) {
+          console.warn('[TOKENICODE:stream] Stale result event ignored:', msgStdinId, '!= current', currentStdinId_result);
+          discardStreamBuffer(msgStdinId);
+          if ((window as any).__claudeUnlisteners?.[msgStdinId]) {
+            (window as any).__claudeUnlisteners[msgStdinId]();
+            delete (window as any).__claudeUnlisteners[msgStdinId];
+          }
+          useSessionStore.getState().unregisterStdinTab(msgStdinId);
+          break;
+        }
+
         // Sub-agent results carry parent_tool_use_id — they must NOT terminate the
         // main session. Only the main agent's result (no parent_tool_use_id) ends the
         // session. Without this guard, the first parallel sub-agent to complete would
@@ -1835,6 +1890,20 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       }
 
       case 'process_exit': {
+        // --- Stale stdinId guard: don't clobber state if a newer session is already active ---
+        const currentStdinId_exit = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
+        if (msgStdinId && currentStdinId_exit && msgStdinId !== currentStdinId_exit) {
+          console.warn('[TOKENICODE:session] Stale process_exit ignored:', msgStdinId, '!= current', currentStdinId_exit);
+          // Discard stale buffer + clean up the old listener and mapping
+          discardStreamBuffer(msgStdinId);
+          if ((window as any).__claudeUnlisteners?.[msgStdinId]) {
+            (window as any).__claudeUnlisteners[msgStdinId]();
+            delete (window as any).__claudeUnlisteners[msgStdinId];
+          }
+          useSessionStore.getState().unregisterStdinTab(msgStdinId);
+          break;
+        }
+
         // The CLI process has exited — clear the stdin handle but keep sessionId for resume
         clearPartial();
         console.log('[TOKENICODE:session] process_exit received', { stdinId: msg.__stdinId });

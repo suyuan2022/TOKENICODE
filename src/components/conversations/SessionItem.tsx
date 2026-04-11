@@ -162,6 +162,7 @@ export function SessionItem({
           ? 'bg-accent/10 ring-1 ring-accent/20'
           : 'hover:bg-bg-secondary'
         }`}
+      {...(import.meta.env.DEV && { 'data-testid': `session-item-${session.id}` })}
     >
       <div className="flex items-center gap-2">
         {multiSelect && (
