@@ -45,9 +45,16 @@ function normalizeProjectKey(raw: string): string {
   return raw;
 }
 
-function projectLabel(project: string): string {
+/** Extract display label from a project key.
+ *  When `parentHint` is true (duplicate names), appends parent folder:
+ *  "A (Desktop)" vs "A (坚果云)" */
+function projectLabel(project: string, parentHint?: boolean): string {
   const parts = project.replace(/^~[\\/]/, '').split(/[\\/]/);
-  return parts[parts.length - 1] || project;
+  const name = parts[parts.length - 1] || project;
+  if (parentHint && parts.length >= 2) {
+    return `${name} (${parts[parts.length - 2]})`;
+  }
+  return name;
 }
 
 // --- Context menu types ---
@@ -641,12 +648,15 @@ export function ConversationList() {
         </div>
       )}
 
-      {/* Project groups */}
-      {projectGroups.map(([project, items]) => (
+      {/* Project groups — detect duplicate folder names for disambiguation */}
+      {projectGroups.map(([project, items]) => {
+        const baseName = projectLabel(project);
+        const isDuplicate = projectGroups.filter(([k]) => projectLabel(k) === baseName).length > 1;
+        return (
         <SessionGroup
           key={project}
           projectKey={project}
-          projectLabel={projectLabel(project)}
+          projectLabel={projectLabel(project, isDuplicate)}
           projectPath={project}
           sessions={items}
           isExpanded={isExpanded(project)}
@@ -667,7 +677,8 @@ export function ConversationList() {
           renamingSessionId={renamingSessionId}
           onRenameDone={() => setRenamingSessionId(null)}
         />
-      ))}
+        );
+      })}
 
       {/* Content matches section (async, appears after metadata results) */}
       {searchQuery.trim() && contentOnlyMatches.length > 0 && (

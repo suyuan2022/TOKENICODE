@@ -238,6 +238,7 @@ function ActivityIndicator({ activityStatus, sessionMeta }: {
     : activityStatus.phase === 'writing' ? t('chat.writing')
     : activityStatus.phase === 'tool' ? `${t('chat.runningTool')}: ${activityStatus.toolName || ''}`
     : activityStatus.phase === 'awaiting' ? t('chat.awaiting')
+    : activityStatus.phase === 'reconnecting' ? t('chat.reconnecting')
     : t('chat.running');
 
   const elapsed = sessionMeta.turnStartTime ? formatElapsed(now - sessionMeta.turnStartTime) : null;
@@ -302,6 +303,7 @@ export function ChatPanel() {
   const sessionStatus = useActiveTab((t) => t.sessionStatus);
   const sessionMeta = useActiveTab((t) => t.sessionMeta);
   const activityStatus = useActiveTab((t) => t.activityStatus);
+  const pendingUserMessages = useActiveTab((t) => t.pendingUserMessages);
   const sidebarOpen = useSettingsStore((s) => s.sidebarOpen);
   const toggleSidebar = useSettingsStore((s) => s.toggleSidebar);
   const toggleSecondaryPanel = useSettingsStore((s) => s.toggleSecondaryPanel);
@@ -540,8 +542,7 @@ export function ChatPanel() {
       <div className="flex flex-1 min-h-0 relative">
       {/* Main chat area */}
       <div className="flex flex-col flex-1 min-w-0">
-      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-5 py-6 selectable"
-        {...(import.meta.env.DEV && { 'data-testid': 'chat-messages' })}>
+      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-5 py-6 selectable">
         {!workingDirectory && messages.length === 0 && !isStreaming ? (
           <WelcomeScreen />
         ) : messages.length === 0 && !isStreaming ? (
@@ -648,14 +649,41 @@ export function ChatPanel() {
                 )}
                 <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
                   <MarkdownRenderer content={partialText} />
-                  <span className="inline-block w-2 h-5 bg-accent ml-0.5
-                    animate-pulse-soft rounded-sm shadow-[0_0_8px_var(--color-accent-glow)]" />
                 </div>
               </div>
               );
             })()}
+            {/* Pending user messages — queued while AI is streaming.
+                Rendered AFTER partialText bubble so they visually queue up
+                behind the streaming reply. Each one becomes a real user
+                message bubble when the current turn completes and the
+                FIFO drain in useStreamProcessor sends it. */}
+            {pendingUserMessages && pendingUserMessages.length > 0 && pendingUserMessages.map((pendingText, idx) => (
+              <div key={`pending_${idx}`} className="flex justify-end gap-3 mt-4 opacity-60">
+                <div className="flex flex-col items-end max-w-[75%]">
+                  <div className="bg-bg-elevated border border-border-subtle text-text-primary
+                    rounded-2xl rounded-br-md px-4 py-2.5 leading-relaxed whitespace-pre-wrap break-words">
+                    {pendingText}
+                  </div>
+                  <span className="text-[10px] text-text-tertiary mt-1 mr-1 flex items-center gap-1">
+                    <svg className="w-2.5 h-2.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                      <circle cx="8" cy="8" r="6" />
+                      <path d="M8 5v3l2 1.5" strokeLinecap="round" />
+                    </svg>
+                    {t('chat.queued')}
+                  </span>
+                </div>
+                <div className="w-8 h-8 rounded-[10px] bg-bg-elevated flex-shrink-0
+                  flex items-center justify-center text-text-tertiary">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                    <circle cx="8" cy="5" r="3" />
+                    <path d="M2 14c0-3 3-5 6-5s6 2 6 5" />
+                  </svg>
+                </div>
+              </div>
+            ))}
             {/* Inline activity status indicator — like Claude Desktop App */}
-            {(sessionStatus === 'running' || activityStatus.phase === 'awaiting') && (
+            {(sessionStatus === 'running' || sessionStatus === 'reconnecting' || activityStatus.phase === 'awaiting') && (
               <ActivityIndicator activityStatus={activityStatus} sessionMeta={sessionMeta} />
             )}
           </div>

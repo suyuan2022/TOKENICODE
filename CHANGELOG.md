@@ -6,6 +6,16 @@ All notable changes to TOKENICODE will be documented in this file.
 
 ---
 
+## [0.10.1] - 2026-04-09
+
+### Fixed
+
+- **流式输出卡死修复** — 新增 setInterval 兜底机制，当 React 重渲染阻塞 rAF 时确保文本正常刷新
+- **同名工作区区分** — 不同路径的同名文件夹现在显示父级目录区分（如 `A (桌面)` vs `A (坚果云)`）
+- **第三方 API beta flags** — 非 Anthropic 原生 API 自动关闭 experimental betas（#69）
+
+---
+
 ## [0.10.0] - 2026-04-05
 
 ### Added

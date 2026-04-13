@@ -23,6 +23,10 @@ export interface StartSessionParams {
    *  "acceptEdits" | "default" | "plan" | "bypassPermissions"
    *  When not "bypassPermissions", enables structured permission requests via SDK protocol. */
   permission_mode?: string;
+  /** When true and resume_session_id is set, strip thinking blocks from the session JSONL
+   *  before resuming. This prevents "invalid thinking signature" 400 errors when switching
+   *  to a different model that can't verify the old model's cryptographic signatures. */
+  model_switch?: boolean;
 }
 
 export interface SessionInfo {
@@ -436,7 +440,34 @@ export const bridge = {
   /** Send a runtime interrupt command */
   interruptSession: (sessionId: string) =>
     invoke<void>('send_control_request', { sessionId, subtype: 'interrupt', payload: {} }),
+
+  /** Submit user feedback via Feishu webhook (self-built app). */
+  submitFeedback: (params: {
+    description: string;
+    screenshotBase64?: string;
+    metadata: FeedbackMetadata;
+  }) =>
+    invoke<void>('submit_feedback', {
+      description: params.description,
+      screenshotBase64: params.screenshotBase64 ?? null,
+      metadata: params.metadata,
+    }),
+
+  /** Check whether FEISHU_* env vars were baked in at build time. */
+  feedbackIsConfigured: () => invoke<boolean>('feedback_is_configured'),
 };
+
+/** Metadata collected alongside user feedback for server-side diagnostics.
+ *  OS / arch are filled in by the Rust side from std::env::consts. */
+export interface FeedbackMetadata {
+  app_name: string;
+  app_version: string;
+  locale?: string;
+  provider_name?: string;
+  model?: string;
+  session_id?: string;
+  user_contact?: string;
+}
 
 // --- SDK Control Protocol Types ---
 

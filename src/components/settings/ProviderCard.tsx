@@ -51,7 +51,6 @@ export function ProviderCard({
             ? 'bg-accent/5 border border-accent/20'
             : 'border border-border-subtle hover:bg-bg-secondary'
         }`}
-      {...(import.meta.env.DEV && { 'data-testid': `provider-card-${provider.id}` })}
     >
       {/* Active indicator dot */}
       <span className={`shrink-0 block w-2.5 h-2.5 rounded-full transition-smooth

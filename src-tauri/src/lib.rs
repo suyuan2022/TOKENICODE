@@ -1055,6 +1055,188 @@ fn resolve_provider_env(
     Ok((env, keys_to_remove, extra_args))
 }
 
+/// Find the JSONL file for a given session UUID by scanning ~/.claude/projects/*/.
+/// Returns the path if found, None otherwise.
+/// Validates that session_id looks like a UUID to prevent path traversal.
+fn find_session_jsonl(session_id: &str) -> Option<std::path::PathBuf> {
+    // Reject non-UUID session IDs to prevent path traversal (e.g. "../../../etc/passwd")
+    if uuid::Uuid::parse_str(session_id).is_err() {
+        eprintln!("[TOKENICODE] find_session_jsonl: rejecting non-UUID session_id: {}", session_id);
+        return None;
+    }
+
+    let home = dirs::home_dir()?;
+    let claude_projects = home.join(".claude").join("projects");
+    if !claude_projects.exists() {
+        return None;
+    }
+
+    let target_filename = format!("{}.jsonl", session_id);
+    if let Ok(entries) = std::fs::read_dir(&claude_projects) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let candidate = entry.path().join(&target_filename);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Strip thinking and redacted_thinking blocks from a session's JSONL file.
+/// This is used before resuming a session with a different model, because the
+/// new model cannot verify the old model's cryptographic thinking signatures
+/// and will reject the request with a 400 error.
+///
+/// Returns Ok(blocks_stripped) on success, or Err with a description on failure.
+/// The caller should NOT block the session resume on failure — let the auto-retry
+/// path handle it as a safety net.
+fn strip_thinking_blocks_from_session(session_id: &str) -> Result<usize, String> {
+    use std::io::{BufRead, Write};
+
+    let jsonl_path = find_session_jsonl(session_id)
+        .ok_or_else(|| format!("Session JSONL not found for id: {}", session_id))?;
+
+    eprintln!(
+        "[TOKENICODE] strip_thinking_blocks: processing {:?}",
+        jsonl_path
+    );
+
+    // Read all lines
+    let file = std::fs::File::open(&jsonl_path)
+        .map_err(|e| format!("Failed to open JSONL: {}", e))?;
+    let reader = std::io::BufReader::new(file);
+    let lines: Vec<String> = reader
+        .lines()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read JSONL: {}", e))?;
+
+    let mut total_stripped = 0usize;
+    let mut modified_lines = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            modified_lines.push(line);
+            continue;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(mut json_line) => {
+                // Look for assistant messages with content arrays.
+                // Format: {"type":"assistant","message":{"role":"assistant","content":[...]}}
+                // Thinking blocks only appear at this level — tool_result content arrays
+                // contain tool output, not model thinking.
+                if let Some(stripped) = strip_thinking_from_value(&mut json_line) {
+                    total_stripped += stripped;
+                }
+                modified_lines.push(serde_json::to_string(&json_line).unwrap_or(line));
+            }
+            Err(_) => {
+                // Not valid JSON — keep the line as-is
+                modified_lines.push(line);
+            }
+        }
+    }
+
+    if total_stripped > 0 {
+        // Backup the original file before overwriting
+        let backup_path = jsonl_path.with_extension("jsonl.bak");
+        if let Err(e) = std::fs::copy(&jsonl_path, &backup_path) {
+            eprintln!(
+                "[TOKENICODE] strip_thinking_blocks: backup failed ({}) — proceeding anyway",
+                e
+            );
+        }
+
+        // Write the cleaned JSONL via temp file + platform-specific replace.
+        let tmp_path = jsonl_path.with_extension("jsonl.tmp");
+        let mut tmp_file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create temp file: {}", e))?;
+        for line in &modified_lines {
+            writeln!(tmp_file, "{}", line)
+                .map_err(|e| format!("Failed to write temp file: {}", e))?;
+        }
+        tmp_file
+            .flush()
+            .map_err(|e| format!("Failed to flush temp file: {}", e))?;
+        // Drop the file handle before rename — on Windows, an open handle
+        // can prevent rename from succeeding.
+        drop(tmp_file);
+
+        // On Unix, rename() atomically replaces the target — no data loss window.
+        // On Windows, rename() cannot overwrite an existing file, so we use a
+        // two-step approach with rollback from backup on failure.
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::fs::rename(&tmp_path, &jsonl_path)
+                .map_err(|e| format!("Failed to rename temp file: {}", e))?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let replace_result = (|| -> std::io::Result<()> {
+                // Try std::fs::rename first — works if target doesn't exist
+                if std::fs::rename(&tmp_path, &jsonl_path).is_ok() {
+                    return Ok(());
+                }
+                // Fallback: backup old file, rename new, rollback on failure
+                let win_backup = jsonl_path.with_extension("jsonl.wbak");
+                let _ = std::fs::remove_file(&win_backup);
+                std::fs::rename(&jsonl_path, &win_backup)?;
+                if let Err(e) = std::fs::rename(&tmp_path, &jsonl_path) {
+                    // Rollback: restore original file
+                    let _ = std::fs::rename(&win_backup, &jsonl_path);
+                    return Err(e);
+                }
+                let _ = std::fs::remove_file(&win_backup);
+                Ok(())
+            })();
+            replace_result.map_err(|e| format!("Failed to replace JSONL on Windows: {}", e))?;
+        }
+
+        eprintln!(
+            "[TOKENICODE] strip_thinking_blocks: stripped {} thinking blocks from {:?}",
+            total_stripped, jsonl_path
+        );
+    } else {
+        eprintln!(
+            "[TOKENICODE] strip_thinking_blocks: no thinking blocks found in {:?}",
+            jsonl_path
+        );
+    }
+
+    Ok(total_stripped)
+}
+
+/// Strip thinking/redacted_thinking content blocks from a JSON value's message.content array.
+/// Returns the number of blocks stripped, or None if nothing was modified.
+fn strip_thinking_from_value(value: &mut serde_json::Value) -> Option<usize> {
+    let mut stripped = 0usize;
+
+    // Look for message.content array (assistant messages)
+    if let Some(message) = value.get_mut("message") {
+        if let Some(content) = message.get_mut("content") {
+            if let Some(arr) = content.as_array_mut() {
+                let before_len = arr.len();
+                arr.retain(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map_or(true, |t| t != "thinking" && t != "redacted_thinking")
+                });
+                stripped += before_len - arr.len();
+            }
+        }
+    }
+
+    if stripped > 0 {
+        Some(stripped)
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 async fn start_claude_session(
     app: AppHandle,
@@ -1086,6 +1268,21 @@ async fn start_claude_session(
         "--strict-mcp-config".to_string(),
     ];
 
+    // Model switch: strip thinking blocks from the session JSONL before resuming.
+    // When switching models, the old model's cryptographic thinking signatures in the
+    // JSONL cause the new model to reject the request (400 error). Stripping them
+    // preserves the conversation text while removing the invalid signatures.
+    // This is best-effort: failure is logged but does NOT block the resume attempt.
+    // The auto-retry path in useStreamProcessor.ts will catch any remaining errors.
+    if params.model_switch.unwrap_or(false) {
+        if let Some(ref resume_id) = params.resume_session_id {
+            match strip_thinking_blocks_from_session(resume_id) {
+                Ok(n) => eprintln!("[TOKENICODE] model_switch: stripped {} thinking blocks before resume", n),
+                Err(e) => eprintln!("[TOKENICODE] model_switch: thinking-block strip failed ({}), attempting resume anyway", e),
+            }
+        }
+    }
+
     // Resume an existing CLI session if requested
     if let Some(ref resume_id) = params.resume_session_id {
         args.push("--resume".to_string());
@@ -1116,15 +1313,6 @@ async fn start_claude_session(
 
     // Extended thinking + effort level
     let thinking_level = params.thinking_level.as_deref().unwrap_or("high");
-    // Haiku 4.5 has a narrower budget_tokens range (max 16384). Higher effort
-    // levels can exceed this limit, causing the API to silently reject the request.
-    // Clamp effort to "low" for haiku models to stay within budget.
-    let is_haiku = params
-        .model
-        .as_deref()
-        .unwrap_or("")
-        .to_lowercase()
-        .contains("haiku");
     if thinking_level == "off" {
         // Explicitly disable thinking — CLI defaults to enabled, so we must pass false
         args.push("--settings".to_string());
@@ -1156,20 +1344,11 @@ async fn start_claude_session(
     // Append provider-specific CLI args (e.g. --setting-sources project,local)
     args.extend(provider_extra_args);
 
-    // Inject effort level env var for non-off thinking levels.
-    // For haiku models, clamp effort to "low" to stay within budget_tokens limits.
+    // Inject effort level env var for non-off thinking levels
     if thinking_level != "off" {
-        let effective_effort = if is_haiku {
-            match thinking_level {
-                "medium" | "high" | "max" => "low",
-                other => other,
-            }
-        } else {
-            thinking_level
-        };
         resolved_env.insert(
             "CLAUDE_CODE_EFFORT_LEVEL".to_string(),
-            effective_effort.to_string(),
+            thinking_level.to_string(),
         );
     }
 
@@ -1450,12 +1629,53 @@ async fn start_claude_session(
 
     let sid = session_id.clone();
 
+    // ── Spawn child waiter task — owns the child process ──
+    //
+    // The waiter task's sole purpose is to **own the child process** and
+    // provide a kill channel for kill_session. It does NOT emit process_exit
+    // or do any cleanup — those responsibilities belong to the stdout reader,
+    // because stdout EOF is naturally time-ordered after all stream messages
+    // have been drained, whereas child.wait() can return BEFORE the stdout
+    // reader has finished processing the last buffered lines (race!).
+    //
+    //   1. child.wait() returns naturally → child exited on its own.
+    //      stdout will close, stdout_reader will hit EOF, THAT emits
+    //      process_exit. The waiter simply ends, silent.
+    //   2. kill_rx fires → kill_session was called. We start_kill the child,
+    //      wait for reap, then end silently. stdout reader will see EOF.
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let waiter_sid = sid.clone();
+        tokio::spawn(async move {
+            let mut child = child;
+            tokio::select! {
+                status = child.wait() => {
+                    eprintln!(
+                        "[TOKENICODE] child naturally exited for {}: code={:?} (stdout reader will emit process_exit)",
+                        waiter_sid,
+                        status.as_ref().ok().and_then(|s| s.code())
+                    );
+                }
+                _ = kill_rx => {
+                    eprintln!("[TOKENICODE] kill signal received for {} — killing child", waiter_sid);
+                    if let Err(e) = child.start_kill() {
+                        eprintln!("[TOKENICODE] start_kill failed for {}: {}", waiter_sid, e);
+                    }
+                    // Wait for child to actually die, then stdout reader will
+                    // see EOF and do the ProcessExit + cleanup.
+                    let _ = child.wait().await;
+                }
+            }
+        });
+    }
+
     state
         .insert(
             sid.clone(),
             ManagedProcess {
-                child,
                 session_id: sid.clone(),
+                pid,
+                kill_tx: Some(kill_tx),
             },
         )
         .await;
@@ -1499,11 +1719,20 @@ async fn start_claude_session(
             // Log first 10 lines with timing to diagnose startup delay
             if line_count <= 10 {
                 let elapsed = spawn_time.elapsed().as_millis();
-                let preview = if line.len() > 150 {
-                    &line[..150]
+                // CRITICAL: must clamp to char boundary, otherwise slicing
+                // through a multi-byte UTF-8 char (e.g. Chinese punctuation
+                // at byte 149-152) panics the entire stdout reader task,
+                // killing the stream pipeline while CLI is still alive.
+                let end = if line.len() > 150 {
+                    let mut i = 150;
+                    while i > 0 && !line.is_char_boundary(i) {
+                        i -= 1;
+                    }
+                    i
                 } else {
-                    &line
+                    line.len()
                 };
+                let preview = &line[..end];
                 eprintln!(
                     "[TOKENICODE:stdout] #{} @{}ms type={} preview={}",
                     line_count,
@@ -1589,10 +1818,24 @@ async fn start_claude_session(
                                 .or_else(|| request.get("toolUseId"))
                                 .and_then(|v| v.as_str())
                                 .map(String::from);
+                            // P0-1 (#39): forward parent_tool_use_id and agent_id so the
+                            // frontend can compute sub-agent depth. Without these, every
+                            // sub-agent permission freezes the main input because
+                            // resolveAgentId falls back to "main agent" depth 0.
+                            let parent_tool_use_id = request
+                                .get("parent_tool_use_id")
+                                .or_else(|| request.get("parentToolUseId"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let agent_id = request
+                                .get("agent_id")
+                                .or_else(|| request.get("agentId"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
 
                             eprintln!(
-                                "[TOKENICODE] permission request: tool={} request_id={}",
-                                tool_name, request_id
+                                "[TOKENICODE] permission request: tool={} request_id={} parent_tool_use_id={:?} agent_id={:?}",
+                                tool_name, request_id, parent_tool_use_id, agent_id
                             );
 
                             // Emit as a special stream message (reuses the working stream channel)
@@ -1603,6 +1846,8 @@ async fn start_claude_session(
                                 "input": input,
                                 "description": description,
                                 "tool_use_id": tool_use_id,
+                                "parent_tool_use_id": parent_tool_use_id,
+                                "agent_id": agent_id,
                             });
                             let _ = emit_to_frontend(&app_clone, &stream_event, perm_payload);
                             continue; // Don't forward to stream as normal msg
@@ -1680,17 +1925,40 @@ async fn start_claude_session(
             };
             if let Err(e) = emit_to_frontend(&app_clone, &stream_event, json_to_emit) {
                 emit_fail_count += 1;
-                eprintln!("[TOKENICODE] emit_to_frontend failed (#{emit_fail_count}): {e}");
-                // If emit fails repeatedly, the frontend is likely unreachable.
-                // Break the loop to trigger process_exit cleanup (#64).
-                if emit_fail_count >= 10 {
-                    eprintln!("[TOKENICODE:CRITICAL] {} consecutive emit failures — frontend unreachable, stopping stream", emit_fail_count);
-                    break;
+                // Log every 10 failures to avoid flooding stderr when the
+                // WebView is unresponsive for a sustained period.
+                if emit_fail_count == 1 || emit_fail_count % 10 == 0 {
+                    eprintln!(
+                        "[TOKENICODE] emit_to_frontend failed (#{emit_fail_count}): {e} — continuing (watchdog will recover user session if needed)"
+                    );
                 }
+                // DO NOT break. Previously we broke after 10 failures, but
+                // that caused permanent silent disconnection: subsequent
+                // events would never reach the WebView, and the frontend
+                // session would stay stuck in 'running' forever. Keep
+                // trying — WebView usually recovers quickly, and the
+                // frontend watchdog (App.tsx) handles user-facing recovery
+                // if the stall persists.
             } else {
-                emit_fail_count = 0;  // reset on success
+                if emit_fail_count > 0 {
+                    eprintln!(
+                        "[TOKENICODE] emit_to_frontend recovered after {} failures",
+                        emit_fail_count
+                    );
+                }
+                emit_fail_count = 0;
             }
         }
+        // stdout EOF means the child's write end is closed (child exited,
+        // naturally or via kill). This is ALWAYS the authoritative signal
+        // for process_exit because it guarantees all buffered stream
+        // messages have been drained and emitted before the exit event.
+        // The child waiter task only provides a kill proxy; it does NOT
+        // emit process_exit, to avoid racing with stdout drain.
+        eprintln!(
+            "[TOKENICODE] stdout reader reached EOF for {} after {} lines",
+            sid_clone, line_count
+        );
         // Emit process_exit on the stream channel (primary detection)
         let _ = emit_to_frontend(
             &app_clone,
@@ -1703,7 +1971,6 @@ async fn start_claude_session(
             &format!("claude:exit:{}", sid_clone),
             serde_json::json!(null),
         );
-
         // Notify frontend that session list may have changed
         let _ = emit_to_frontend(&app_clone, "sessions:changed", serde_json::json!(null));
     });
@@ -6457,20 +6724,6 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
 
-            // Register test harness socket server (debug builds only).
-            // Provides a Unix socket that tokenicode-cli.mjs connects to for
-            // automated GUI testing. Release builds never include this.
-            #[cfg(debug_assertions)]
-            {
-                let mcp_config = tauri_plugin_mcp::PluginConfig::new("TOKENICODE".to_string())
-                    .start_socket_server(true)
-                    .socket_path(std::path::PathBuf::from("/tmp/tokenicode-test.sock"));
-                app.handle().plugin(
-                    tauri_plugin_mcp::init_with_config(mcp_config)
-                )?;
-                eprintln!("[TOKENICODE] Test harness registered on /tmp/tokenicode-test.sock");
-            }
-
             #[cfg(not(desktop))]
             let _ = app;
 
@@ -6547,6 +6800,8 @@ pub fn run() {
             test_provider_connection,
             respond_permission,
             send_control_request,
+            commands::feedback::submit_feedback,
+            commands::feedback::feedback_is_configured,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -6603,3 +6858,90 @@ mod decode_tests {
     }
 }
 
+#[cfg(test)]
+mod strip_thinking_tests {
+    use super::strip_thinking_from_value;
+    use serde_json::json;
+
+    #[test]
+    fn test_strip_thinking_removes_thinking_blocks() {
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "private thoughts"},
+                    {"type": "text", "text": "Hello!"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                ]
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, Some(2));
+        let content = value["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn test_strip_thinking_preserves_other_types() {
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Hello!"},
+                    {"type": "tool_use", "id": "t1", "name": "bash"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "output"},
+                ]
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, None);
+        assert_eq!(value["message"]["content"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_strip_thinking_user_message_unchanged() {
+        let mut value = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "What is 2+2?"
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, None);
+    }
+
+    #[test]
+    fn test_strip_thinking_empty_content() {
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": []
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, None);
+    }
+
+    #[test]
+    fn test_strip_thinking_only_thinking_blocks() {
+        // Edge case: all blocks are thinking — result is empty content array
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "hmm"},
+                    {"type": "redacted_thinking", "data": "abc"},
+                ]
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, Some(2));
+        assert_eq!(value["message"]["content"].as_array().unwrap().len(), 0);
+    }
+}

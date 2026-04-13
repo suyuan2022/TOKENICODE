@@ -842,6 +842,23 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
         <ToolIcon name={toolName} />
         <span className="text-xs font-medium text-text-muted">{label}</span>
         {renderPreview()}
+        {/* In-progress indicator: typing dots — three dots with staggered
+            animation-delay create the illusion of light moving across them.
+            The tool transitions out of this state when toolResultContent
+            arrives via the tool_result stream event. */}
+        {!hasResult && (
+          <span
+            className="inline-flex items-center gap-[3px] ml-1.5 flex-shrink-0"
+            title={t('msg.toolRunning')}
+          >
+            <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot"
+              style={{ animationDelay: '0ms' }} />
+            <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot"
+              style={{ animationDelay: '200ms' }} />
+            <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot"
+              style={{ animationDelay: '400ms' }} />
+          </span>
+        )}
         {/* Show a small result indicator when collapsed with result */}
         {!expanded && hasResult && (
           <svg width="10" height="10" viewBox="0 0 12 12" fill="none"

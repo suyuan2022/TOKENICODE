@@ -19,6 +19,110 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.10.2',
+    date: '2026-04-11',
+    highlights: {
+      zh: [
+        '新增用户反馈通道，设置里一键提交',
+        '流式输出卡死大修 — 孤儿缓冲、停滞看门狗、打断保留一整套',
+        '切换模型不再 400 报错',
+        '/compact 在后台 tab 完成时不再卡住转圈',
+        '工具调用有运行中动画，消息可排队发送',
+      ],
+      en: [
+        'New in-app feedback channel in Settings',
+        'Stream stuck fixes — orphan buffer, stall watchdog, interrupt preservation',
+        'Model switching no longer hits 400 errors',
+        '/compact no longer freezes when it completes on a background tab',
+        'Tool calls animate while running, new messages can queue up',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新功能', en: 'New' },
+        items: {
+          zh: [
+            '提交反馈 — 设置里新增「反馈」tab，可以直接给开发者发问题或建议，支持粘贴截图，会自动带上应用版本、系统、Provider、Model 等诊断信息，无需打开 GitHub',
+          ],
+          en: [
+            'Submit Feedback — a new "Feedback" tab in Settings lets you send bug reports or suggestions directly to the developer, with screenshot paste support; app version, OS, provider, and model are attached automatically — no GitHub account needed',
+          ],
+        },
+      },
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '流式输出偶尔卡住、结尾漏字 — 新增孤儿缓冲队列 + 3 秒停滞看门狗，路由失效时缓冲不再被静默清空',
+            '按停止按钮后已流出的文字丢失 — 现在会作为一条消息保留在对话里',
+            '切换模型后 400 "invalid thinking signature" 报错 — 改为在 resume 前直接清理 JSONL 中的 thinking 块',
+            '切换 Provider 后的 signature 不匹配 — 同步清理本地 thinking 历史',
+            '/compact 在后台 tab 完成时卡片一直转圈 — 前后台的 pending command 状态现在都会在 result/assistant 到达时清理',
+            '切换 tab 时 thinking 内容丢失 — 后台 tab 的 stream handler 现在也处理 thinking_delta',
+            '子 agent 请求权限时锁住主输入框 — 权限请求现在携带 parent_tool_use_id / agent_id 以区分层级',
+            '从 Finder 拖文件到输入框会同时插入文件 chip 和原始文本路径 — 新增 drop 拦截',
+            'Rewind 后事件偶尔路由到错误 tab — killProcess 现在会清理 stdin → tab 映射',
+            '流式缓冲区对中文字符使用字节切片导致 panic，进而杀死整个 stdout 读取任务 — 改为安全的字符边界检查',
+            '"注入 PATH" 之前写的是错误的 marker 且反复点击会累积多个块（#79）— 现在会拒绝无效 CLI 候选（broken symlink / 空目录 / 非可执行文件），marker 正名为 `# Added by TOKENICODE`，每次注入前先剥离自己的历史块',
+          ],
+          en: [
+            'Stream output occasionally stalled or dropped trailing characters — added orphan buffer queue + 3-second stall watchdog; flushes are no longer silently discarded when routing is unresolved',
+            'Streamed text was lost when the Stop button was pressed — it is now preserved as a regular message in the transcript',
+            '"Invalid thinking signature" 400 errors after switching model — JSONL thinking blocks are now stripped before --resume',
+            'Provider switch signature mismatch — local thinking history is cleaned on provider change as well',
+            '/compact command card spun forever when it completed on a background tab — pendingCommand state is now cleared from both foreground and background handlers',
+            'Thinking content disappeared after tab switching — background stream handler now processes thinking_delta',
+            'Sub-agent permission requests locked the main input bar — requests now carry parent_tool_use_id / agent_id to identify their layer',
+            'Finder file drag inserted both a file chip and a raw text path — added drop interception',
+            'Events occasionally routed to the wrong tab after Rewind — killProcess now cleans up the stdin → tab mapping',
+            'Stream buffer byte-slicing panicked on Chinese characters and killed the entire stdout reader task — now uses safe char-boundary checks',
+            '"Inject PATH" wrote a wrong marker and accumulated duplicate blocks on repeat clicks (#79) — now rejects invalid CLI candidates (broken symlinks, empty dirs, non-executable files), marker renamed to `# Added by TOKENICODE`, and each inject strips its own historical blocks first',
+          ],
+        },
+      },
+      {
+        label: { zh: '改进', en: 'Improved' },
+        items: {
+          zh: [
+            '工具调用运行中会显示 3 个跳动的圆点动画，长任务不再像死机',
+            '当前 AI 正在回复时按 Enter 发送的新消息会进入排队队列，等回复完成后自动合并发送',
+            'ModelSelector 下拉和底部按钮现在都显示实际调用的 provider 模型名（如 mimo-v2-pro），而非 Claude tier 名',
+            '重连状态下 ActivityIndicator 会显示明确的"重连中"提示',
+          ],
+          en: [
+            'Running tool calls now show a 3-dot typing animation so long tasks no longer look frozen',
+            'Messages sent while AI is still replying now queue up and merge into a single follow-up when the reply finishes',
+            'ModelSelector dropdown and collapsed button now both show the actual provider model name (e.g. mimo-v2-pro) instead of the Claude tier label',
+            'Reconnecting state is now explicitly shown in the ActivityIndicator',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.1',
+    date: '2026-04-09',
+    highlights: {
+      zh: ['修复输出偶尔卡住的问题', '同名文件夹不再混淆'],
+      en: ['Fix occasional output freeze', 'Same-name folders now distinguishable'],
+    },
+    categories: [
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '流式输出偶尔卡死 — 新增定时兜底机制，长对话时输出不再停在某个字不动',
+            '不同路径的同名文件夹现在能正确区分 — 显示父级目录（如「A (桌面)」vs「A (坚果云)」）',
+          ],
+          en: [
+            'Streaming output freeze — added timer fallback so output never gets stuck mid-response',
+            'Same-name folders from different paths now show parent directory for disambiguation',
+          ],
+        },
+      },
+    ],
+  },
+  {
     version: '0.10.0',
     date: '2026-04-05',
     highlights: {

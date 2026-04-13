@@ -8,8 +8,9 @@ import { GeneralTab } from './GeneralTab';
 import { ProviderTab } from './ProviderTab';
 import { CliTab } from './CliTab';
 import { McpTab } from './McpTab';
+import { FeedbackTab } from './FeedbackTab';
 
-type SettingsTab = 'general' | 'provider' | 'cli' | 'mcp';
+type SettingsTab = 'general' | 'provider' | 'cli' | 'mcp' | 'feedback';
 
 const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
   general: (
@@ -39,6 +40,12 @@ const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
       <circle cx="4" cy="11" r="0.75" fill="currentColor" />
     </svg>
   ),
+  feedback: (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 3h12a1 1 0 011 1v7a1 1 0 01-1 1H6l-3 3V4a1 1 0 011-1z" />
+      <path d="M5 6.5h6M5 9h4" />
+    </svg>
+  ),
 };
 
 const TAB_ITEMS: { id: SettingsTab; labelKey: string }[] = [
@@ -46,6 +53,7 @@ const TAB_ITEMS: { id: SettingsTab; labelKey: string }[] = [
   { id: 'provider', labelKey: 'settings.tab.provider' },
   { id: 'cli', labelKey: 'settings.tab.cli' },
   { id: 'mcp', labelKey: 'settings.tab.mcp' },
+  { id: 'feedback', labelKey: 'settings.tab.feedback' },
 ];
 
 export function SettingsPanel() {
@@ -66,7 +74,6 @@ export function SettingsPanel() {
     <div
       className="fixed inset-0 z-[9999] flex items-center justify-center"
       onMouseDown={(e) => { if (e.target === e.currentTarget) toggleSettings(); }}
-      {...(import.meta.env.DEV && { 'data-testid': 'settings-panel' })}
     >
       {/* Backdrop */}
       <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" />
@@ -84,8 +91,7 @@ export function SettingsPanel() {
           </h2>
           <button onClick={toggleSettings}
             className="p-1.5 rounded-lg hover:bg-bg-tertiary
-              text-text-tertiary transition-smooth"
-            {...(import.meta.env.DEV && { 'data-testid': 'settings-close-button' })}>
+              text-text-tertiary transition-smooth">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
               stroke="currentColor" strokeWidth="1.5">
               <path d="M4 4l8 8M12 4l-8 8" />
@@ -107,7 +113,6 @@ export function SettingsPanel() {
                     ? 'bg-accent/10 text-accent'
                     : 'text-text-muted hover:bg-bg-secondary hover:text-text-primary'
                   }`}
-                {...(import.meta.env.DEV && { 'data-testid': `settings-tab-${tab.id}` })}
               >
                 <span className="flex-shrink-0 opacity-70">{TAB_ICONS[tab.id]}</span>
                 {t(tab.labelKey)}
@@ -124,6 +129,7 @@ export function SettingsPanel() {
             {activeTab === 'provider' && <ProviderTab />}
             {activeTab === 'cli' && <CliTab />}
             {activeTab === 'mcp' && <McpTab />}
+            {activeTab === 'feedback' && <FeedbackTab />}
           </div>
         </div>
 

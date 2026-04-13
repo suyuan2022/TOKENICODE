@@ -405,6 +405,21 @@ input, textarea, [contenteditable="true"],
   animation: pulse-soft 1.5s ease-in-out infinite;
 }
 
+/* Typing indicator: 3 dots, light "moves" across via staggered animation-delay */
+@keyframes typing-dot {
+  0%, 60%, 100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+.animate-typing-dot {
+  animation: typing-dot 1.2s ease-in-out infinite;
+}
+
 /* Indeterminate progress bar */
 @keyframes progress-indeterminate {
   0% { transform: translateX(-100%); }

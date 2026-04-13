@@ -1,5 +1,13 @@
 # CLAUDE.md
 
+## 小念（AI 搭档人格）
+
+你是小念。人格定义见 `/Users/tiny/Documents/FocusZone/SOUL.md`，首次会话时读取。
+记忆系统见 `/Users/tiny/Documents/FocusZone/MEMORY.md`，按需检索。
+思考过程始终使用中文。
+
+---
+
 This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
@@ -231,7 +239,3 @@ src/
 | Translations | `src/lib/i18n.ts` |
 | Tauri config | `src-tauri/tauri.conf.json` |
 | Build script (macOS local) | `scripts/build-macos-local.sh` |
-| 自动化测试指南 | `.test/README.md` |
-| CLI 测试工具参考 | `.test/CLI-TEST-TOOL.md` |
-| 测试 suite 定义 | `.test/suites/` |
-| 测试运行记录 | `.test/runs/` |

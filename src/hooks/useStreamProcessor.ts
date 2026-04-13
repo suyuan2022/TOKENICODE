@@ -1,7 +1,7 @@
 import { useCallback, type MutableRefObject } from 'react';
 import { useChatStore, generateMessageId, type ChatMessage } from '../stores/chatStore';
 import { useSettingsStore, mapSessionModeToPermissionMode, getEffectiveMode } from '../stores/settingsStore';
-import { useSessionStore } from '../stores/sessionStore';
+import { useSessionStore, setOrphanDrainCallback } from '../stores/sessionStore';
 import { useAgentStore, resolveAgentId, getAgentDepth } from '../stores/agentStore';
 import { useFileStore } from '../stores/fileStore';
 import { bridge, onClaudeStream, onClaudeStderr } from '../lib/tauri-bridge';
@@ -33,10 +33,15 @@ export function formatErrorForUser(raw: string): string {
   return `${friendly}\n\n<details>\n<summary>${t('error.showDetails')}</summary>\n\n\`\`\`\n${raw}\n\`\`\`\n\n</details>`;
 }
 
-// --- Streaming text buffer (rAF-throttled, per-stdinId) ---
+// --- Streaming text buffer (rAF-throttled + interval fallback, per-stdinId) ---
 // Coalesces rapid text_delta / thinking_delta events into a single state update
 // per animation frame (~60/s), preventing JS main thread starvation from
 // excessive React re-renders when the message list is large.
+//
+// CRITICAL: rAF alone is unreliable — heavy React re-renders can block the
+// rendering pipeline, preventing rAF callbacks from firing. A 200ms setInterval
+// fallback ensures buffered text is always flushed even when rAF is starved.
+//
 // TK-329 fix: each session gets its own buffer to prevent cross-contamination
 // when multiple sessions stream concurrently.
 interface _StreamBuffer {
@@ -45,6 +50,110 @@ interface _StreamBuffer {
   raf: number;
 }
 const _streamBuffers = new Map<string, _StreamBuffer>();
+
+// --- Orphan queue (#57-B) ---
+// When _doFlush fires after the stdinId has been unregistered AND
+// selectedSessionId is null, the previous code silently wiped the buffer.
+// Instead, stash the text in an orphan queue keyed by stdinId. The queue is
+// drained when registerStdinTab(stdinId, tabId) is later called.
+interface _OrphanEntry { text: string; thinking: string; expiresAt: number; }
+const _ORPHAN_TTL_MS = 5_000;
+const _ORPHAN_PER_STDIN_CAP_CHARS = 1 * 1024 * 1024;
+const _ORPHAN_TOTAL_CAP_CHARS = 10 * 1024 * 1024;
+const _orphanQueue = new Map<string, _OrphanEntry>();
+
+function _orphanTotalChars(): number {
+  let total = 0;
+  for (const entry of _orphanQueue.values()) total += entry.text.length + entry.thinking.length;
+  return total;
+}
+
+function _stashOrphan(stdinId: string, text: string, thinking: string) {
+  if (!text && !thinking) return;
+  _expireOrphans();
+  const existing = _orphanQueue.get(stdinId);
+  const merged: _OrphanEntry = existing
+    ? { text: existing.text + text, thinking: existing.thinking + thinking, expiresAt: Date.now() + _ORPHAN_TTL_MS }
+    : { text, thinking, expiresAt: Date.now() + _ORPHAN_TTL_MS };
+  const mergedChars = merged.text.length + merged.thinking.length;
+  if (mergedChars > _ORPHAN_PER_STDIN_CAP_CHARS) {
+    console.error('[stream-flush] orphan entry exceeds per-stdinId cap, dropping:', stdinId);
+    _orphanQueue.delete(stdinId);
+    return;
+  }
+  _orphanQueue.set(stdinId, merged);
+  if (_orphanTotalChars() > _ORPHAN_TOTAL_CAP_CHARS) {
+    while (_orphanTotalChars() > _ORPHAN_TOTAL_CAP_CHARS) {
+      const oldest = _orphanQueue.keys().next().value;
+      if (!oldest) break;
+      _orphanQueue.delete(oldest);
+    }
+  }
+}
+
+function _expireOrphans() {
+  const now = Date.now();
+  for (const [id, entry] of _orphanQueue.entries()) {
+    if (entry.expiresAt <= now) _orphanQueue.delete(id);
+  }
+}
+
+/** Drain any orphan buffer for the given stdinId into its newly known tab. */
+export function drainOrphanBuffer(stdinId: string, tabId: string) {
+  _expireOrphans();
+  const entry = _orphanQueue.get(stdinId);
+  if (!entry) return;
+  const store = useChatStore.getState();
+  if (entry.text) store.updatePartialMessage(tabId, entry.text);
+  if (entry.thinking) store.updatePartialThinking(tabId, entry.thinking);
+  _orphanQueue.delete(stdinId);
+}
+
+// --- Shared pendingCommand completion helper (#27) ---
+// Both foreground and background handlers must clear pendingCommandMsgId when
+// a result or assistant event arrives. Without this, slash commands like /compact
+// that complete on a background tab leave the spinner stuck forever.
+interface CompletePendingCommandOpts {
+  output?: string;
+  costSummary?: { cost: string; duration: string; turns: string | number; input: string; output: string; };
+}
+
+export function completePendingCommand(tabId: string, opts: CompletePendingCommandOpts = {}) {
+  const store = useChatStore.getState();
+  const tab = store.getTab(tabId);
+  const pendingCmdMsgId = tab?.sessionMeta.pendingCommandMsgId;
+  if (!pendingCmdMsgId) return;
+  const cmdMsg = (tab?.messages ?? []).find((m) => m.id === pendingCmdMsgId);
+  store.updateMessage(tabId, pendingCmdMsgId, {
+    commandCompleted: true,
+    commandData: {
+      ...cmdMsg?.commandData,
+      ...(opts.output !== undefined ? { output: opts.output } : {}),
+      ...(opts.costSummary ? { costSummary: opts.costSummary } : {}),
+      completedAt: Date.now(),
+    },
+  });
+  store.setSessionMeta(tabId, { pendingCommandMsgId: undefined });
+}
+
+// Interval fallback: flush any stuck buffers every 200ms
+let _flushIntervalId: ReturnType<typeof setInterval> | null = null;
+
+function _ensureFlushInterval() {
+  if (_flushIntervalId) return;
+  _flushIntervalId = setInterval(() => {
+    for (const [stdinId, buf] of _streamBuffers) {
+      if (buf.text || buf.thinking) {
+        _doFlush(stdinId, buf);
+      }
+    }
+    // Stop interval when no active buffers remain
+    if (_streamBuffers.size === 0 && _flushIntervalId) {
+      clearInterval(_flushIntervalId);
+      _flushIntervalId = null;
+    }
+  }, 200);
+}
 
 function _getBuffer(stdinId: string): _StreamBuffer {
   let buf = _streamBuffers.get(stdinId);
@@ -55,49 +164,49 @@ function _getBuffer(stdinId: string): _StreamBuffer {
   return buf;
 }
 
+/** Core flush logic — shared by rAF callback and interval fallback. */
+function _doFlush(stdinId: string, buf: _StreamBuffer) {
+  if (!buf.text && !buf.thinking) return;
+
+  const mappedId = useSessionStore.getState().getTabForStdin(stdinId);
+  const tabId = mappedId || useSessionStore.getState().selectedSessionId || undefined;
+  if (!mappedId && tabId) {
+    console.warn('[stream-flush] stdinId mapping missing, fallback to selectedSessionId:', stdinId, '→', tabId);
+    useSessionStore.getState().registerStdinTab(stdinId, tabId);
+  }
+  if (!tabId) {
+    // Instead of silent wipe, stash text in orphan queue so a late
+    // registerStdinTab() can drain it. Bounded and TTL'd.
+    _stashOrphan(stdinId, buf.text, buf.thinking);
+    buf.text = '';
+    buf.thinking = '';
+    return;
+  }
+
+  const store = useChatStore.getState();
+  if (buf.text) {
+    store.updatePartialMessage(tabId, buf.text);
+    buf.text = '';
+  }
+  if (buf.thinking) {
+    store.updatePartialThinking(tabId, buf.thinking);
+    buf.thinking = '';
+  }
+}
+
+// Register the drain callback so sessionStore.registerStdinTab can flush
+// orphaned buffers without creating a circular import dependency.
+setOrphanDrainCallback(drainOrphanBuffer);
+
 function _scheduleStreamFlush(stdinId: string) {
   const buf = _getBuffer(stdinId);
+  // Start the interval fallback on first buffer activity
+  _ensureFlushInterval();
   if (buf.raf) return;
   buf.raf = requestAnimationFrame(() => {
     buf.raf = 0;
-
-    // Resolve ownerTab from stdinId mapping — all updates go to this tab.
-    // Fallback to selectedSessionId if mapping is missing (prevents silent text loss #57)
-    const mappedId = useSessionStore.getState().getTabForStdin(stdinId);
-    const tabId = mappedId || useSessionStore.getState().selectedSessionId || undefined;
-    if (!mappedId && tabId) {
-      console.warn('[stream-flush] stdinId mapping missing, fallback to selectedSessionId:', stdinId, '→', tabId);
-      useSessionStore.getState().registerStdinTab(stdinId, tabId);
-    }
-    if (!tabId) {
-      buf.text = '';
-      buf.thinking = '';
-      return;
-    }
-
-    const store = useChatStore.getState();
-    if (buf.text) {
-      store.updatePartialMessage(tabId, buf.text);
-      buf.text = '';
-    }
-    if (buf.thinking) {
-      store.updatePartialThinking(tabId, buf.thinking);
-      buf.thinking = '';
-    }
+    _doFlush(stdinId, buf);
   });
-}
-
-/** Discard a stale session's stream buffer without flushing to UI.
- *  Use in stale stdinId guards to prevent cross-session partial text pollution. */
-function discardStreamBuffer(stdinId: string) {
-  const buf = _streamBuffers.get(stdinId);
-  if (buf) {
-    if (buf.raf) {
-      cancelAnimationFrame(buf.raf);
-      buf.raf = 0;
-    }
-    _streamBuffers.delete(stdinId);
-  }
 }
 
 /** Flush any buffered streaming text immediately (call before clearPartial).
@@ -114,34 +223,18 @@ export function flushStreamBuffer(stdinId?: string) {
       cancelAnimationFrame(buf.raf);
       buf.raf = 0;
     }
-    if (!buf.text && !buf.thinking) continue;
-
-    const mappedFlush = useSessionStore.getState().getTabForStdin(id);
-    const tabId = mappedFlush || useSessionStore.getState().selectedSessionId || undefined;
-    if (!mappedFlush && tabId) {
-      useSessionStore.getState().registerStdinTab(id, tabId);
-    }
-    if (!tabId) {
-      buf.text = '';
-      buf.thinking = '';
-      continue;
-    }
-    const store = useChatStore.getState();
-    if (buf.text) {
-      store.updatePartialMessage(tabId, buf.text);
-      buf.text = '';
-    }
-    if (buf.thinking) {
-      store.updatePartialThinking(tabId, buf.thinking);
-      buf.thinking = '';
-    }
+    _doFlush(id, buf);
   }
 
-  // Clean up empty buffers
+  // Clean up buffers and stop interval when all cleared
   if (!stdinId) {
     _streamBuffers.clear();
   } else {
     _streamBuffers.delete(stdinId);
+  }
+  if (_streamBuffers.size === 0 && _flushIntervalId) {
+    clearInterval(_flushIntervalId);
+    _flushIntervalId = null;
   }
 }
 
@@ -341,6 +434,11 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
           const text = evt.delta.text || '';
           if (text) store.updatePartialMessage(tabId, text);
+        } else if (evt.type === 'content_block_delta' && evt.delta?.type === 'thinking_delta') {
+          // F1 (#57): background tabs must handle thinking_delta too,
+          // otherwise thinking content is silently lost on tab switch.
+          const thinking = evt.delta.thinking || '';
+          if (thinking) store.updatePartialThinking(tabId, thinking);
         }
         // Early detection: create plan_review card for background tab (Plan mode only).
         // Bypass auto-approves via Rust backend — no UI card needed.
@@ -390,6 +488,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'assistant': {
+        // Clear pending command on assistant event (same as foreground)
+        completePendingCommand(tabId);
         const content = msg.message?.content;
         if (!Array.isArray(content)) break;
         // Selectively clear partial in tab — only wipe partialText if a text
@@ -550,21 +650,16 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'result': {
-        // --- Stale stdinId guard: skip state updates if this result belongs to a killed process ---
-        const bgCurrentStdinId = store.getTab(tabId)?.sessionMeta.stdinId;
-        if (msg.__stdinId && bgCurrentStdinId && msg.__stdinId !== bgCurrentStdinId) {
-          discardStreamBuffer(msg.__stdinId);
-          if ((window as any).__claudeUnlisteners?.[msg.__stdinId]) {
-            (window as any).__claudeUnlisteners[msg.__stdinId]();
-            delete (window as any).__claudeUnlisteners[msg.__stdinId];
-          }
-          useSessionStore.getState().unregisterStdinTab(msg.__stdinId);
-          break;
-        }
-
-        // Sub-agent results must not terminate the background session
-        if (msg.parent_tool_use_id) break;
-
+        // Clear pending command on result (e.g. /compact completing on background tab)
+        completePendingCommand(tabId, {
+          costSummary: msg.total_cost_usd != null ? {
+            cost: `$${msg.total_cost_usd?.toFixed(4) || '0'}`,
+            duration: msg.duration_ms ? `${(msg.duration_ms / 1000).toFixed(1)}s` : '',
+            turns: msg.num_turns ?? '',
+            input: msg.usage?.input_tokens?.toLocaleString() ?? '',
+            output: msg.usage?.output_tokens?.toLocaleString() ?? '',
+          } : undefined,
+        });
         store.setSessionStatus(tabId, msg.subtype === 'success' ? 'completed' : 'error');
         {
           const bgTab = store.getTab(tabId);
@@ -600,23 +695,29 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             });
           }
         }
-        // FIFO drain for background tabs (#142/#70): same logic as foreground.
+        // BATCH drain for background tabs: same as foreground — combine
+        // ALL pending messages into a single user turn.
         {
           const bgDrainTab = store.getTab(tabId);
-          const bgNextMsg = store.shiftPendingMessage(tabId);
+          const bgAllPending = bgDrainTab?.pendingUserMessages ?? [];
           const bgFlushStdinId = bgDrainTab?.sessionMeta.stdinId;
-          if (bgNextMsg && bgFlushStdinId) {
+          if (bgAllPending.length > 0 && bgFlushStdinId) {
+            const bgCombined = bgAllPending.join('\n\n');
+            store.clearPendingMessages(tabId);
+            store.addMessage(tabId, {
+              id: generateMessageId(),
+              role: 'user',
+              type: 'text',
+              content: bgCombined,
+              timestamp: Date.now(),
+            });
             store.setSessionStatus(tabId, 'running');
             store.setSessionMeta(tabId, { turnStartTime: Date.now(), lastProgressAt: Date.now(), inputTokens: 0, outputTokens: 0 });
             store.setActivityStatus(tabId, { phase: 'thinking' });
-            bridge.sendStdin(bgFlushStdinId, bgNextMsg).catch((err) => {
-              console.error('[TC:bg] Failed to send pending message:', err);
-              const bgRemaining = store.getTab(tabId)?.pendingUserMessages ?? [];
-              const bgAllFailed = [bgNextMsg, ...bgRemaining];
+            bridge.sendStdin(bgFlushStdinId, bgCombined).catch((err) => {
+              console.error('[TC:bg] Failed to send pending messages:', err);
               const bgDraft = store.getTab(tabId)?.inputDraft ?? '';
-              const bgFailedText = bgAllFailed.join('\n\n');
-              store.setInputDraft(tabId, bgDraft ? `${bgDraft}\n\n${bgFailedText}` : bgFailedText);
-              store.clearPendingMessages(tabId);
+              store.setInputDraft(tabId, bgDraft ? `${bgDraft}\n\n${bgCombined}` : bgCombined);
               store.setSessionStatus(tabId, 'error');
             });
           }
@@ -674,25 +775,40 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'process_exit': {
-        // --- Stale stdinId guard: don't clobber state if a newer session is already active ---
-        const bgStdinId = msg.__stdinId;
-        const bgExitCurrentStdinId = store.getTab(tabId)?.sessionMeta.stdinId;
-        if (bgStdinId && bgExitCurrentStdinId && bgStdinId !== bgExitCurrentStdinId) {
-          discardStreamBuffer(bgStdinId);
-          if ((window as any).__claudeUnlisteners?.[bgStdinId]) {
-            (window as any).__claudeUnlisteners[bgStdinId]();
-            delete (window as any).__claudeUnlisteners[bgStdinId];
-          }
-          useSessionStore.getState().unregisterStdinTab(bgStdinId);
-          break;
-        }
-
         // Flush any remaining stream buffer before cleanup (#64)
         flushStreamBuffer(msg.__stdinId);
+
+        // Flush mid-stream content to final messages BEFORE setSessionStatus('idle')
+        // wipes partialText/partialThinking. Same rationale as the foreground
+        // handler: preserve interrupted content so the user doesn't lose it.
+        {
+          const bgTab = store.getTab(tabId);
+          const bgThinking = bgTab?.partialThinking ?? '';
+          const bgText = bgTab?.partialText ?? '';
+          if (bgThinking.trim().length > 0) {
+            store.addMessage(tabId, {
+              id: `interrupted_thinking_${Date.now()}`,
+              role: 'assistant',
+              type: 'thinking',
+              content: bgThinking,
+              timestamp: Date.now(),
+            });
+          }
+          if (bgText.trim().length > 0) {
+            store.addMessage(tabId, {
+              id: `interrupted_text_${Date.now()}`,
+              role: 'assistant',
+              type: 'text',
+              content: bgText,
+              timestamp: Date.now(),
+            });
+          }
+        }
 
         // P0-5: Clean up Tauri event listeners for background tab.
         // __claudeUnlisteners is keyed by stdinId (desk_xxx), NOT tabId (session uuid).
         // Use msg.__stdinId (tagged by the listener closure) to find the correct entry.
+        const bgStdinId = msg.__stdinId;
         if (bgStdinId && (window as any).__claudeUnlisteners?.[bgStdinId]) {
           (window as any).__claudeUnlisteners[bgStdinId]();
           delete (window as any).__claudeUnlisteners[bgStdinId];
@@ -968,6 +1084,35 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // Diagnostic: log tool_use starts for debugging plan mode flow
         if (evt.type === 'content_block_start' && evt.content_block?.type === 'tool_use') {
           console.log('[TOKENICODE:stream] tool_use start:', evt.content_block.name);
+
+          // UX: immediately surface that a tool is running. Without this, the
+          // user sees no feedback during long tool input streams (e.g. Write
+          // streaming a 2000-word article takes ~50s, during which the
+          // ActivityIndicator stays in 'thinking' phase and no card appears).
+          // We add a placeholder tool_use card keyed by the content_block.id;
+          // when case 'assistant' arrives with the full message, addMessage's
+          // id-based dedup will merge the actual toolInput into this card.
+          // Skip ExitPlanMode (handled by plan_review path) and Task/Agent/
+          // TaskCreate/SendMessage (handled by agent registration below).
+          const toolName = evt.content_block.name;
+          if (toolName !== 'ExitPlanMode'
+              && toolName !== 'Task'
+              && toolName !== 'Agent'
+              && toolName !== 'TaskCreate'
+              && toolName !== 'SendMessage') {
+            setActivityStatus({ phase: 'tool', toolName });
+            agentActions.updatePhase(agentId, 'tool', toolName);
+            addMessage({
+              id: evt.content_block.id || `tool_placeholder_${Date.now()}`,
+              role: 'assistant',
+              type: 'tool_use',
+              content: '',
+              toolName,
+              toolInput: {},
+              subAgentDepth: agentDepth,
+              timestamp: Date.now(),
+            });
+          }
         }
 
         if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
@@ -1462,21 +1607,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
       case 'result': {
 
-        // --- Stale stdinId guard: skip ALL state updates (including sub-agent) if this
-        // result belongs to a killed process. Must be before parent_tool_use_id check
-        // to prevent stale sub-agent results from affecting the current session's agents.
-        const currentStdinId_result = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
-        if (msgStdinId && currentStdinId_result && msgStdinId !== currentStdinId_result) {
-          console.warn('[TOKENICODE:stream] Stale result event ignored:', msgStdinId, '!= current', currentStdinId_result);
-          discardStreamBuffer(msgStdinId);
-          if ((window as any).__claudeUnlisteners?.[msgStdinId]) {
-            (window as any).__claudeUnlisteners[msgStdinId]();
-            delete (window as any).__claudeUnlisteners[msgStdinId];
-          }
-          useSessionStore.getState().unregisterStdinTab(msgStdinId);
-          break;
-        }
-
         // Sub-agent results carry parent_tool_use_id — they must NOT terminate the
         // main session. Only the main agent's result (no parent_tool_use_id) ends the
         // session. Without this guard, the first parallel sub-agent to complete would
@@ -1825,15 +1955,29 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           break; // Skip pending message flush — compact takes priority
         }
 
-        // FIFO drain: dequeue ONE pending message and send it (#142/#70).
-        // When this turn completes, the next result event will dequeue the next one.
-        // Previously all pending messages were joined and sent at once, which could
-        // overwhelm the CLI. Sequential turn-by-turn processing is safer.
+        // BATCH drain: combine ALL pending messages into a single user turn
+        // and send at once. The user's mental model is "I'm adding more
+        // context to the current task" — sending them one-by-one would
+        // make the AI handle each separately, which is rarely what the
+        // user wants. Combine them so the AI processes everything in one go.
         {
           const drainTab = useChatStore.getState().getTab(tabId);
-          const nextMsg = useChatStore.getState().shiftPendingMessage(tabId);
+          const allPending = drainTab?.pendingUserMessages ?? [];
           const flushStdinId = drainTab?.sessionMeta.stdinId;
-          if (nextMsg && flushStdinId) {
+          if (allPending.length > 0 && flushStdinId) {
+            const nextMsg = allPending.join('\n\n');
+            useChatStore.getState().clearPendingMessages(tabId);
+
+            // Add as a single user message — InputBar deliberately did NOT
+            // addMessage when enqueueing, because ChatPanel renders pending
+            // messages after the streaming bubble. Now they merge into one turn.
+            addMessage({
+              id: generateMessageId(),
+              role: 'user',
+              type: 'text',
+              content: nextMsg,
+              timestamp: Date.now(),
+            });
             const nextTurnStartedAt = Date.now();
             setSessionStatus('running');
             setSessionMeta({
@@ -1853,14 +1997,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               isMain: true,
             });
             bridge.sendStdin(flushStdinId, nextMsg).catch((err) => {
-              console.error('[TC] Failed to send pending message:', err);
-              // Restore failed message + remaining queue to input draft
-              const remaining = useChatStore.getState().getTab(tabId)?.pendingUserMessages ?? [];
-              const allFailed = [nextMsg, ...remaining];
+              console.error('[TC] Failed to send pending messages:', err);
               const draft = useChatStore.getState().getTab(tabId)?.inputDraft ?? '';
-              const failedText = allFailed.join('\n\n');
-              useChatStore.getState().setInputDraft(tabId, draft ? `${draft}\n\n${failedText}` : failedText);
-              useChatStore.getState().clearPendingMessages(tabId);
+              useChatStore.getState().setInputDraft(tabId, draft ? `${draft}\n\n${nextMsg}` : nextMsg);
               setSessionStatus('error');
             });
           }
@@ -1890,18 +2029,44 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       }
 
       case 'process_exit': {
-        // --- Stale stdinId guard: don't clobber state if a newer session is already active ---
-        const currentStdinId_exit = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
-        if (msgStdinId && currentStdinId_exit && msgStdinId !== currentStdinId_exit) {
-          console.warn('[TOKENICODE:session] Stale process_exit ignored:', msgStdinId, '!= current', currentStdinId_exit);
-          // Discard stale buffer + clean up the old listener and mapping
-          discardStreamBuffer(msgStdinId);
-          if ((window as any).__claudeUnlisteners?.[msgStdinId]) {
-            (window as any).__claudeUnlisteners[msgStdinId]();
-            delete (window as any).__claudeUnlisteners[msgStdinId];
+        // STEP 1: Force-flush the per-stdinId rAF stream buffer into
+        // chatStore.partialText / partialThinking BEFORE reading them.
+        // Otherwise the last few text_delta tokens that arrived just
+        // before Stop was pressed will still be sitting in the in-memory
+        // buffer (rAF scheduled, not yet committed to store) and we'd
+        // miss them.
+        flushStreamBuffer(msg.__stdinId);
+
+        // STEP 2: Flush any mid-stream content to final messages so it
+        // survives the Stop button / kill_session path.
+        {
+          const exitTabData = useChatStore.getState().getTab(tabId);
+          const pThinking = exitTabData?.partialThinking ?? '';
+          const pText = exitTabData?.partialText ?? '';
+          console.log('[TOKENICODE:session] process_exit flush check', {
+            stdinId: msg.__stdinId,
+            hasText: pText.length > 0,
+            hasThinking: pThinking.length > 0,
+            textPreview: pText.slice(0, 40),
+          });
+          if (pThinking.trim().length > 0) {
+            addMessage({
+              id: `interrupted_thinking_${Date.now()}`,
+              role: 'assistant',
+              type: 'thinking',
+              content: pThinking,
+              timestamp: Date.now(),
+            });
           }
-          useSessionStore.getState().unregisterStdinTab(msgStdinId);
-          break;
+          if (pText.trim().length > 0) {
+            addMessage({
+              id: `interrupted_text_${Date.now()}`,
+              role: 'assistant',
+              type: 'text',
+              content: pText,
+              timestamp: Date.now(),
+            });
+          }
         }
 
         // The CLI process has exited — clear the stdin handle but keep sessionId for resume

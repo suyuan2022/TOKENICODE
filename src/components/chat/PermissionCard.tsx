@@ -74,20 +74,6 @@ export function PermissionCard({ message }: Props) {
     setRetrying(false);
   }, [message.id, permData]);
 
-  // Expose permission handler for test harness (debug builds only).
-  // Only expose when in pending state (not resolved/sending/failed).
-  // Usage via execute_js: window.__tokenicode_respond_permission(true)  // allow
-  //                       window.__tokenicode_respond_permission(false) // deny
-  if (import.meta.env.DEV) {
-    if (interactionState === 'pending') {
-      (window as any).__tokenicode_respond_permission = handleRespond;
-    } else if ((window as any).__tokenicode_respond_permission === handleRespond) {
-      // Clean up when this card leaves pending state, so status().pendingPermission
-      // doesn't stay true and cause wait-until-done to return permission_pending.
-      delete (window as any).__tokenicode_respond_permission;
-    }
-  }
-
   const handleRetry = useCallback(() => {
     setRetrying(true);
     // Reset to pending state, then let user choose again
@@ -104,8 +90,7 @@ export function PermissionCard({ message }: Props) {
   const isPending = interactionState === 'pending';
 
   return (
-    <div className={`ml-11 animate-scale-in ${isResolved ? 'opacity-60' : ''}`}
-      {...(import.meta.env.DEV && { 'data-testid': 'permission-card' })}>
+    <div className={`ml-11 animate-scale-in ${isResolved ? 'opacity-60' : ''}`}>
       <div className={`rounded-xl border overflow-hidden transition-all duration-200
         ${isResolved
           ? 'border-border-subtle bg-bg-secondary/30'
@@ -197,7 +182,6 @@ export function PermissionCard({ message }: Props) {
                     border-2 border-success/40 text-success bg-success/5
                     hover:bg-success/15 transition-smooth cursor-pointer
                     flex items-center gap-1.5"
-                  {...(import.meta.env.DEV && { 'data-testid': 'permission-allow-button' })}
                 >
                   <svg width="12" height="12" viewBox="0 0 12 12" fill="none"
                     stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -211,7 +195,6 @@ export function PermissionCard({ message }: Props) {
                     text-text-muted border border-border-subtle
                     hover:bg-bg-secondary hover:text-text-primary
                     transition-smooth cursor-pointer"
-                  {...(import.meta.env.DEV && { 'data-testid': 'permission-deny-button' })}
                 >
                   {t('msg.permissionDenyHint')}
                 </button>

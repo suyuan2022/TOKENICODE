@@ -59,7 +59,10 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
       const tier = TIER_MAP[m.id];
       const mapping = activeProvider.modelMappings.find((mm) => mm.tier === tier);
       if (mapping?.providerModel) {
-        return { id: m.id, label: `${m.short} → ${mapping.providerModel}`, short: m.short, mapped: true, isExtra: false };
+        // Show only the provider model name — the actual backend being called.
+        // The Claude-side tier prefix ("Opus 4.6 →") is noise since the mapping
+        // is user-configured and the provider name is what matters (#74).
+        return { id: m.id, label: mapping.providerModel, short: mapping.providerModel, mapped: true, isExtra: false };
       }
       return { id: m.id, label: m.label, short: m.short, mapped: false, isExtra: false };
     });
@@ -88,7 +91,6 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
           text-xs text-text-muted hover:text-text-primary
           hover:bg-bg-secondary transition-smooth
           disabled:opacity-40 disabled:cursor-not-allowed"
-        {...(import.meta.env.DEV && { 'data-testid': 'model-selector' })}
       >
         <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
           stroke="currentColor" strokeWidth="1.5" className="flex-shrink-0">
@@ -138,7 +140,6 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
                     ? 'text-accent bg-accent/5'
                     : 'text-text-muted hover:text-text-primary hover:bg-bg-secondary'
                   }`}
-                {...(import.meta.env.DEV && { 'data-testid': `model-option-${option.id}` })}
               >
                 <div className="min-w-0">
                   <div className={`font-medium truncate ${option.mapped ? 'font-mono' : ''}`}>{option.label}</div>

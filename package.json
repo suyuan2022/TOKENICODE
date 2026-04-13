@@ -1,7 +1,7 @@
 {
   "name": "tokenicode",
   "private": true,
-  "version": "0.10.0",
+  "version": "0.10.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -47,7 +47,6 @@
     "rehype-sanitize": "^6.0.0",
     "remark-cjk-friendly": "^2.0.1",
     "remark-gfm": "^4.0.1",
-    "tauri-plugin-mcp": "^0.1.0",
     "zustand": "^5.0.11"
   },
   "devDependencies": {
