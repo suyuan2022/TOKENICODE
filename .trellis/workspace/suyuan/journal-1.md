@@ -140,3 +140,54 @@ suyuan 分支未提交改动包含完整的 CLI-to-GUI 测试桥：
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: feat/e2e-test-harness 分支拆分 + push
+
+**Date**: 2026-04-13
+**Task**: feat/e2e-test-harness 分支拆分 + push
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+## 本次工作
+
+从 suyuan 工作分支的混合 commit 中，拆分出纯测试基建代码到独立的 `feat/e2e-test-harness` 分支。
+
+### 做了什么
+- 从 main (v0.10.2) 创建 feat/e2e-test-harness 分支
+- 逐文件 cherry-pick 测试相关改动（19 files, +2094/-15）
+- 精确排除 bug fix 代码（haiku clamp、stdinId guard、Unicode 判空、CLI_INTERNAL_RESULTS filter、LRU guard）
+- 对混合文件（InputBar.tsx、lib.rs）手动挑选 hunk
+- pnpm build + cargo check 通过
+- Push 到 fork: suyuan2022/TOKENICODE feat/e2e-test-harness
+
+### 分支用途
+- 作为独立 PR 提给上游 yiliqi78/TOKENICODE
+- 团队成员可以直接拉这个分支获取测试能力
+- 后续测试工作流更新在此分支迭代，suyuan 分支同步
+
+### 清理
+- 删除了上游 trellis 模板带来的两个空壳命令：before-backend-dev（指向不存在的 spec/backend/）、before-frontend-dev（与 /trellis:start 重复）
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6e2e01b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
