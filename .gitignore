@@ -43,3 +43,6 @@ package-lock.json
 
 # Obsidian
 .obsidian/
+
+# Local test harness (not shared upstream)
+.test/

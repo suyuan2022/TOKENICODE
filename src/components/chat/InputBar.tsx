@@ -694,7 +694,8 @@ export function InputBar() {
       useCommandStore.getState().clearPrefix();
     }
 
-    if (!text) return;
+    // Check if text is visually empty (strip invisible Unicode chars for the check only)
+    if (!text.replace(/[\u200B-\u200D\uFEFF\u00A0\u2060\u200E\u200F]/g, '').trim()) return;
 
     // Intercept immediate (built-in) commands even when submitted directly
     // (e.g. user types "/help" and presses Enter without using the popover)
@@ -1137,6 +1138,18 @@ export function InputBar() {
   // Keep ref in sync so executeImmediateCommand can call latest handleSubmit
   handleSubmitRef.current = handleSubmit;
 
+  // Expose send handler for test harness (dev only)
+  useEffect(() => {
+    if (import.meta.env.DEV) {
+      (window as any).__tokenicode_send = handleSubmit;
+    }
+    return () => {
+      if (import.meta.env.DEV) {
+        delete (window as any).__tokenicode_send;
+      }
+    };
+  }, [handleSubmit]);
+
   // handleStreamMessage and handleBackgroundStreamMessage are provided by
   // useStreamProcessor hook (see src/hooks/useStreamProcessor.ts).
 
@@ -1506,6 +1519,7 @@ export function InputBar() {
                   }, 3000);
                 }
               }}
+              {...(import.meta.env.DEV && { 'data-testid': 'stop-button' })}
               className="flex-shrink-0 self-end w-8 h-8 rounded-[10px]
                 bg-red-500/15 text-red-500
                 flex items-center justify-center
@@ -1521,6 +1535,7 @@ export function InputBar() {
           <button
             onClick={handleSubmit}
             disabled={isAwaiting || (!input.trim() && !activePrefix)}
+            {...(import.meta.env.DEV && { 'data-testid': 'send-button' })}
             className={`flex-shrink-0 self-end w-8 h-8 rounded-[10px]
               flex items-center justify-center transition-smooth
               disabled:opacity-30 disabled:cursor-not-allowed

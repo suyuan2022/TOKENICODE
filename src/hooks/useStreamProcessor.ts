@@ -9,6 +9,12 @@ import { envFingerprint, resolveModelForProvider } from '../lib/api-provider';
 import { useProviderStore } from '../stores/providerStore';
 import { t } from '../lib/i18n';
 
+// Known CLI internal result strings that should not be shown to users
+const CLI_INTERNAL_RESULTS = new Set([
+  'No response requested.',
+  '[Tool result missing due to internal error]',
+]);
+
 // --- Error classification for user-facing messages ---
 // Each pattern maps to a friendly i18n key. Matched errors show the friendly
 // message as primary text with raw error in a collapsible details block.
@@ -207,6 +213,15 @@ function _scheduleStreamFlush(stdinId: string) {
     buf.raf = 0;
     _doFlush(stdinId, buf);
   });
+}
+
+/** Discard a stale session's stream buffer without flushing to UI.
+ *  Use in stale stdinId guards to prevent cross-session partial text pollution. */
+function discardStreamBuffer(stdinId: string) {
+  const buf = _streamBuffers.get(stdinId);
+  if (!buf) return;
+  if (buf.raf) cancelAnimationFrame(buf.raf);
+  _streamBuffers.delete(stdinId);
 }
 
 /** Flush any buffered streaming text immediately (call before clearPartial).
@@ -515,6 +530,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const block = content[blockIdx];
           if (block.type === 'text') {
             if (bgHasAskUserQuestion) continue;
+            if (CLI_INTERNAL_RESULTS.has(block.text)) continue;
             const textId = msg.uuid ? `${msg.uuid}_text_${blockIdx}` : generateMessageId();
             store.addMessage(tabId, {
               id: textId,
@@ -680,7 +696,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             lastProgressAt: undefined,
           });
         }
-        if (typeof msg.result === 'string' && msg.result) {
+        if (typeof msg.result === 'string' && msg.result && !CLI_INTERNAL_RESULTS.has(msg.result)) {
           // Only add if not already delivered via 'assistant' event
           const bgTab = store.getTab(tabId);
           const bgIsDuplicate = bgTab?.messages.some(
@@ -1293,6 +1309,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const block = content[blockIdx];
           if (block.type === 'text') {
             if (hasAskUserQuestion) continue;
+            if (CLI_INTERNAL_RESULTS.has(block.text)) continue;
             setActivityStatus({ phase: 'writing' });
             agentActions.updatePhase(agentId, 'writing');
             // Use msg.uuid + block index as stable ID so re-delivered
@@ -1778,7 +1795,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // Mark pending processing card (CLI slash command) as completed
         const pendingCmdMsgId = useChatStore.getState().getTab(tabId)?.sessionMeta.pendingCommandMsgId;
         if (pendingCmdMsgId) {
-          const resultOutput = typeof msg.result === 'string' ? msg.result : '';
+          const resultOutput = typeof msg.result === 'string' && !CLI_INTERNAL_RESULTS.has(msg.result) ? msg.result : '';
           useChatStore.getState().updateMessage(tabId, pendingCmdMsgId, {
             commandCompleted: true,
             commandData: {
@@ -1792,7 +1809,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
 
         // Extract result text for display (e.g., slash command output)
         let resultDisplayText = '';
-        if (typeof msg.result === 'string' && msg.result) {
+        if (typeof msg.result === 'string' && msg.result && !CLI_INTERNAL_RESULTS.has(msg.result)) {
           resultDisplayText = msg.result;
         } else if (typeof msg.content === 'string' && msg.content) {
           resultDisplayText = msg.content;
@@ -2029,6 +2046,14 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       }
 
       case 'process_exit': {
+        // --- Stale stdinId guard: don't clobber state if a newer session is already active ---
+        const currentStdinId_exit = useChatStore.getState().getTab(tabId)?.sessionMeta?.stdinId;
+        if (currentStdinId_exit && msg.__stdinId && currentStdinId_exit !== msg.__stdinId) {
+          console.warn('[TOKENICODE:session] Stale process_exit ignored:', msg.__stdinId, '!= current', currentStdinId_exit);
+          discardStreamBuffer(msg.__stdinId);
+          break;
+        }
+
         // STEP 1: Force-flush the per-stdinId rAF stream buffer into
         // chatStore.partialText / partialThinking BEFORE reading them.
         // Otherwise the last few text_delta tokens that arrived just

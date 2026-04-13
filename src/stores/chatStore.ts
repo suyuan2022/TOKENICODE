@@ -583,7 +583,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         if (oldest === undefined) break;
         if (oldest === tabId) continue; // don't evict the tab we're creating
         const entry = newTabs.get(oldest);
-        if (entry?.isStreaming || entry?.sessionStatus === 'running') continue; // protect active
+        // Don't evict tabs that are actively streaming or have pending partial content
+        if (entry?.isStreaming || entry?.sessionStatus === 'running' || entry?.sessionStatus === 'reconnecting' || entry?.partialText || entry?.partialThinking) continue; // protect active
         newTabs.delete(oldest);
       }
       // If all candidates are streaming, allow cache to exceed MAX_CACHE

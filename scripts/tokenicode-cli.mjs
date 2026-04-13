@@ -178,6 +178,10 @@ const commands = {
     return await callHelper(client, 'stop');
   },
 
+  async 'delete-session'(client) {
+    return await callHelper(client, 'deleteCurrentSession');
+  },
+
   // ── Chat: Read ──
 
   async 'get-messages'(client, { flags }) {
@@ -628,7 +632,7 @@ const commands = {
       usage: 'node scripts/tokenicode-cli.mjs <command> [args] [--flags]',
       commands: {
         health: ['ping', 'status', 'restart [--timeout MS]', 'relaunch [--timeout MS]'],
-        chat: ['type TEXT', 'send', 'stop', 'get-messages [--last N] [--all] [--tab ID] [--full]', 'check-editor'],
+        chat: ['type TEXT', 'send', 'stop', 'delete-session', 'get-messages [--last N] [--all] [--tab ID] [--full]', 'check-editor'],
         session: ['get-active-session', 'get-all-sessions', 'switch-session ID', 'new-session [--cwd PATH]'],
         model: ['get-current-model', 'get-current-provider', 'switch-model ID', 'switch-provider ID'],
         settings: ['open-settings', 'close-settings', 'switch-settings-tab ID'],
