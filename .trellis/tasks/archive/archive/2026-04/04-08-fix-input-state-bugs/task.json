@@ -1,0 +1,45 @@
+{
+  "id": "fix-input-state-bugs",
+  "name": "fix-input-state-bugs",
+  "title": "Fix pre-existing input state bugs (model switch deadlock + file drop text leak)",
+  "description": "",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "suyuan",
+  "assignee": "suyuan",
+  "createdAt": "2026-04-08",
+  "completedAt": "2026-04-13",
+  "branch": null,
+  "base_branch": "suyuan",
+  "worktree_path": null,
+  "current_phase": 0,
+  "next_action": [
+    {
+      "phase": 1,
+      "action": "implement"
+    },
+    {
+      "phase": 2,
+      "action": "check"
+    },
+    {
+      "phase": 3,
+      "action": "finish"
+    },
+    {
+      "phase": 4,
+      "action": "create-pr"
+    }
+  ],
+  "commit": "d34af50",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "Bug B (file drop text leak) fully fixed and user-verified. Bug A (model switch deadlock) technical layers fixed (regex + gate + routing race + helper extraction), but the A2 resume-skip trade-off introduced a context-continuity regression that was split out into 04-08-fix-model-switch-context-continuity.",
+  "meta": {}
+}

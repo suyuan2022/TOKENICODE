@@ -1,0 +1,5 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend development guide"}
+{"file": "src/hooks/useStreamProcessor.ts", "reason": "Core fix target: stale stdinId guard in result + process_exit handlers"}
+{"file": "src/components/chat/InputBar.tsx", "reason": "Empty message guard + stop button flow reference"}
+{"file": ".trellis/spec/frontend/hook-guidelines.md", "reason": "Hook coding standards"}

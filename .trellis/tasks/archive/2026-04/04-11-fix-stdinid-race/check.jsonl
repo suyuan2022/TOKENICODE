@@ -1,0 +1,5 @@
+{"file": ".claude/commands/trellis/finish-work.md", "reason": "Finish work checklist"}
+{"file": ".claude/commands/trellis/check-frontend.md", "reason": "Frontend check spec"}
+{"file": "src/hooks/useStreamProcessor.ts", "reason": "Verify stale guard correctness"}
+{"file": "src/components/chat/InputBar.tsx", "reason": "Verify empty message guard"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Quality standards"}

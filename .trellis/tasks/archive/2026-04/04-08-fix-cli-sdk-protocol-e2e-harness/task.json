@@ -1,0 +1,41 @@
+{
+  "id": "fix-cli-sdk-protocol-e2e-harness",
+  "name": "fix-cli-sdk-protocol-e2e-harness",
+  "title": "Fix CLI SDK control protocol bugs + bootstrap test harness",
+  "description": "",
+  "status": "completed",
+  "dev_type": "fullstack",
+  "scope": "src-tauri/src/lib.rs, src-tauri/src/protocol.rs, src-tauri/src/commands/claude_process.rs, src/hooks/useStreamProcessor.ts, src/stores/sessionStore.ts, src/stores/chatStore.ts, src/lib/tauri-bridge.ts, src-tauri/tests/, src-tauri/tests/fixtures/, .trellis/spec/backend/, .trellis/spec/frontend/testing.md, package.json, Cargo.toml, CLAUDE.md",
+  "package": null,
+  "priority": "P2",
+  "creator": "suyuan",
+  "assignee": "suyuan",
+  "createdAt": "2026-04-08",
+  "completedAt": "2026-04-13",
+  "branch": "fix/cli-sdk-protocol-e2e-harness",
+  "base_branch": "suyuan",
+  "worktree_path": "/Users/suyuan/Documents/夙愿's库/01 主业/01 Her产品/源码/trellis-worktrees/fix/cli-sdk-protocol-e2e-harness",
+  "current_phase": 1,
+  "next_action": [
+    {
+      "phase": 1,
+      "action": "implement"
+    },
+    {
+      "phase": 2,
+      "action": "check"
+    },
+    {
+      "phase": 3,
+      "action": "finish"
+    }
+  ],
+  "commit": "db30599 + d34af50",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "F1/F2/F3 SDK protocol bugs fixed in db30599. Follow-up Bug A (model switch deadlock) + Bug B (file drop text leak) discovered in manual GUI test and fixed in d34af50. Bug A has a known context-continuity regression tracked in 04-08-fix-model-switch-context-continuity.",
+  "meta": {}
+}

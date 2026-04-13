@@ -1,0 +1,12 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend development guide"}
+{"file": ".trellis/spec/backend/testing.md", "reason": "Backend testing conventions and test-harness context"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer data flow (Rust↔React via Tauri events)"}
+{"file": "src-tauri/src/lib.rs", "reason": "Main Tauri command handlers - patterns to follow"}
+{"file": "src-tauri/src/protocol.rs", "reason": "SDK control protocol types reference"}
+{"file": "src/lib/tauri-bridge.ts", "reason": "Frontend IPC bridge - all Tauri invoke calls"}
+{"file": "src/stores/chatStore.ts", "reason": "Chat store - state shape for test snapshots"}
+{"file": "src/stores/sessionStore.ts", "reason": "Session store - tab routing and stdinId mapping"}
+{"file": "src/hooks/useStreamProcessor.ts", "reason": "Stream processor - background tab event handling"}
+{"file": "src-tauri/Cargo.toml", "reason": "Cargo deps - add axum under test-harness feature"}
+{"file": "src-tauri/src/commands/claude_process.rs", "reason": "ProcessManager types - process lifecycle patterns"}

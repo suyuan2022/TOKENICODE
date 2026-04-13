@@ -1,0 +1,9 @@
+{"file": ".claude/commands/trellis/finish-work.md", "reason": "Finish work checklist"}
+{"file": ".claude/commands/trellis/check.md", "reason": "Code quality check spec"}
+{"file": ".trellis/spec/backend/testing.md", "reason": "Verify test harness follows backend conventions"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Check cross-layer state sync correctness"}
+{"file": "src-tauri/src/lib.rs", "reason": "Verify integration with main Tauri setup"}
+{"file": "src-tauri/src/protocol.rs", "reason": "Verify protocol types used correctly"}
+{"file": "src/lib/tauri-bridge.ts", "reason": "Verify frontend harness doesn't conflict with production bridge"}
+{"file": "src/stores/chatStore.ts", "reason": "Verify test state reporting doesn't pollute store"}
+{"file": "src-tauri/Cargo.toml", "reason": "Verify feature gating - no axum in release"}

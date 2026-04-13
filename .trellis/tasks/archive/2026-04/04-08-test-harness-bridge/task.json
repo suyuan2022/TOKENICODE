@@ -1,0 +1,45 @@
+{
+  "id": "test-harness-bridge",
+  "name": "test-harness-bridge",
+  "title": "Build CLI-to-GUI test harness bridge for TOKENICODE",
+  "description": "",
+  "status": "completed",
+  "completedAt": "2026-04-13",
+  "dev_type": "fullstack",
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "suyuan",
+  "assignee": "suyuan",
+  "createdAt": "2026-04-08",
+  "branch": "feature/test-harness-bridge",
+  "base_branch": "suyuan",
+  "worktree_path": "/Users/suyuan/Documents/夙愿's库/01 主业/01 Her产品/源码/trellis-worktrees/feature/test-harness-bridge",
+  "current_phase": 2,
+  "next_action": [
+    {
+      "phase": 1,
+      "action": "implement"
+    },
+    {
+      "phase": 2,
+      "action": "check"
+    },
+    {
+      "phase": 3,
+      "action": "finish"
+    },
+    {
+      "phase": 4,
+      "action": "create-pr"
+    }
+  ],
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
