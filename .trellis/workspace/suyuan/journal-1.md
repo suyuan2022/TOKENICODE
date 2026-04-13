@@ -191,3 +191,52 @@ suyuan 分支未提交改动包含完整的 CLI-to-GUI 测试桥：
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 提交 6 个 PR 到上游
+
+**Date**: 2026-04-13
+**Task**: 提交 6 个 PR 到上游
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+## 提交 PR
+
+向 yiliqi78/TOKENICODE 提交 6 个 PR，每个 bug fix 独立分支、独立 PR：
+
+| PR | 分支 | 内容 |
+|----|------|------|
+| #81 | feat/e2e-test-harness | E2E 测试基建（socket harness + CLI 工具 + data-testid） |
+| #82 | fix/haiku-effort-clamp | Haiku effort level 钳位（budget_tokens 上限 16384） |
+| #83 | fix/stdinid-race-guard | 中断后再发消息丢失修复（#80） |
+| #84 | fix/empty-message-unicode | Unicode 不可见字符空消息判空 |
+| #85 | fix/cli-internal-result-filter | CLI 内部协议文本过滤（"No response requested."） |
+| #86 | fix/lru-eviction-guard | LRU tab 驱逐保护加强 |
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a5b51f2` | (see git log) |
+| `8b93806` | (see git log) |
+| `ef4db92` | (see git log) |
+| `6bbeb7a` | (see git log) |
+| `57b6152` | (see git log) |
+| `6e2e01b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
