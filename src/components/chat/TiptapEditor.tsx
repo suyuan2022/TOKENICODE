@@ -47,6 +47,8 @@ export interface TiptapEditorHandle {
 interface TiptapEditorProps {
   /** Placeholder text */
   placeholder?: string;
+  /** Whether the editor accepts input */
+  editable?: boolean;
   /** Called whenever the content changes (debounce-free) */
   onUpdate?: (text: string) => void;
   /** Called on keydown — receives the native keyboard event */
@@ -94,6 +96,14 @@ function editorToPlainText(editor: ReturnType<typeof useEditor>): string {
   return parts.join('\n');
 }
 
+function liveDomToPlainText(root: HTMLElement | null): string {
+  if (!root) return '';
+  return (root.innerText || root.textContent || '')
+    .replace(/\u200b/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trimEnd();
+}
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -102,6 +112,7 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
   function TiptapEditor(props, ref) {
     const {
       placeholder = '',
+      editable = true,
       onUpdate,
       onKeyDown,
       onPaste,
@@ -135,6 +146,7 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
         Placeholder.configure({ placeholder }),
         FileChipWithView,
       ],
+      editable,
       editorProps: {
         attributes: {
           class: 'tiptap outline-none',
@@ -207,8 +219,16 @@ export const TiptapEditor = forwardRef<TiptapEditorHandle, TiptapEditorProps>(
       });
     }, [editor, placeholder]);
 
+    useEffect(() => {
+      if (!editor) return;
+      editor.setEditable(editable);
+    }, [editor, editable]);
+
     useImperativeHandle(ref, () => ({
       getText() {
+        if (composingRef.current) {
+          return liveDomToPlainText(wrapperRef.current);
+        }
         return editorToPlainText(editor);
       },
       setText(text: string) {

@@ -7,7 +7,13 @@ import { settingsEvents } from '../lib/settingsEvents';
 export type Theme = 'light' | 'dark' | 'system';
 export type ColorTheme = 'black' | 'blue' | 'orange' | 'green';
 export type SecondaryPanelTab = 'files' | 'skills';
-export type ModelId = 'claude-opus-4-7' | 'claude-sonnet-4-6' | 'claude-haiku-4-5-20251001';
+export type ModelId =
+  | 'claude-opus-4-7'
+  | 'claude-opus-4-7-1m' // legacy alias, kept for persisted settings compatibility
+  | 'claude-opus-4-6'
+  | 'claude-opus-4-6-1m'
+  | 'claude-sonnet-4-6'
+  | 'claude-haiku-4-5-20251001';
 export type SessionMode = 'code' | 'ask' | 'plan' | 'bypass';
 /** CLI permission mode for the SDK control protocol */
 export type CliPermissionMode = 'acceptEdits' | 'default' | 'plan' | 'bypassPermissions';
@@ -26,10 +32,14 @@ export type ThinkingLevel = 'off' | 'low' | 'medium' | 'high' | 'max';
 
 // --- Model options (display mapping) ---
 
+// UI display rule: 4.7 is shown once because it ships with 1M context by default.
+// 4.6 keeps a separate 1M variant so users can choose the larger window.
 export const MODEL_OPTIONS: { id: ModelId; label: string; short: string }[] = [
-  { id: 'claude-opus-4-7', label: 'Claude Opus 4.7', short: 'Opus 4.7' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', short: 'Sonnet 4.6' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', short: 'Haiku 4.5' },
+  { id: 'claude-opus-4-7', label: 'Opus 4.7', short: 'Opus 4.7' },
+  { id: 'claude-opus-4-6', label: 'Opus 4.6', short: 'Opus 4.6' },
+  { id: 'claude-opus-4-6-1m', label: 'Opus 4.6 (1M)', short: 'Opus 4.6 (1M)' },
+  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', short: 'Sonnet 4.6' },
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', short: 'Haiku 4.5' },
 ];
 
 // --- Store State & Actions ---
@@ -293,16 +303,9 @@ export const useSettingsStore = create<SettingsState>()(
             persisted.selectedModel = 'claude-haiku-4-5-20251001';
           }
         }
-        if (version < 7) {
-          // Anthropic released Opus 4.7 with 1M context by default — no separate [1m] variant
-          // needed. Migrate any 4.6 or 4.6-1m selections to the unified claude-opus-4-7.
-          if (
-            persisted.selectedModel === 'claude-opus-4-6' ||
-            persisted.selectedModel === 'claude-opus-4-6-1m'
-          ) {
-            persisted.selectedModel = 'claude-opus-4-7';
-          }
-        }
+        // v7 migration removed (Phase 2 §2.5 / §5.1): users are free to pick
+        // 4.6 / 4.6-1m / 4.7 / 4.7-1m. The earlier migration forcibly rewrote
+        // 4.6 selections to 4.7, which silently broke old-CLI users.
         return persisted;
       },
       partialize: (state) => ({
@@ -361,6 +364,14 @@ export function setSessionModeLocal(mode: SessionMode): void {
   useSettingsStore.getState().setSessionMode(mode);
 }
 
+// Phase 2 §2.3 runtime sync policy:
+//
+// - sessionMode change → SDK control protocol `set_permission_mode` on the
+//   live session (no kill). Handled here.
+// - selectedModel / thinkingLevel / activeProviderId change → DO NOT kill.
+//   InputBar.handleSubmit detects the spawnConfigHash mismatch on the next
+//   user send and handles teardown + resume spawn. Killing here would drop
+//   in-flight turns and cross-tab races between the sidebar and pre-warm.
 useSettingsStore.subscribe((state, prevState) => {
   if (state.sessionMode === prevState.sessionMode) return;
 

@@ -50,7 +50,9 @@ export const DEFAULT_CONFIG: StreamControllerConfig = {
   ttlMs: 5_000,
   perStdinCapChars: 1 * 1024 * 1024,
   totalCapChars: 10 * 1024 * 1024,
-  intervalMs: 200,
+  // Keep the fallback flush responsive so background/slow tabs do not batch
+  // visible updates into 200ms-sized jumps.
+  intervalMs: 50,
 };
 
 export type StreamEvent =
@@ -63,12 +65,19 @@ export type StreamEvent =
 type Listener = (evt: StreamEvent) => void;
 
 interface Buffer { text: string; thinking: string; raf: number }
-interface Orphan { text: string; thinking: string; expiresAt: number }
+interface Orphan {
+  text: string;
+  thinking: string;
+  events: unknown[];
+  eventBytes: number;
+  expiresAt: number;
+}
 
 export class StreamController {
   private readonly buffers = new Map<StdinId, Buffer>();
   private readonly orphans = new Map<StdinId, Orphan>();
   private readonly completedOnce = new Set<StdinId>();
+  private readonly eagerThinkingFlushed = new Set<StdinId>();
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private readonly listeners = new Set<Listener>();
 
@@ -93,7 +102,18 @@ export class StreamController {
     if (!text) return;
     if (this.completedOnce.has(stdinId)) return;
     const buf = this.getOrCreateBuffer(stdinId);
+    const shouldFlushImmediately = !this.eagerThinkingFlushed.has(stdinId)
+      && !buf.text
+      && !buf.thinking
+      && !buf.raf;
     buf.thinking += text;
+    if (shouldFlushImmediately) {
+      this.eagerThinkingFlushed.add(stdinId);
+      this.doFlush(stdinId, buf);
+      if (!buf.text && !buf.thinking) this.buffers.delete(stdinId);
+      if (this.buffers.size === 0) this.stopInterval();
+      return;
+    }
     this.schedule(stdinId, buf);
   }
 
@@ -131,6 +151,7 @@ export class StreamController {
     const buf = this.buffers.get(stdinId);
     if (buf?.raf) this.scheduler.cancelRaf(buf.raf);
     this.buffers.delete(stdinId);
+    this.eagerThinkingFlushed.delete(stdinId);
     if (this.buffers.size === 0) this.stopInterval();
   }
 
@@ -142,6 +163,7 @@ export class StreamController {
   completeStream(stdinId: StdinId): void {
     if (this.completedOnce.has(stdinId)) return;
     this.completedOnce.add(stdinId);
+    this.eagerThinkingFlushed.delete(stdinId);
     const buf = this.buffers.get(stdinId);
     if (buf) {
       if (buf.raf) { this.scheduler.cancelRaf(buf.raf); buf.raf = 0; }
@@ -156,6 +178,7 @@ export class StreamController {
   /** Test/cleanup hook: reset completion guard (e.g., stdinId reused). */
   forgetCompletion(stdinId: StdinId): void {
     this.completedOnce.delete(stdinId);
+    this.eagerThinkingFlushed.delete(stdinId);
   }
 
   // --- Orphan queue ---
@@ -166,25 +189,39 @@ export class StreamController {
     const existing = this.orphans.get(stdinId);
     const expiresAt = this.scheduler.now() + this.config.ttlMs;
     const merged: Orphan = existing
-      ? { text: existing.text + text, thinking: existing.thinking + thinking, expiresAt }
-      : { text, thinking, expiresAt };
-    const mergedChars = merged.text.length + merged.thinking.length;
-    if (mergedChars > this.config.perStdinCapChars) {
-      this.orphans.delete(stdinId);
-      this.emit({ type: 'orphan-dropped', stdinId, reason: 'per-cap' });
-      return;
-    }
-    this.orphans.set(stdinId, merged);
-    while (this.orphanTotalChars() > this.config.totalCapChars) {
-      const oldest = this.orphans.keys().next().value;
-      if (!oldest) break;
-      this.orphans.delete(oldest);
-      this.emit({ type: 'orphan-dropped', stdinId: oldest, reason: 'total-cap' });
-    }
-    this.emit({ type: 'orphan-stashed', stdinId, totalChars: this.orphanTotalChars() });
+      ? {
+        text: existing.text + text,
+        thinking: existing.thinking + thinking,
+        events: existing.events,
+        eventBytes: existing.eventBytes,
+        expiresAt,
+      }
+      : { text, thinking, events: [], eventBytes: 0, expiresAt };
+    this.commitOrphan(stdinId, merged);
   }
 
-  drainOrphan(stdinId: StdinId, tabId: TabId): void {
+  stashOrphanEvent(stdinId: StdinId, event: unknown): void {
+    this.expireOrphans();
+    const existing = this.orphans.get(stdinId);
+    const expiresAt = this.scheduler.now() + this.config.ttlMs;
+    const eventBytes = this.estimateEventBytes(event);
+    const merged: Orphan = existing
+      ? {
+        text: existing.text,
+        thinking: existing.thinking,
+        events: [...existing.events, event],
+        eventBytes: existing.eventBytes + eventBytes,
+        expiresAt,
+      }
+      : { text: '', thinking: '', events: [event], eventBytes, expiresAt };
+    this.commitOrphan(stdinId, merged);
+  }
+
+  drainOrphan(
+    stdinId: StdinId,
+    tabId: TabId,
+    replayEvent?: (event: unknown) => void,
+  ): void {
     this.expireOrphans();
     const entry = this.orphans.get(stdinId);
     if (!entry) return;
@@ -192,6 +229,11 @@ export class StreamController {
     if (entry.thinking) this.sink.updatePartialThinking(tabId, entry.thinking);
     this.orphans.delete(stdinId);
     this.emit({ type: 'orphan-drained', stdinId, tabId });
+    if (replayEvent) {
+      for (const event of entry.events) {
+        replayEvent(event);
+      }
+    }
   }
 
   expireOrphans(): void {
@@ -206,7 +248,9 @@ export class StreamController {
 
   orphanTotalChars(): number {
     let total = 0;
-    for (const e of this.orphans.values()) total += e.text.length + e.thinking.length;
+    for (const e of this.orphans.values()) {
+      total += e.text.length + e.thinking.length + e.eventBytes;
+    }
     return total;
   }
 
@@ -273,6 +317,32 @@ export class StreamController {
       buf.thinking = '';
     }
     this.emit({ type: 'partial-flushed', stdinId, tabId, textLen, thinkingLen });
+  }
+
+  private estimateEventBytes(event: unknown): number {
+    try {
+      const serialized = JSON.stringify(event);
+      return serialized ? serialized.length : 1;
+    } catch {
+      return 1;
+    }
+  }
+
+  private commitOrphan(stdinId: StdinId, entry: Orphan): void {
+    const totalBytes = entry.text.length + entry.thinking.length + entry.eventBytes;
+    if (totalBytes > this.config.perStdinCapChars) {
+      this.orphans.delete(stdinId);
+      this.emit({ type: 'orphan-dropped', stdinId, reason: 'per-cap' });
+      return;
+    }
+    this.orphans.set(stdinId, entry);
+    while (this.orphanTotalChars() > this.config.totalCapChars) {
+      const oldest = this.orphans.keys().next().value;
+      if (!oldest) break;
+      this.orphans.delete(oldest);
+      this.emit({ type: 'orphan-dropped', stdinId: oldest, reason: 'total-cap' });
+    }
+    this.emit({ type: 'orphan-stashed', stdinId, totalChars: this.orphanTotalChars() });
   }
 
   private emit(evt: StreamEvent): void {

@@ -1,6 +1,5 @@
-import { useCallback, useState } from 'react';
-import { type ChatMessage, useChatStore, getActiveTabState } from '../../stores/chatStore';
-import { useSessionStore } from '../../stores/sessionStore';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { type ChatMessage, useChatStore } from '../../stores/chatStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 
@@ -25,72 +24,94 @@ export function PermissionCard({ message }: Props) {
   const [retrying, setRetrying] = useState(false);
   const interactionState = message.interactionState ?? (message.resolved ? 'resolved' : 'pending');
   const permData = message.permissionData;
+  const resolveOwner = useCallback((): { tabId: string; stdinId: string } | null => {
+    if (message.owner?.tabId && message.owner.stdinId) return { ...message.owner };
+    const tabs = Array.from(useChatStore.getState().tabs.values());
+    const match = tabs.find((tab) => tab.messages.some((m) => m.id === message.id));
+    const stdinId = match?.sessionMeta.stdinId;
+    if (match && stdinId) return { tabId: match.tabId, stdinId };
+    return null;
+  }, [message.id, message.owner]);
 
   // Determine display values — prefer structured permissionData, fallback to legacy fields
   const toolName = permData?.toolName ?? message.permissionTool ?? '';
   const description = permData?.description ?? '';
-  const inputPreview = permData?.input
-    ? formatInput(permData.toolName, permData.input)
-    : (typeof message.content === 'string' ? message.content : '');
+  const inputPreview = useMemo(() => {
+    if (permData?.input) {
+      return formatInput(permData.toolName, permData.input);
+    }
+    return typeof message.content === 'string' ? message.content : '';
+  }, [message.content, permData?.input, permData?.toolName]);
 
   const handleRespond = useCallback(async (allow: boolean) => {
-    const permTabId = useSessionStore.getState().selectedSessionId;
-    if (!permTabId) return;
+    const owner = resolveOwner();
+    if (!owner) return;
     const { setInteractionState, setSessionStatus, setActivityStatus } = useChatStore.getState();
-    const stdinId = getActiveTabState().sessionMeta.stdinId;
-    if (!stdinId) return;
 
     // If we have structured permissionData, use SDK control protocol
     if (permData?.requestId) {
-      setInteractionState(permTabId, message.id, 'sending');
+      setInteractionState(owner.tabId, message.id, 'sending');
       try {
         await bridge.respondPermission(
-          stdinId,
+          owner.stdinId,
           permData.requestId,
           allow,
           allow ? undefined : 'User denied this operation',
           permData.toolUseId,
           allow ? permData.input : undefined,
         );
-        setInteractionState(permTabId, message.id, 'resolved');
-        setSessionStatus(permTabId, 'running');
-        setActivityStatus(permTabId, { phase: 'thinking' });
+        setInteractionState(owner.tabId, message.id, 'resolved');
+        setSessionStatus(owner.tabId, 'running');
+        setActivityStatus(owner.tabId, { phase: 'thinking' });
       } catch (err) {
-        setInteractionState(permTabId, message.id, 'failed', String(err));
+        setInteractionState(owner.tabId, message.id, 'failed', String(err));
       }
     } else {
       // Legacy fallback: send raw y/n to stdin (for bypass/old-style)
-      setInteractionState(permTabId, message.id, 'sending');
+      setInteractionState(owner.tabId, message.id, 'sending');
       try {
-        await bridge.sendRawStdin(stdinId, allow ? 'y' : 'n');
-        setInteractionState(permTabId, message.id, 'resolved');
-        setSessionStatus(permTabId, 'running');
-        setActivityStatus(permTabId, { phase: 'thinking' });
+        await bridge.sendRawStdin(owner.stdinId, allow ? 'y' : 'n');
+        setInteractionState(owner.tabId, message.id, 'resolved');
+        setSessionStatus(owner.tabId, 'running');
+        setActivityStatus(owner.tabId, { phase: 'thinking' });
       } catch (err) {
         console.warn('[TC:permission] Legacy permission response failed:', err);
-        setInteractionState(permTabId, message.id, 'failed', String(err));
+        setInteractionState(owner.tabId, message.id, 'failed', String(err));
       }
     }
     setRetrying(false);
-  }, [message.id, permData]);
+  }, [message.id, permData, resolveOwner]);
 
   const handleRetry = useCallback(() => {
     setRetrying(true);
     // Reset to pending state, then let user choose again
-    const retryTabId = useSessionStore.getState().selectedSessionId;
-    if (retryTabId) {
-      useChatStore.getState().setInteractionState(retryTabId, message.id, 'pending');
+    const owner = resolveOwner();
+    if (owner) {
+      useChatStore.getState().setInteractionState(owner.tabId, message.id, 'pending');
     }
     setRetrying(false);
-  }, [message.id]);
+  }, [message.id, resolveOwner]);
 
   const isResolved = interactionState === 'resolved';
   const isSending = interactionState === 'sending';
   const isFailed = interactionState === 'failed';
   const isPending = interactionState === 'pending';
 
+  // Expose permission respond handler for test harness (dev only)
+  useEffect(() => {
+    if (import.meta.env.DEV && isPending) {
+      (window as any).__tokenicode_respond_permission = handleRespond;
+    }
+    return () => {
+      if (import.meta.env.DEV) {
+        delete (window as any).__tokenicode_respond_permission;
+      }
+    };
+  }, [handleRespond, isPending]);
+
   return (
-    <div className={`ml-11 animate-scale-in ${isResolved ? 'opacity-60' : ''}`}>
+    <div className={`ml-11 animate-scale-in ${isResolved ? 'opacity-60' : ''}`}
+      {...(import.meta.env.DEV && { 'data-testid': 'permission-card' })}>
       <div className={`rounded-xl border overflow-hidden transition-all duration-200
         ${isResolved
           ? 'border-border-subtle bg-bg-secondary/30'
@@ -178,6 +199,7 @@ export function PermissionCard({ message }: Props) {
               <>
                 <button
                   onClick={() => handleRespond(true)}
+                  {...(import.meta.env.DEV && { 'data-testid': 'permission-allow-button' })}
                   className="px-4 py-2 rounded-lg text-xs font-semibold
                     border-2 border-success/40 text-success bg-success/5
                     hover:bg-success/15 transition-smooth cursor-pointer
@@ -191,6 +213,7 @@ export function PermissionCard({ message }: Props) {
                 </button>
                 <button
                   onClick={() => handleRespond(false)}
+                  {...(import.meta.env.DEV && { 'data-testid': 'permission-deny-button' })}
                   className="px-3 py-2 rounded-lg text-xs font-medium
                     text-text-muted border border-border-subtle
                     hover:bg-bg-secondary hover:text-text-primary

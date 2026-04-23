@@ -13,6 +13,7 @@ import { SessionGroup } from './SessionGroup';
 import { SessionItem } from './SessionItem';
 import { SessionContextMenu, ProjectContextMenu } from './SessionContextMenu';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { teardownSession, waitForStdinCleared } from '../../lib/sessionLifecycle';
 
 // --- Path utilities ---
 
@@ -23,12 +24,26 @@ function isWindowsAbsolutePath(p: string): boolean {
   return /^[A-Za-z]:[/\\]/.test(p);
 }
 
+// S16 (v3 §4.3): prefer the already-decoded `project` field from the backend
+// (decode_project_name in Rust). We only fall through to heuristic decoding
+// when the caller passes the raw projectDir token. For the encoded case we
+// cache backend decoder results — the synchronous API shape prevents us from
+// awaiting per call site, so decoding is fire-and-forget and the cached
+// answer is returned the next time the path is queried.
+const _decodedCache = new Map<string, string>();
 function resolveProjectPath(raw: string): string {
   if (raw.startsWith('/') || isWindowsAbsolutePath(raw)) return raw;
   if (raw.startsWith('~/') || raw === '~') {
     if (_cachedHomeDir) return raw.replace('~', _cachedHomeDir);
     return raw;
   }
+  const cached = _decodedCache.get(raw);
+  if (cached) return cached;
+  // Kick off an async decode so the next render picks up the authoritative
+  // value; keep a naive fallback to avoid blocking the current render.
+  bridge.decodeProjectDir(raw)
+    .then((decoded) => { _decodedCache.set(raw, decoded); })
+    .catch(() => {});
   if (/^[A-Za-z]-/.test(raw)) {
     const drive = raw[0];
     const rest = raw.slice(2);
@@ -347,6 +362,8 @@ export function ConversationList() {
     // Only set the CLI UUID (for resume). Prevents inheriting a stale stdinId
     // from a previous session that might still be alive in the backend.
     setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+    // PRD §9: Write cliResumeId in sessionStore — InputBar reads this for resume
+    useSessionStore.getState().setCliResumeId(sessionId, sessionId);
 
     try {
       const rawMessages = await bridge.loadSession(sessionPath);
@@ -389,6 +406,22 @@ export function ConversationList() {
   // --- Delete handlers ---
   const executeDelete = useCallback(async (sessionId: string, sessionPath: string) => {
     try {
+      // Kill running process before deleting (S8 fix — prevent residual processes)
+      const tab = useChatStore.getState().getTab(sessionId);
+      const routedStdinIds = Object.entries(useSessionStore.getState().stdinToTab)
+        .filter(([, tabId]) => tabId === sessionId)
+        .map(([stdinId]) => stdinId);
+      const stdinIds = Array.from(new Set([
+        ...(tab?.sessionMeta.stdinId ? [tab.sessionMeta.stdinId] : []),
+        ...routedStdinIds,
+      ]));
+      for (const stdinId of stdinIds) {
+        await teardownSession(stdinId, sessionId, 'delete');
+        if (tab?.sessionMeta.stdinId === stdinId) {
+          await waitForStdinCleared(sessionId, stdinId).catch(() => {});
+        }
+      }
+
       if (sessionPath) {
         await bridge.deleteSession(sessionId, sessionPath);
       } else {
@@ -403,6 +436,9 @@ export function ConversationList() {
       // Drop the per-tab agent cache — otherwise creating a new session
       // that reuses this ID shows the ghost agents of the old one (#B9).
       useAgentStore.getState().clearCacheForTab(sessionId);
+      // Phase 3 §3.1: drop per-tab path grants so an authorized external
+      // file can't be read again after the tab is gone.
+      bridge.clearPathGrants(sessionId).catch(() => {});
       fetchSessions();
     } catch (err) {
       console.error('Failed to delete session:', err);

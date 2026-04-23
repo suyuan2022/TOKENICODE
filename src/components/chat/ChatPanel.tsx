@@ -11,14 +11,16 @@ import { useSessionStore } from '../../stores/sessionStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { AgentPanel } from '../agents/AgentPanel';
-import { bridge, onClaudeStream, onClaudeStderr } from '../../lib/tauri-bridge';
+// bridge import removed — spawn goes through sessionLifecycle module
 import { open } from '@tauri-apps/plugin-dialog';
 import { useT } from '../../lib/i18n';
-import { envFingerprint, resolveModelForProvider } from '../../lib/api-provider';
+import { envFingerprint, is1MModel as isOneMillionModel, resolveModelForProvider, spawnConfigHash } from '../../lib/api-provider';
 import { useProviderStore } from '../../stores/providerStore';
+import { spawnSession } from '../../lib/sessionLifecycle';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { SetupWizard } from '../setup/SetupWizard';
 import { AiAvatar } from '../shared/AiAvatar';
+import { UserAvatar } from '../shared/UserAvatar';
 import { useFindInPage } from '../../hooks/useFindInPage';
 import { FindBar } from './FindBar';
 
@@ -224,9 +226,10 @@ function CyclingThinkingText() {
 }
 
 /** Activity indicator with elapsed time and token count */
-function ActivityIndicator({ activityStatus, sessionMeta }: {
+function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   activityStatus: { phase: string; toolName?: string };
   sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; lastProgressAt?: number };
+  sessionStatus?: string;
 }) {
   const t = useT();
   const [now, setNow] = useState(Date.now());
@@ -236,7 +239,12 @@ function ActivityIndicator({ activityStatus, sessionMeta }: {
     return () => clearInterval(id);
   }, []);
 
-  const phaseText = activityStatus.phase === 'thinking' ? t('chat.thinking')
+  const isStopping = sessionStatus === 'stopping';
+  const isStarting = sessionStatus === 'running'
+    && activityStatus.phase === 'idle';
+  const phaseText = isStopping ? t('chat.stopping')
+    : isStarting ? t('chat.startingAgent')
+    : activityStatus.phase === 'thinking' ? t('chat.thinking')
     : activityStatus.phase === 'writing' ? t('chat.writing')
     : activityStatus.phase === 'tool' ? `${t('chat.runningTool')}: ${activityStatus.toolName || ''}`
     : activityStatus.phase === 'awaiting' ? t('chat.awaiting')
@@ -251,25 +259,29 @@ function ActivityIndicator({ activityStatus, sessionMeta }: {
 
   // Context pressure warning: threshold depends on model context window size
   // 1M models → warn at 600K; others at 120K (60% of 200K).
-  // Opus 4.7 ships with 1M context by default (no [1m] variant needed).
   const selectedModel = useSettingsStore((s) => s.selectedModel);
   const resolvedModel = resolveModelForProvider(selectedModel);
-  const is1MModel = resolvedModel.includes('[1m]') || selectedModel === 'claude-opus-4-7';
-  const contextWindow = is1MModel ? 1_000_000 : 200_000;
+  const is1MContextModel = isOneMillionModel(resolvedModel);
+  const contextWindow = is1MContextModel ? 1_000_000 : 200_000;
   const inputTokens = sessionMeta.inputTokens || 0;
-  const contextWarning = inputTokens > contextWindow * 0.6;
+  const contextWarning = !isStopping && inputTokens > contextWindow * 0.6;
 
   // Stall detection: 120s of silence (no stream activity), not total elapsed time.
-  const stallWarning = !!sessionMeta.lastProgressAt
+  const stallWarning = !isStopping
+    && !!sessionMeta.lastProgressAt
     && !!elapsed
     && (now - sessionMeta.lastProgressAt) > 120_000;
 
-  const isThinking = activityStatus.phase === 'thinking';
+  const isThinking = !isStopping && !isStarting && activityStatus.phase === 'thinking';
 
   return (
-    <div className="flex items-center gap-1.5 py-1">
-      <span className={`text-sm font-medium leading-none text-accent
-        ${isThinking ? '' : 'animate-pulse-soft'}`}>/</span>
+    <div className={`flex items-center gap-1.5 py-1 ${isStopping ? 'px-2.5 rounded-full border border-warning/20 bg-warning/5 w-fit' : ''}`}>
+      {isStopping ? (
+        <span className="w-3.5 h-3.5 rounded-full border-2 border-warning/25 border-t-warning animate-spin flex-shrink-0" />
+      ) : (
+        <span className={`text-sm font-medium leading-none text-accent
+          ${isThinking ? '' : 'animate-pulse-soft'}`}>/</span>
+      )}
       <span className="text-sm text-text-muted">
         {isThinking ? <CyclingThinkingText /> : phaseText}
         {statsText && (
@@ -663,12 +675,12 @@ export function ChatPanel() {
                 behind the streaming reply. Each one becomes a real user
                 message bubble when the current turn completes and the
                 FIFO drain in useStreamProcessor sends it. */}
-            {pendingUserMessages && pendingUserMessages.length > 0 && pendingUserMessages.map((pendingText, idx) => (
-              <div key={`pending_${idx}`} className="flex justify-end gap-3 mt-4 opacity-60">
-                <div className="flex flex-col items-end max-w-[75%]">
+            {pendingUserMessages && pendingUserMessages.length > 0 && pendingUserMessages.map((pending, idx) => (
+              <div key={`pending_${idx}`} className="flex justify-end gap-3 mt-4">
+                <div className="flex flex-col items-end max-w-[75%] opacity-60">
                   <div className="bg-bg-elevated border border-border-subtle text-text-primary
                     rounded-2xl rounded-br-md px-4 py-2.5 leading-relaxed whitespace-pre-wrap break-words">
-                    {pendingText}
+                    {pending.text}
                   </div>
                   <span className="text-[10px] text-text-tertiary mt-1 mr-1 flex items-center gap-1">
                     <svg className="w-2.5 h-2.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -678,18 +690,12 @@ export function ChatPanel() {
                     {t('chat.queued')}
                   </span>
                 </div>
-                <div className="w-8 h-8 rounded-[10px] bg-bg-elevated flex-shrink-0
-                  flex items-center justify-center text-text-tertiary">
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                    <circle cx="8" cy="5" r="3" />
-                    <path d="M2 14c0-3 3-5 6-5s6 2 6 5" />
-                  </svg>
-                </div>
+                <UserAvatar size="w-8 h-8 text-xs" className="mt-0.5 flex-shrink-0" />
               </div>
             ))}
             {/* Inline activity status indicator — like Claude Desktop App */}
-            {(sessionStatus === 'running' || sessionStatus === 'reconnecting' || activityStatus.phase === 'awaiting') && (
-              <ActivityIndicator activityStatus={activityStatus} sessionMeta={sessionMeta} />
+            {(sessionStatus === 'running' || sessionStatus === 'reconnecting' || sessionStatus === 'stopping' || activityStatus.phase === 'awaiting') && (
+              <ActivityIndicator activityStatus={activityStatus} sessionMeta={sessionMeta} sessionStatus={sessionStatus} />
             )}
           </div>
         )}
@@ -786,73 +792,79 @@ async function startDraftSession(folderPath: string) {
   // Send empty prompt — Rust will skip the NDJSON send.
   const preWarmId = `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   try {
-    // Register stream listeners before spawning
-    const unlisten = await onClaudeStream(preWarmId, (msg: any) => {
-      // Tag message with stdinId so the handler can route to correct session
-      msg.__stdinId = preWarmId;
-      // Forward to InputBar's handler via a global — will be overridden when InputBar mounts
-      const handler = (window as any).__claudeStreamHandler;
-      if (handler) {
-        // Replay any events that arrived while handler was briefly null (React effect cycle)
-        const queue: any[] = (window as any).__claudeStreamQueue;
-        if (queue && queue.length > 0) {
-          console.warn(`[TOKENICODE] replaying ${queue.length} queued pre-warm events`);
-          const pending = queue.splice(0);
-          for (const queued of pending) handler(queued);
-        }
-        handler(msg);
-      } else {
-        // Handler not yet available (InputBar not mounted or React effect cycle) — queue the event
-        if (!(window as any).__claudeStreamQueue) (window as any).__claudeStreamQueue = [];
-        (window as any).__claudeStreamQueue.push(msg);
-        console.warn('[TOKENICODE] pre-warm event queued (handler not ready):', msg.type);
-      }
-    });
-    const unlistenStderr = await onClaudeStderr(preWarmId, (line: string) => {
-      // Log pre-warm stderr for debugging (errors here explain why CLI may fail)
-      console.warn('[TOKENICODE] pre-warm stderr:', line);
-    });
+    const settings = useSettingsStore.getState();
+    const model = resolveModelForProvider(settings.selectedModel);
+    const providerId = useProviderStore.getState().activeProviderId || '';
+    const permissionMode = mapSessionModeToPermissionMode(settings.sessionMode);
 
-    // Store unlisten per stdinId for multi-session support
-    if (!(window as any).__claudeUnlisteners) {
-      (window as any).__claudeUnlisteners = {};
-    }
-    (window as any).__claudeUnlisteners[preWarmId] = () => {
-      unlisten();
-      unlistenStderr();
-    };
-
-    const session = await bridge.startSession({
-      prompt: '',  // empty = pre-warm, no message sent
-      cwd: folderPath,
-      model: resolveModelForProvider(useSettingsStore.getState().selectedModel),
-      session_id: preWarmId,
-      thinking_level: useSettingsStore.getState().thinkingLevel,
-      provider_id: useProviderStore.getState().activeProviderId || undefined,
-      permission_mode: mapSessionModeToPermissionMode(useSettingsStore.getState().sessionMode),
-    });
-
-    // Store stdinId so InputBar can send the first message via stdin
+    // Ensure tab exists before writing sessionMeta
     useChatStore.getState().ensureTab(draftId);
     useChatStore.getState().setSessionMeta(draftId, {
-      sessionId: session.cli_session_id || session.stdin_id,
-      stdinId: preWarmId,
-      envFingerprint: envFingerprint(),
-      spawnedModel: resolveModelForProvider(useSettingsStore.getState().selectedModel),
+      stdinReady: false,
+      pendingReadyMessage: undefined,
     });
 
-    // Register stdinId → tabId mapping for background stream routing
-    useSessionStore.getState().registerStdinTab(preWarmId, draftId);
-    // Store cliResumeId for resume logic
-    if (session.cli_session_id) {
-      useSessionStore.getState().setCliResumeId(draftId, session.cli_session_id);
-    }
+    // Phase 2 §2.1: capture spawn-time fingerprint and config hash BEFORE
+    // the async spawn so they reflect the config actually used, not whatever
+    // the user might change while the spawn is in flight.
+    const preEnvFingerprint = envFingerprint();
+    const preSpawnConfigHash = spawnConfigHash();
 
-    // Skip desk_* IDs — they pollute tracked_sessions.txt (multi-session isolation fix)
-    const trackId = session.cli_session_id || session.stdin_id;
-    if (!trackId.startsWith('desk_')) {
-      bridge.trackSession(trackId).catch(() => {});
-    }
+    // Use lifecycle module for unified spawn
+    const spawnResult = await spawnSession({
+      tabId: draftId,
+      stdinId: preWarmId,
+      cwdSnapshot: folderPath,
+      configSnapshot: {
+        model,
+        providerId,
+        thinkingLevel: settings.thinkingLevel,
+        permissionMode,
+      },
+      sessionModeSnapshot: settings.sessionMode,
+      sessionParams: {
+        prompt: '',  // empty = pre-warm, no message sent
+        cwd: folderPath,
+        model,
+        session_id: preWarmId,
+        thinking_level: settings.thinkingLevel,
+        provider_id: providerId || undefined,
+        permission_mode: permissionMode,
+      },
+      onStream: (msg: any) => {
+        // Forward to InputBar's handler via a global
+        const handler = (window as any).__claudeStreamHandler;
+        if (handler) {
+          const queue: any[] = (window as any).__claudeStreamQueue;
+          if (queue && queue.length > 0) {
+            const pending = queue.splice(0);
+            for (const queued of pending) handler(queued);
+          }
+          handler(msg);
+        } else {
+          if (!(window as any).__claudeStreamQueue) (window as any).__claudeStreamQueue = [];
+          (window as any).__claudeStreamQueue.push(msg);
+        }
+      },
+      onStderr: (line: string) => {
+        console.warn('[TOKENICODE] pre-warm stderr:', line);
+      },
+      setRunning: false,
+    });
+
+    // Write additional meta (uses pre-captured values to avoid race)
+    useChatStore.getState().setSessionMeta(draftId, {
+      sessionId: spawnResult.sessionInfo.cli_session_id ?? undefined,
+      envFingerprint: preEnvFingerprint,
+      spawnedModel: model,
+      stdinReady: false,
+      pendingReadyMessage: undefined,
+      // Phase 2 §2.1: lock in the pre-warm spawn config hash so the first
+      // real user submit can detect drift correctly.
+      // Uses pre-computed value captured before async spawn to avoid
+      // race with user config changes during the spawn window.
+      spawnConfigHash: preSpawnConfigHash,
+    });
   } catch {
     // Pre-warm failed — InputBar will spawn on first message instead
   }
