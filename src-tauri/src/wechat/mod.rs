@@ -3,6 +3,7 @@ pub mod commands;
 pub mod executor;
 pub mod inbound;
 pub mod login;
+pub mod media;
 pub mod monitor;
 pub mod poller;
 pub mod runtime;

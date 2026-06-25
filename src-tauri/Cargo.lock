@@ -5066,6 +5066,7 @@ dependencies = [
 name = "tokenicode"
 version = "0.11.0"
 dependencies = [
+ "aes",
  "base64 0.22.1",
  "cocoa",
  "dirs",

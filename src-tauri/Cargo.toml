@@ -25,6 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 notify = "7"
 base64 = "0.22"
+aes = "0.8"
 serde_yaml = "0.9"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
