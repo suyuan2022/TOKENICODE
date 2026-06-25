@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::wechat::inbound::InboundWechatMedia;
 use serde_json::Value;
@@ -117,6 +117,7 @@ pub struct WechatTurnManager {
     active_turn: Option<InboundWechatTurn>,
     queue: VecDeque<InboundWechatTurn>,
     pending_permission: Option<WechatPermissionRequest>,
+    pending_generated_files: HashMap<String, String>,
 }
 
 impl WechatTurnManager {
@@ -128,6 +129,7 @@ impl WechatTurnManager {
         self.connected = false;
         self.queue.clear();
         self.pending_permission = None;
+        self.pending_generated_files.clear();
 
         let effects = self
             .active_turn
@@ -183,6 +185,7 @@ impl WechatTurnManager {
             return Vec::new();
         };
         self.pending_permission = None;
+        self.pending_generated_files.clear();
 
         let mut effects = vec![
             WechatTurnEffect::SendWeChatText {
@@ -217,6 +220,35 @@ impl WechatTurnManager {
             to_user_id: active_turn.from_user_id().to_string(),
             context_token: active_turn.context_token().to_string(),
             text,
+        }]
+    }
+
+    pub(crate) fn remember_generated_file(&mut self, tool_use_id: String, path: String) {
+        if self.active_turn.is_some() {
+            self.pending_generated_files.insert(tool_use_id, path);
+        }
+    }
+
+    pub(crate) fn complete_generated_file(
+        &mut self,
+        tool_use_id: &str,
+        is_error: bool,
+    ) -> Vec<WechatTurnEffect> {
+        let Some(path) = self.pending_generated_files.remove(tool_use_id) else {
+            return Vec::new();
+        };
+        if is_error {
+            return Vec::new();
+        }
+        let Some(active_turn) = self.active_turn.as_ref() else {
+            return Vec::new();
+        };
+
+        vec![WechatTurnEffect::SendWeChatFile {
+            to_user_id: active_turn.from_user_id().to_string(),
+            context_token: active_turn.context_token().to_string(),
+            path,
+            caption: None,
         }]
     }
 
@@ -265,6 +297,7 @@ impl WechatTurnManager {
             active_turn.is_some() || !self.queue.is_empty() || self.pending_permission.is_some();
         self.queue.clear();
         self.pending_permission = None;
+        self.pending_generated_files.clear();
 
         let mut effects = Vec::new();
         if let Some(active_turn) = active_turn {

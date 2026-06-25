@@ -197,6 +197,14 @@ impl WechatRuntime {
     ) -> Vec<WechatTurnEffect> {
         match event.get("type").and_then(Value::as_str) {
             Some("result") => self.process_result_event(event, received_at_ms),
+            Some("assistant") | Some("stream_event") => {
+                for (tool_use_id, path) in generated_file_tool_uses(event) {
+                    self.turn_manager.remember_generated_file(tool_use_id, path);
+                }
+                Vec::new()
+            }
+            Some("tool_result") => self.process_tool_result_event(event),
+            Some("user") | Some("human") => self.process_nested_tool_result_event(event),
             Some("tokenicode_permission_request") => permission_request_from_event(event)
                 .map(|request| self.turn_manager.request_permission(request))
                 .unwrap_or_default(),
@@ -227,6 +235,111 @@ impl WechatRuntime {
         self.turn_manager
             .finish_turn(text.to_string(), received_at_ms)
     }
+
+    fn process_tool_result_event(&mut self, event: &Value) -> Vec<WechatTurnEffect> {
+        let Some(tool_use_id) = event
+            .get("tool_use_id")
+            .or_else(|| event.get("toolUseId"))
+            .and_then(Value::as_str)
+        else {
+            return Vec::new();
+        };
+
+        self.turn_manager
+            .complete_generated_file(tool_use_id, tool_result_is_error(event))
+    }
+
+    fn process_nested_tool_result_event(&mut self, event: &Value) -> Vec<WechatTurnEffect> {
+        let mut effects = Vec::new();
+        let Some(blocks) = event
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .or_else(|| event.get("content").and_then(Value::as_array))
+        else {
+            return effects;
+        };
+
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(tool_use_id) = block
+                .get("tool_use_id")
+                .or_else(|| block.get("toolUseId"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            effects.extend(
+                self.turn_manager
+                    .complete_generated_file(tool_use_id, tool_result_is_error(block)),
+            );
+        }
+
+        effects
+    }
+}
+
+fn generated_file_tool_uses(event: &Value) -> Vec<(String, String)> {
+    let mut tool_uses = Vec::new();
+
+    if let Some(blocks) = event
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .or_else(|| event.get("content").and_then(Value::as_array))
+    {
+        for block in blocks {
+            if let Some(tool_use) = generated_file_tool_use_from_block(block) {
+                tool_uses.push(tool_use);
+            }
+        }
+    }
+
+    if let Some(block) = event
+        .get("event")
+        .and_then(|stream_event| stream_event.get("content_block"))
+        .or_else(|| event.get("content_block"))
+    {
+        if let Some(tool_use) = generated_file_tool_use_from_block(block) {
+            tool_uses.push(tool_use);
+        }
+    }
+
+    tool_uses
+}
+
+fn generated_file_tool_use_from_block(block: &Value) -> Option<(String, String)> {
+    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return None;
+    }
+    if block.get("name").and_then(Value::as_str) != Some("Write") {
+        return None;
+    }
+    let tool_use_id = block
+        .get("id")
+        .or_else(|| block.get("tool_use_id"))
+        .or_else(|| block.get("toolUseId"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let path = block
+        .get("input")
+        .and_then(|input| input.get("file_path").or_else(|| input.get("filePath")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+
+    Some((tool_use_id, path))
+}
+
+fn tool_result_is_error(event: &Value) -> bool {
+    event
+        .get("is_error")
+        .or_else(|| event.get("isError"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn permission_request_from_event(event: &Value) -> Option<WechatPermissionRequest> {
@@ -644,6 +757,217 @@ mod tests {
                     .into(),
             }]
         );
+    }
+
+    #[test]
+    fn successful_write_tool_result_sends_generated_file_to_active_wechat_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "create a report")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let write_start_effects = runtime.process_stream_event(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-write-1",
+                        "name": "Write",
+                        "input": {
+                            "file_path": "/tmp/generated-report.md",
+                            "content": "# Report"
+                        }
+                    }]
+                }
+            }),
+            2_000,
+        );
+        let write_result_effects = runtime.process_stream_event(
+            &json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu-write-1",
+                "content": "File created successfully"
+            }),
+            3_000,
+        );
+
+        assert!(write_start_effects.is_empty());
+        assert_eq!(
+            write_result_effects,
+            vec![WechatTurnEffect::SendWeChatFile {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                path: "/tmp/generated-report.md".into(),
+                caption: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_tool_result_sends_streamed_write_file_to_active_wechat_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "create a chart")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        runtime.process_stream_event(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu-write-2",
+                        "name": "Write",
+                        "input": {
+                            "file_path": "/tmp/generated-chart.png"
+                        }
+                    }
+                }
+            }),
+            2_000,
+        );
+        let effects = runtime.process_stream_event(
+            &json!({
+                "type": "user",
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-write-2",
+                        "content": "created"
+                    }]
+                }
+            }),
+            3_000,
+        );
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::SendWeChatFile {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                path: "/tmp/generated-chart.png".into(),
+                caption: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn write_tool_result_without_active_wechat_turn_does_not_send_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+
+        runtime.process_stream_event(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-write-1",
+                        "name": "Write",
+                        "input": { "file_path": "/tmp/generated-report.md" }
+                    }]
+                }
+            }),
+            1_000,
+        );
+        let effects = runtime.process_stream_event(
+            &json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu-write-1",
+                "content": "File created successfully"
+            }),
+            2_000,
+        );
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn failed_write_tool_result_does_not_send_file_or_leak_pending_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "create a report")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        runtime.process_stream_event(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-write-1",
+                        "name": "Write",
+                        "input": { "file_path": "/tmp/generated-report.md" }
+                    }]
+                }
+            }),
+            2_000,
+        );
+        let failed_effects = runtime.process_stream_event(
+            &json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu-write-1",
+                "is_error": true,
+                "content": "permission denied"
+            }),
+            3_000,
+        );
+        let retry_effects = runtime.process_stream_event(
+            &json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu-write-1",
+                "content": "late success"
+            }),
+            4_000,
+        );
+
+        assert!(failed_effects.is_empty());
+        assert!(retry_effects.is_empty());
     }
 
     #[test]
