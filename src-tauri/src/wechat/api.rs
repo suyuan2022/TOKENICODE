@@ -411,9 +411,16 @@ pub struct MessageItem {
     #[serde(rename = "type")]
     pub item_type: Option<i32>,
     pub text_item: Option<TextItem>,
+    pub ref_msg: Option<RefMessage>,
     pub image_item: Option<ImageItem>,
     pub voice_item: Option<VoiceItem>,
     pub file_item: Option<FileItem>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefMessage {
+    pub message_item: Option<Box<MessageItem>>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

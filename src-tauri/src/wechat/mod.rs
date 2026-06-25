@@ -1,5 +1,6 @@
 pub mod api;
 pub mod commands;
+pub mod inbound;
 pub mod login;
 pub mod monitor;
 pub mod store;
