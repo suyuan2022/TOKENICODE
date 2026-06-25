@@ -7,6 +7,7 @@ use crate::{
     commands::StdinManager,
     wechat::{
         api::{IlinkApiClient, QrCodeResponse, QrStatusResponse},
+        executor::execute_wechat_effect,
         login::{parse_qr_code_response, parse_qr_status_response, WechatQrPoll},
         poller::WechatPollingTask,
         runtime::WechatRuntimeHandle,
@@ -131,9 +132,19 @@ pub async fn wechat_poll_qr_login(
 }
 
 #[tauri::command]
-pub async fn wechat_disconnect(polling_task: State<'_, WechatPollingTask>) -> Result<(), String> {
+pub async fn wechat_disconnect(
+    runtime: State<'_, WechatRuntimeHandle>,
+    polling_task: State<'_, WechatPollingTask>,
+) -> Result<(), String> {
     polling_task.stop().await;
-    state_store().clear_account()
+    let effects = runtime.disconnect().await;
+    let store = runtime.state_store().await;
+    for effect in &effects {
+        if let Err(err) = execute_wechat_effect(effect, &store).await {
+            eprintln!("[WeChat] disconnect effect failed: {err}");
+        }
+    }
+    store.clear_account()
 }
 
 #[tauri::command]

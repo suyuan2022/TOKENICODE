@@ -44,6 +44,10 @@ impl WechatRuntimeHandle {
         self.inner.lock().await.connect();
     }
 
+    pub async fn disconnect(&self) -> Vec<WechatTurnEffect> {
+        self.inner.lock().await.disconnect()
+    }
+
     pub async fn clear_desktop_session(&self) {
         self.inner.lock().await.clear_desktop_session();
     }
@@ -98,6 +102,10 @@ impl WechatRuntime {
 
     pub fn connect(&mut self) {
         self.turn_manager.connect();
+    }
+
+    pub fn disconnect(&mut self) -> Vec<WechatTurnEffect> {
+        self.turn_manager.disconnect()
     }
 
     pub fn set_desktop_session(&mut self, session_id: String) {
@@ -509,6 +517,100 @@ mod tests {
                 text: "权限请求：Bash\n{\n  \"cmd\": \"pnpm test\"\n}\n回复 approve 或 deny。"
                     .into(),
             }]
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_wechat_turn_state_and_preserves_desktop_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "first")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(8, "user-1", "ctx-2", "queued")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                2_000,
+            )
+            .unwrap();
+        runtime.process_stream_event(
+            &json!({
+                "type": "tokenicode_permission_request",
+                "request_id": "perm-1",
+                "tool_name": "Bash",
+                "input": { "cmd": "pnpm test" }
+            }),
+            3_000,
+        );
+
+        let effects = runtime.disconnect();
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::StopTyping {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+            }]
+        );
+        assert_eq!(runtime.desktop_session_id(), Some("stdin-1"));
+        assert!(runtime
+            .process_stream_event(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": "late answer"
+                }),
+                4_000,
+            )
+            .is_empty());
+
+        runtime.connect();
+        let outcome = runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(9, "user-1", "ctx-3", "fresh")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                5_000,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome.effects,
+            vec![
+                WechatTurnEffect::SendToClaude {
+                    desktop_session_id: "stdin-1".into(),
+                    text: "fresh".into(),
+                },
+                WechatTurnEffect::StartTyping {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-3".into(),
+                },
+            ]
         );
     }
 
