@@ -17,6 +17,12 @@ use super::{
     turn::WechatTurnEffect,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WechatEffectDispatch {
+    pub claude_effect_count: usize,
+    pub wechat_effect_count: usize,
+}
+
 pub async fn execute_claude_effect(
     stdin_mgr: &StdinManager,
     effect: &WechatTurnEffect,
@@ -75,6 +81,41 @@ pub async fn execute_claude_effect(
         }
         _ => Ok(false),
     }
+}
+
+pub async fn execute_turn_effects(
+    stdin_mgr: &StdinManager,
+    store: &WechatStateStore,
+    effects: &[WechatTurnEffect],
+) -> Result<WechatEffectDispatch, String> {
+    execute_turn_effects_with(stdin_mgr, store, effects, |request| async move {
+        IlinkApiClient::new(None)
+            .execute_json::<Value>(request)
+            .await
+    })
+    .await
+}
+
+pub async fn execute_turn_effects_with<F, Fut>(
+    stdin_mgr: &StdinManager,
+    store: &WechatStateStore,
+    effects: &[WechatTurnEffect],
+    mut execute_wechat_request: F,
+) -> Result<WechatEffectDispatch, String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    let mut dispatch = WechatEffectDispatch::default();
+    for effect in effects {
+        if execute_claude_effect(stdin_mgr, effect).await? {
+            dispatch.claude_effect_count += 1;
+        }
+        if execute_wechat_effect_with(effect, store, &mut execute_wechat_request).await? {
+            dispatch.wechat_effect_count += 1;
+        }
+    }
+    Ok(dispatch)
 }
 
 pub async fn execute_wechat_effect(

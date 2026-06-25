@@ -14,7 +14,7 @@ use crate::{
     commands::StdinManager,
     wechat::{
         api::{GetUpdatesResponse, IlinkApiClient, IlinkHttpRequest},
-        executor::{execute_claude_effect, execute_wechat_effect_with},
+        executor::execute_turn_effects_with,
         monitor::MonitorStatus,
         runtime::WechatRuntimeHandle,
     },
@@ -160,23 +160,20 @@ where
         .await?;
 
     let store = runtime.state_store().await;
-    let mut claude_effect_count = 0;
-    let mut wechat_effect_count = 0;
-    for effect in &outcome.effects {
-        if execute_claude_effect(stdin_mgr, effect).await? {
-            claude_effect_count += 1;
-        }
-        if execute_wechat_effect_with(effect, &store, &mut execute_wechat_request).await? {
-            wechat_effect_count += 1;
-        }
-    }
+    let dispatch = execute_turn_effects_with(
+        stdin_mgr,
+        &store,
+        &outcome.effects,
+        &mut execute_wechat_request,
+    )
+    .await?;
 
     Ok(WechatPollIteration {
         polled: true,
         status: Some(outcome.status),
         inbound_text_count: outcome.inbound_text_count,
-        claude_effect_count,
-        wechat_effect_count,
+        claude_effect_count: dispatch.claude_effect_count,
+        wechat_effect_count: dispatch.wechat_effect_count,
         next_timeout_ms: outcome.next_timeout_ms,
     })
 }

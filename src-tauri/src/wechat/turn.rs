@@ -94,6 +94,12 @@ impl WechatTurnManager {
 
     pub fn receive_text(&mut self, message: InboundWechatText) -> Vec<WechatTurnEffect> {
         let mut effects = self.discard_stale(message.received_at_ms);
+        if self.pending_permission.is_some() {
+            if let Some(allow) = parse_permission_decision(&message.text) {
+                effects.extend(self.answer_permission(allow));
+                return effects;
+            }
+        }
         self.queue.push_back(message);
         effects.extend(self.start_next_turn());
         effects
@@ -225,6 +231,14 @@ impl WechatTurnManager {
         ];
         self.active_turn = Some(next_turn);
         effects
+    }
+}
+
+fn parse_permission_decision(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "approve" | "allow" | "yes" | "y" | "同意" | "允许" => Some(true),
+        "deny" | "reject" | "no" | "n" | "拒绝" | "不允许" => Some(false),
+        _ => None,
     }
 }
 
@@ -384,6 +398,67 @@ mod tests {
             }],
         );
         assert_eq!(manager.pending_permission_request_id(), None);
+    }
+
+    #[test]
+    fn permission_decision_message_is_not_sent_to_claude() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+        manager.set_desktop_session("stdin-1".into());
+        manager.receive_text(text_message("msg-1", "first", 0));
+        manager.request_permission(WechatPermissionRequest {
+            request_id: "perm-1".into(),
+            tool_name: "Bash".into(),
+            input_preview: "{}".into(),
+            tool_use_id: Some("toolu-1".into()),
+            updated_input: serde_json::json!({ "cmd": "pnpm test" }),
+        });
+
+        let effects = manager.receive_text(text_message("msg-2", "approve", 1_000));
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::RespondPermission {
+                desktop_session_id: "stdin-1".into(),
+                request_id: "perm-1".into(),
+                allow: true,
+                tool_use_id: Some("toolu-1".into()),
+                updated_input: serde_json::json!({ "cmd": "pnpm test" }),
+            }],
+        );
+        assert_eq!(manager.pending_permission_request_id(), None);
+        assert_eq!(manager.active_turn_message_id(), Some("msg-1"));
+        assert_eq!(manager.queued_len(), 0);
+    }
+
+    #[test]
+    fn permission_deny_message_maps_to_denial_response() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+        manager.set_desktop_session("stdin-1".into());
+        manager.receive_text(text_message("msg-1", "first", 0));
+        manager.request_permission(WechatPermissionRequest {
+            request_id: "perm-1".into(),
+            tool_name: "Bash".into(),
+            input_preview: "{}".into(),
+            tool_use_id: Some("toolu-1".into()),
+            updated_input: serde_json::json!({ "cmd": "pnpm test" }),
+        });
+
+        let effects = manager.receive_text(text_message("msg-2", "deny", 1_000));
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::RespondPermission {
+                desktop_session_id: "stdin-1".into(),
+                request_id: "perm-1".into(),
+                allow: false,
+                tool_use_id: Some("toolu-1".into()),
+                updated_input: serde_json::json!({ "cmd": "pnpm test" }),
+            }],
+        );
+        assert_eq!(manager.pending_permission_request_id(), None);
+        assert_eq!(manager.queued_len(), 0);
     }
 
     #[test]

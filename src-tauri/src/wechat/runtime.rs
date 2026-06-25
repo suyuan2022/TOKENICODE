@@ -3,8 +3,9 @@ use crate::wechat::{
     inbound::parse_inbound_text,
     monitor::{MonitorStatus, WechatMonitorState},
     store::WechatStateStore,
-    turn::{WechatTurnEffect, WechatTurnManager},
+    turn::{WechatPermissionRequest, WechatTurnEffect, WechatTurnManager},
 };
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -72,6 +73,17 @@ impl WechatRuntimeHandle {
             .lock()
             .await
             .process_updates_response(response, received_at_ms)
+    }
+
+    pub async fn process_stream_event(
+        &self,
+        event: &Value,
+        received_at_ms: u64,
+    ) -> Vec<WechatTurnEffect> {
+        self.inner
+            .lock()
+            .await
+            .process_stream_event(event, received_at_ms)
     }
 }
 
@@ -148,6 +160,74 @@ impl WechatRuntime {
             effects,
         })
     }
+
+    pub fn process_stream_event(
+        &mut self,
+        event: &Value,
+        received_at_ms: u64,
+    ) -> Vec<WechatTurnEffect> {
+        match event.get("type").and_then(Value::as_str) {
+            Some("result") => self.process_result_event(event, received_at_ms),
+            Some("tokenicode_permission_request") => permission_request_from_event(event)
+                .map(|request| self.turn_manager.request_permission(request))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn process_result_event(
+        &mut self,
+        event: &Value,
+        received_at_ms: u64,
+    ) -> Vec<WechatTurnEffect> {
+        if event
+            .get("parent_tool_use_id")
+            .or_else(|| event.get("parentToolUseId"))
+            .is_some()
+        {
+            return Vec::new();
+        }
+        let Some(text) = event
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Vec::new();
+        };
+        self.turn_manager
+            .finish_turn(text.to_string(), received_at_ms)
+    }
+}
+
+fn permission_request_from_event(event: &Value) -> Option<WechatPermissionRequest> {
+    let request_id = event
+        .get("request_id")
+        .or_else(|| event.get("requestId"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let tool_name = event
+        .get("tool_name")
+        .or_else(|| event.get("toolName"))
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown")
+        .to_string();
+    let updated_input = event.get("input").cloned().unwrap_or(Value::Null);
+    let input_preview =
+        serde_json::to_string_pretty(&updated_input).unwrap_or_else(|_| updated_input.to_string());
+    let tool_use_id = event
+        .get("tool_use_id")
+        .or_else(|| event.get("toolUseId"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Some(WechatPermissionRequest {
+        request_id,
+        tool_name,
+        input_preview,
+        tool_use_id,
+        updated_input,
+    })
 }
 
 #[cfg(test)]
@@ -179,6 +259,7 @@ mod tests {
         store::{WechatAccount, WechatStateStore},
         turn::WechatTurnEffect,
     };
+    use serde_json::json;
 
     use super::*;
 
@@ -284,6 +365,151 @@ mod tests {
         assert!(outcome.effects.is_empty());
         assert_eq!(store.load_sync_buf().unwrap(), None);
         assert_eq!(store.load_context_token("user-1").unwrap(), None);
+    }
+
+    #[test]
+    fn main_result_event_finishes_active_wechat_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "hello")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let effects = runtime.process_stream_event(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "result": "answer from Claude"
+            }),
+            2_000,
+        );
+
+        assert_eq!(
+            effects,
+            vec![
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                    text: "answer from Claude".into(),
+                },
+                WechatTurnEffect::StopTyping {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_result_event_does_not_finish_active_wechat_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "hello")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let subagent_effects = runtime.process_stream_event(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "parent_tool_use_id": "toolu-parent",
+                "result": "sub-agent answer"
+            }),
+            2_000,
+        );
+        let main_effects = runtime.process_stream_event(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "result": "main answer"
+            }),
+            3_000,
+        );
+
+        assert!(subagent_effects.is_empty());
+        assert_eq!(
+            main_effects,
+            vec![
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                    text: "main answer".into(),
+                },
+                WechatTurnEffect::StopTyping {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn permission_event_forwards_request_to_active_wechat_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "hello")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let effects = runtime.process_stream_event(
+            &json!({
+                "type": "tokenicode_permission_request",
+                "request_id": "perm-1",
+                "tool_name": "Bash",
+                "input": { "cmd": "pnpm test" },
+                "tool_use_id": "toolu-1"
+            }),
+            2_000,
+        );
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "权限请求：Bash\n{\n  \"cmd\": \"pnpm test\"\n}\n回复 approve 或 deny。"
+                    .into(),
+            }]
+        );
     }
 
     fn account() -> WechatAccount {

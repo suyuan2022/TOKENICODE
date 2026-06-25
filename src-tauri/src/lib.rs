@@ -1262,8 +1262,7 @@ fn normalize_cli_model_id(model: &str) -> String {
 mod provider_capability_tests {
     use super::{
         normalize_cli_model_id, parse_bool_override, redacted_env_for_log,
-        resolve_provider_capabilities, ApiProvider, ModelMapping,
-        PARTIAL_MESSAGES_OVERRIDE_ENV,
+        resolve_provider_capabilities, ApiProvider, ModelMapping, PARTIAL_MESSAGES_OVERRIDE_ENV,
     };
     use std::collections::HashMap;
 
@@ -1304,10 +1303,7 @@ mod provider_capability_tests {
     fn normalize_cli_model_id_passes_models_through_unchanged() {
         // Standard Opus passes through; the 1M form already arrives in `[1m]`
         // shape from the frontend, so it is also untouched.
-        assert_eq!(
-            normalize_cli_model_id("claude-opus-4-8"),
-            "claude-opus-4-8"
-        );
+        assert_eq!(normalize_cli_model_id("claude-opus-4-8"), "claude-opus-4-8");
         assert_eq!(
             normalize_cli_model_id("claude-opus-4-8[1m]"),
             "claude-opus-4-8[1m]"
@@ -1662,11 +1658,35 @@ fn cleanup_mcp_scratch_config(stdin_id: &str) {
     }
 }
 
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+async fn dispatch_wechat_stream_event(
+    runtime: &wechat::runtime::WechatRuntimeHandle,
+    stdin_mgr: &StdinManager,
+    event: &Value,
+) {
+    let effects = runtime.process_stream_event(event, current_time_ms()).await;
+    if effects.is_empty() {
+        return;
+    }
+
+    let store = runtime.state_store().await;
+    if let Err(err) = wechat::executor::execute_turn_effects(stdin_mgr, &store, &effects).await {
+        eprintln!("[WeChat] stream fanout failed: {err}");
+    }
+}
+
 #[tauri::command]
 async fn start_claude_session(
     app: AppHandle,
     state: State<'_, ProcessManager>,
     stdin_mgr: State<'_, StdinManager>,
+    wechat_runtime: State<'_, wechat::runtime::WechatRuntimeHandle>,
     bypass_modes: State<'_, BypassModeMap>,
     path_access: State<'_, PathAccessManager>,
     params: StartSessionParams,
@@ -1861,9 +1881,7 @@ async fn start_claude_session(
     // `claude-opus-4-8`) deliberately do not match.
     if let Some(model_name) = params.model.as_deref() {
         let m = model_name.to_lowercase();
-        let is_1m_model = m.contains("mimo")
-            || m.contains("[1m]")
-            || m.ends_with("-1m");
+        let is_1m_model = m.contains("mimo") || m.contains("[1m]") || m.ends_with("-1m");
         if is_1m_model {
             resolved_env.insert(
                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
@@ -2183,6 +2201,8 @@ async fn start_claude_session(
     let exit_notify_clone = exit_notify.clone();
     let state_clone = state.inner().clone();
     let stdin_mgr_clone = stdin_mgr.inner().clone();
+    let stdin_mgr_for_wechat = stdin_mgr.inner().clone();
+    let wechat_runtime_clone = wechat_runtime.inner().clone();
     let bypass_modes_clone = bypass_modes.inner().clone();
     let bypass_flag = bypass_modes
         .register(&sid, permission_mode == "bypassPermissions")
@@ -2244,6 +2264,8 @@ async fn start_claude_session(
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
+
+            dispatch_wechat_stream_event(&wechat_runtime_clone, &stdin_mgr_for_wechat, &json).await;
 
             // Intercept control_request messages for SDK control protocol routing.
             // All modes use --permission-prompt-tool stdio. In bypass mode, we
@@ -2344,6 +2366,12 @@ async fn start_claude_session(
                                 "parent_tool_use_id": parent_tool_use_id,
                                 "agent_id": agent_id,
                             });
+                            dispatch_wechat_stream_event(
+                                &wechat_runtime_clone,
+                                &stdin_mgr_for_wechat,
+                                &perm_payload,
+                            )
+                            .await;
                             let _ = emit_to_frontend(&app_clone, &stream_event, perm_payload);
                             continue; // Don't forward to stream as normal msg
                         }
