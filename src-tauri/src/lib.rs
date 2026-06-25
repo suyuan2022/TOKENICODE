@@ -8037,6 +8037,9 @@ pub fn run() {
         .manage(BypassModeMap::new())
         .manage(WatcherManager::default())
         .manage(PathAccessManager::new())
+        .manage(wechat::runtime::WechatRuntimeHandle::new(
+            wechat::store::default_wechat_state_store(),
+        ))
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // titleBarStyle: "Overlay" in tauri.conf.json handles macOS traffic lights
@@ -8167,6 +8170,7 @@ pub fn run() {
             wechat::commands::wechat_start_qr_login,
             wechat::commands::wechat_poll_qr_login,
             wechat::commands::wechat_disconnect,
+            wechat::commands::wechat_set_desktop_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

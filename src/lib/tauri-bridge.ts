@@ -450,6 +450,9 @@ export const bridge = {
   wechatDisconnect: () =>
     invoke<void>('wechat_disconnect'),
 
+  wechatSetDesktopSession: (sessionId: string | null) =>
+    invoke<void>('wechat_set_desktop_session', { sessionId }),
+
   // Session custom names (persisted to ~/.claude/tokenicode_session_names.json)
   loadCustomPreviews: () =>
     invoke<Record<string, string>>('load_custom_previews'),

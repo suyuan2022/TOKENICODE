@@ -5,6 +5,8 @@ use crate::wechat::{
     store::WechatStateStore,
     turn::{WechatTurnEffect, WechatTurnManager},
 };
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WechatPollOutcome {
@@ -19,6 +21,35 @@ pub struct WechatRuntime {
     store: WechatStateStore,
     monitor: WechatMonitorState,
     turn_manager: WechatTurnManager,
+}
+
+#[derive(Debug, Clone)]
+pub struct WechatRuntimeHandle {
+    inner: Arc<Mutex<WechatRuntime>>,
+}
+
+impl WechatRuntimeHandle {
+    pub fn new(store: WechatStateStore) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(WechatRuntime::new(store))),
+        }
+    }
+
+    pub async fn set_desktop_session(&self, session_id: String) {
+        self.inner.lock().await.set_desktop_session(session_id);
+    }
+
+    pub async fn clear_desktop_session(&self) {
+        self.inner.lock().await.clear_desktop_session();
+    }
+
+    pub async fn desktop_session_id(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .await
+            .desktop_session_id()
+            .map(ToOwned::to_owned)
+    }
 }
 
 impl WechatRuntime {
@@ -36,6 +67,14 @@ impl WechatRuntime {
 
     pub fn set_desktop_session(&mut self, session_id: String) {
         self.turn_manager.set_desktop_session(session_id);
+    }
+
+    pub fn clear_desktop_session(&mut self) {
+        self.turn_manager.clear_desktop_session();
+    }
+
+    pub fn desktop_session_id(&self) -> Option<&str> {
+        self.turn_manager.desktop_session_id()
     }
 
     pub fn next_get_updates_request(&self) -> Result<Option<IlinkHttpRequest>, String> {
@@ -85,6 +124,25 @@ impl WechatRuntime {
             inbound_text_count,
             effects,
         })
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use crate::wechat::{runtime::WechatRuntimeHandle, store::WechatStateStore};
+
+    #[tokio::test]
+    async fn stores_and_clears_current_desktop_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WechatRuntimeHandle::new(WechatStateStore::new(dir.path().to_path_buf()));
+
+        handle.set_desktop_session("stdin-1".into()).await;
+
+        assert_eq!(handle.desktop_session_id().await, Some("stdin-1".into()));
+
+        handle.clear_desktop_session().await;
+
+        assert_eq!(handle.desktop_session_id().await, None);
     }
 }
 

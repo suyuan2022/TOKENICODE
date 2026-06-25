@@ -88,6 +88,10 @@ impl WechatTurnManager {
         self.desktop_session_id = Some(session_id);
     }
 
+    pub fn clear_desktop_session(&mut self) {
+        self.desktop_session_id = None;
+    }
+
     pub fn receive_text(&mut self, message: InboundWechatText) -> Vec<WechatTurnEffect> {
         let mut effects = self.discard_stale(message.received_at_ms);
         self.queue.push_back(message);
@@ -117,7 +121,10 @@ impl WechatTurnManager {
         effects
     }
 
-    pub fn request_permission(&mut self, request: WechatPermissionRequest) -> Vec<WechatTurnEffect> {
+    pub fn request_permission(
+        &mut self,
+        request: WechatPermissionRequest,
+    ) -> Vec<WechatTurnEffect> {
         let Some(active_turn) = self.active_turn.as_ref() else {
             return Vec::new();
         };

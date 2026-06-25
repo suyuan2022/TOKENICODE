@@ -79,6 +79,17 @@ impl WechatStateStore {
     }
 }
 
+pub fn default_wechat_state_store() -> WechatStateStore {
+    WechatStateStore::new(default_wechat_state_dir())
+}
+
+pub fn default_wechat_state_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".tokenicode")
+        .join("wechat")
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> StoreResult<()> {
     let data = serde_json::to_vec_pretty(value).map_err(|err| format!("serialize json: {err}"))?;
     write_bytes(path, &data)

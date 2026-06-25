@@ -1,11 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tauri::State;
 
 use crate::wechat::{
     api::{IlinkApiClient, QrCodeResponse, QrStatusResponse},
     login::{parse_qr_code_response, parse_qr_status_response, WechatQrPoll},
-    store::{WechatAccount, WechatStateStore},
+    runtime::WechatRuntimeHandle,
+    store::{default_wechat_state_store, WechatAccount, WechatStateStore},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,15 +110,24 @@ pub async fn wechat_disconnect() -> Result<(), String> {
     state_store().clear_account()
 }
 
-fn state_store() -> WechatStateStore {
-    WechatStateStore::new(wechat_state_dir())
+#[tauri::command]
+pub async fn wechat_set_desktop_session(
+    session_id: Option<String>,
+    runtime: State<'_, WechatRuntimeHandle>,
+) -> Result<(), String> {
+    set_desktop_session(runtime.inner(), session_id).await;
+    Ok(())
 }
 
-fn wechat_state_dir() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".tokenicode")
-        .join("wechat")
+async fn set_desktop_session(runtime: &WechatRuntimeHandle, session_id: Option<String>) {
+    match session_id.filter(|value| !value.trim().is_empty()) {
+        Some(session_id) => runtime.set_desktop_session(session_id).await,
+        None => runtime.clear_desktop_session().await,
+    }
+}
+
+fn state_store() -> WechatStateStore {
+    default_wechat_state_store()
 }
 
 fn now_ms() -> u64 {
@@ -137,6 +148,20 @@ pub fn normalize_qr_image(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn set_desktop_session_updates_shared_runtime_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = WechatRuntimeHandle::new(WechatStateStore::new(dir.path().to_path_buf()));
+
+        set_desktop_session(&runtime, Some("stdin-1".into())).await;
+
+        assert_eq!(runtime.desktop_session_id().await, Some("stdin-1".into()));
+
+        set_desktop_session(&runtime, None).await;
+
+        assert_eq!(runtime.desktop_session_id().await, None);
+    }
 
     #[test]
     fn normalizes_raw_base64_qr_images_for_frontend() {
