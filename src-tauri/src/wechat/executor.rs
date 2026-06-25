@@ -213,9 +213,10 @@ where
             context_token,
             text,
         } => {
+            let context_token = resolve_context_token(store, to_user_id, context_token)?;
             for chunk in split_wechat_text_chunks(text) {
                 let request =
-                    client.send_text_request(to_user_id, context_token, &chunk, &new_client_id());
+                    client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
                 let response: SendMessageResponse =
                     parse_response(execute_request(request).await?)?;
                 match classify_send_response(&response) {
@@ -264,6 +265,21 @@ where
         }
         _ => Ok(false),
     }
+}
+
+fn resolve_context_token(
+    store: &WechatStateStore,
+    to_user_id: &str,
+    context_token: &str,
+) -> Result<String, String> {
+    if !context_token.trim().is_empty() {
+        return Ok(context_token.to_string());
+    }
+
+    store
+        .load_context_token(to_user_id)?
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| format!("WeChat context_token missing for user {to_user_id}"))
 }
 
 async fn execute_typing_effect<F, Fut>(
@@ -569,6 +585,44 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("tc-"));
+    }
+
+    #[tokio::test]
+    async fn send_wechat_text_effect_uses_persisted_context_token_when_effect_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        store.save_context_token("user-1", "ctx-latest").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: String::new(),
+                text: "async follow-up".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body["msg"]["to_user_id"], "user-1");
+        assert_eq!(requests[0].body["msg"]["context_token"], "ctx-latest");
+        assert_eq!(
+            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
+            "async follow-up"
+        );
     }
 
     #[tokio::test]
