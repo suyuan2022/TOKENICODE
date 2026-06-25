@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use serde_json::Value;
+
 const STALE_QUEUE_AFTER_MS: u64 = 60_000;
 const STALE_QUEUE_NOTICE: &str = "这条消息排队超过 60 秒，请重新发送。";
 
@@ -17,6 +19,8 @@ pub struct WechatPermissionRequest {
     pub request_id: String,
     pub tool_name: String,
     pub input_preview: String,
+    pub tool_use_id: Option<String>,
+    pub updated_input: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +46,8 @@ pub enum WechatTurnEffect {
         desktop_session_id: String,
         request_id: String,
         allow: bool,
+        tool_use_id: Option<String>,
+        updated_input: Value,
     },
 }
 
@@ -140,6 +146,8 @@ impl WechatTurnManager {
             desktop_session_id,
             request_id: request.request_id,
             allow,
+            tool_use_id: request.tool_use_id,
+            updated_input: request.updated_input,
         }]
     }
 
@@ -342,6 +350,8 @@ mod tests {
             request_id: "perm-1".into(),
             tool_name: "Bash".into(),
             input_preview: "{ \"cmd\": \"pnpm test\" }".into(),
+            tool_use_id: Some("toolu-1".into()),
+            updated_input: serde_json::json!({ "cmd": "pnpm test" }),
         });
 
         assert_eq!(
@@ -362,6 +372,8 @@ mod tests {
                 desktop_session_id: "stdin-1".into(),
                 request_id: "perm-1".into(),
                 allow: true,
+                tool_use_id: Some("toolu-1".into()),
+                updated_input: serde_json::json!({ "cmd": "pnpm test" }),
             }],
         );
         assert_eq!(manager.pending_permission_request_id(), None);
@@ -378,6 +390,8 @@ mod tests {
             request_id: "perm-1".into(),
             tool_name: "Bash".into(),
             input_preview: "{}".into(),
+            tool_use_id: None,
+            updated_input: serde_json::json!({}),
         });
 
         let effects = manager.disconnect();
