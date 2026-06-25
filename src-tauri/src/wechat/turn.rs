@@ -6,6 +6,13 @@ const STALE_QUEUE_AFTER_MS: u64 = 60_000;
 const STALE_QUEUE_NOTICE: &str = "这条消息排队超过 60 秒，请重新发送。";
 const STOP_CONFIRM_NOTICE: &str = "已停止当前任务，并清空排队消息。";
 const STOP_IDLE_NOTICE: &str = "当前没有正在运行的任务。";
+const HELP_NOTICE: &str = "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n\n权限请求时，回复 approve/deny 或 同意/拒绝。";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BasicRemoteCommand {
+    Help,
+    Status,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundWechatText {
@@ -100,6 +107,9 @@ impl WechatTurnManager {
     pub fn receive_text(&mut self, message: InboundWechatText) -> Vec<WechatTurnEffect> {
         if parse_stop_command(&message.text) {
             return self.stop_current_turn(message);
+        }
+        if let Some(command) = parse_basic_remote_command(&message.text) {
+            return self.reply_to_basic_command(command, message);
         }
 
         let mut effects = self.discard_stale(message.received_at_ms);
@@ -227,6 +237,57 @@ impl WechatTurnManager {
         effects
     }
 
+    fn reply_to_basic_command(
+        &self,
+        command: BasicRemoteCommand,
+        message: InboundWechatText,
+    ) -> Vec<WechatTurnEffect> {
+        let text = match command {
+            BasicRemoteCommand::Help => HELP_NOTICE.into(),
+            BasicRemoteCommand::Status => self.status_notice(),
+        };
+
+        vec![WechatTurnEffect::SendWeChatText {
+            to_user_id: message.from_user_id,
+            context_token: message.context_token,
+            text,
+        }]
+    }
+
+    fn status_notice(&self) -> String {
+        let mut lines = vec![
+            format!(
+                "微信远程状态：{}",
+                if self.connected {
+                    "已连接"
+                } else {
+                    "未连接"
+                }
+            ),
+            format!(
+                "桌面会话：{}",
+                if self.desktop_session_id.is_some() {
+                    "已绑定"
+                } else {
+                    "未绑定"
+                }
+            ),
+            format!(
+                "当前任务：{}",
+                if self.active_turn.is_some() {
+                    "处理中"
+                } else {
+                    "空闲"
+                }
+            ),
+            format!("排队消息：{}", self.queue.len()),
+        ];
+        if self.pending_permission.is_some() {
+            lines.push("权限请求：等待回复 approve/deny".into());
+        }
+        lines.join("\n")
+    }
+
     fn discard_stale(&mut self, now_ms: u64) -> Vec<WechatTurnEffect> {
         let mut fresh = VecDeque::new();
         let mut effects = Vec::new();
@@ -270,6 +331,14 @@ impl WechatTurnManager {
         ];
         self.active_turn = Some(next_turn);
         effects
+    }
+}
+
+fn parse_basic_remote_command(text: &str) -> Option<BasicRemoteCommand> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "/help" | "help" | "帮助" | "幫助" => Some(BasicRemoteCommand::Help),
+        "/status" | "status" | "状态" | "狀態" => Some(BasicRemoteCommand::Status),
+        _ => None,
     }
 }
 
@@ -545,6 +614,57 @@ mod tests {
         assert_eq!(manager.queued_len(), 0);
         assert_eq!(manager.pending_permission_request_id(), None);
         assert!(manager.finish_turn("late answer".into(), 3_000).is_empty());
+    }
+
+    #[test]
+    fn help_command_replies_without_starting_a_claude_turn() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+        manager.set_desktop_session("stdin-1".into());
+
+        let effects = manager.receive_text(text_message("msg-1", "/help", 0));
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user@im.wechat".into(),
+                context_token: "ctx-msg-1".into(),
+                text: "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n\n权限请求时，回复 approve/deny 或 同意/拒绝。"
+                    .into(),
+            }],
+        );
+        assert_eq!(manager.active_turn_message_id(), None);
+        assert_eq!(manager.queued_len(), 0);
+    }
+
+    #[test]
+    fn status_command_reports_remote_state_without_interrupting_work() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+        manager.set_desktop_session("stdin-1".into());
+        manager.receive_text(text_message("msg-1", "first", 0));
+        manager.receive_text(text_message("msg-2", "second", 1_000));
+        manager.request_permission(WechatPermissionRequest {
+            request_id: "perm-1".into(),
+            tool_name: "Bash".into(),
+            input_preview: "{}".into(),
+            tool_use_id: None,
+            updated_input: serde_json::json!({}),
+        });
+
+        let effects = manager.receive_text(text_message("msg-3", "/status", 2_000));
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user@im.wechat".into(),
+                context_token: "ctx-msg-3".into(),
+                text: "微信远程状态：已连接\n桌面会话：已绑定\n当前任务：处理中\n排队消息：1\n权限请求：等待回复 approve/deny".into(),
+            }],
+        );
+        assert_eq!(manager.active_turn_message_id(), Some("msg-1"));
+        assert_eq!(manager.queued_len(), 1);
+        assert_eq!(manager.pending_permission_request_id(), Some("perm-1"));
     }
 
     #[test]
