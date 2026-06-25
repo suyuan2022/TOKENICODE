@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{commands::StdinManager, protocol::ControlRequest};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
 use serde_json::Value;
 
@@ -25,10 +25,27 @@ use super::{
 
 const MAX_WECHAT_TEXT_CHARS: usize = 3_800;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WechatEffectDispatch {
     pub claude_effect_count: usize,
     pub wechat_effect_count: usize,
+    pub desktop_user_messages: Vec<WechatDesktopUserMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WechatDesktopUserMessage {
+    pub desktop_session_id: String,
+    pub content: String,
+    pub attachments: Vec<WechatDesktopAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WechatDesktopAttachment {
+    pub name: String,
+    pub path: String,
+    pub is_image: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,11 +174,22 @@ where
 {
     let mut dispatch = WechatEffectDispatch::default();
     for effect in effects {
-        let handled_claude = execute_claude_effect(stdin_mgr, effect).await?
-            || execute_claude_media_effect_with(stdin_mgr, store, effect, &mut download_media)
-                .await?;
+        let mut desktop_user_message = desktop_user_message_for_text_effect(effect);
+        let mut handled_claude = execute_claude_effect(stdin_mgr, effect).await?;
+        if !handled_claude {
+            if let Some(message) =
+                execute_claude_media_effect_with(stdin_mgr, store, effect, &mut download_media)
+                    .await?
+            {
+                handled_claude = true;
+                desktop_user_message = Some(message);
+            }
+        }
         if handled_claude {
             dispatch.claude_effect_count += 1;
+            if let Some(message) = desktop_user_message {
+                dispatch.desktop_user_messages.push(message);
+            }
         }
         if execute_wechat_effect_with(effect, store, &mut execute_wechat_request).await? {
             dispatch.wechat_effect_count += 1;
@@ -175,7 +203,7 @@ pub async fn execute_claude_media_effect_with<F, Fut>(
     store: &WechatStateStore,
     effect: &WechatTurnEffect,
     mut download_media: F,
-) -> Result<bool, String>
+) -> Result<Option<WechatDesktopUserMessage>, String>
 where
     F: FnMut(WechatCdnDownloadRequest) -> Fut,
     Fut: Future<Output = Result<Vec<u8>, String>>,
@@ -185,7 +213,7 @@ where
         media,
     } = effect
     else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let request = build_cdn_download_request(&media.cdn)?;
@@ -204,7 +232,18 @@ where
     stdin_mgr
         .send(desktop_session_id, &payload.to_string())
         .await?;
-    Ok(true)
+    Ok(Some(WechatDesktopUserMessage {
+        desktop_session_id: desktop_session_id.clone(),
+        content: media_display_text(media),
+        attachments: vec![WechatDesktopAttachment {
+            name: saved_path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "media".into()),
+            path: saved_path.display().to_string(),
+            is_image: media.kind == InboundWechatMediaKind::Image,
+        }],
+    }))
 }
 
 pub async fn execute_wechat_effect(
@@ -443,6 +482,39 @@ fn media_prompt_for_claude(media: &InboundWechatMedia, saved_path: &Path) -> Str
     )
 }
 
+fn desktop_user_message_for_text_effect(
+    effect: &WechatTurnEffect,
+) -> Option<WechatDesktopUserMessage> {
+    let WechatTurnEffect::SendToClaude {
+        desktop_session_id,
+        text,
+    } = effect
+    else {
+        return None;
+    };
+
+    Some(WechatDesktopUserMessage {
+        desktop_session_id: desktop_session_id.clone(),
+        content: text.clone(),
+        attachments: Vec::new(),
+    })
+}
+
+fn media_display_text(media: &InboundWechatMedia) -> String {
+    let label = match media.kind {
+        InboundWechatMediaKind::Image => "微信发来的图片",
+        InboundWechatMediaKind::File => "微信发来的文件",
+    };
+    let name = media
+        .file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("：{value}"))
+        .unwrap_or_default();
+    format!("{label}{name}")
+}
+
 fn split_wechat_text_chunks(text: &str) -> Vec<String> {
     if text.chars().count() <= MAX_WECHAT_TEXT_CHARS {
         return vec![text.to_string()];
@@ -609,6 +681,22 @@ mod tests {
             .trim();
         assert!(Path::new(saved_path).starts_with(dir.path().join("inbound-media")));
         assert_eq!(std::fs::read(saved_path).unwrap(), b"hello wechat media");
+        assert_eq!(
+            dispatch.desktop_user_messages,
+            vec![WechatDesktopUserMessage {
+                desktop_session_id: "stdin-1".into(),
+                content: "微信发来的图片".into(),
+                attachments: vec![WechatDesktopAttachment {
+                    name: Path::new(saved_path)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                    path: saved_path.into(),
+                    is_image: true,
+                }],
+            }]
+        );
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;

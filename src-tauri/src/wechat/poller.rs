@@ -9,12 +9,14 @@ use tokio::{
 };
 
 use serde_json::{json, Value};
+use tauri::AppHandle;
 
 use crate::{
     commands::StdinManager,
+    events::emit_to_frontend,
     wechat::{
         api::{GetUpdatesResponse, IlinkApiClient, IlinkHttpRequest},
-        executor::execute_turn_effects_with,
+        executor::{execute_turn_effects_with, WechatDesktopUserMessage},
         monitor::MonitorStatus,
         runtime::WechatRuntimeHandle,
     },
@@ -35,7 +37,12 @@ struct PollingTaskState {
 }
 
 impl WechatPollingTask {
-    pub async fn start(&self, runtime: WechatRuntimeHandle, stdin_mgr: StdinManager) -> bool {
+    pub async fn start(
+        &self,
+        runtime: WechatRuntimeHandle,
+        stdin_mgr: StdinManager,
+        app: Option<AppHandle>,
+    ) -> bool {
         let mut state = self.inner.lock().await;
         if state
             .handle
@@ -52,7 +59,9 @@ impl WechatPollingTask {
 
         let (stop_tx, stop_rx) = oneshot::channel();
         state.stop_tx = Some(stop_tx);
-        state.handle = Some(tokio::spawn(run_poll_loop(runtime, stdin_mgr, stop_rx)));
+        state.handle = Some(tokio::spawn(run_poll_loop(
+            runtime, stdin_mgr, app, stop_rx,
+        )));
         true
     }
 
@@ -88,6 +97,7 @@ pub struct WechatPollIteration {
     pub inbound_text_count: usize,
     pub claude_effect_count: usize,
     pub wechat_effect_count: usize,
+    pub desktop_user_messages: Vec<WechatDesktopUserMessage>,
     pub next_timeout_ms: u64,
 }
 
@@ -149,6 +159,7 @@ where
             inbound_text_count: 0,
             claude_effect_count: 0,
             wechat_effect_count: 0,
+            desktop_user_messages: Vec::new(),
             next_timeout_ms: NO_ACCOUNT_RETRY_MS,
         });
     };
@@ -174,6 +185,7 @@ where
         inbound_text_count: outcome.inbound_text_count,
         claude_effect_count: dispatch.claude_effect_count,
         wechat_effect_count: dispatch.wechat_effect_count,
+        desktop_user_messages: dispatch.desktop_user_messages,
         next_timeout_ms: outcome.next_timeout_ms,
     })
 }
@@ -181,6 +193,7 @@ where
 async fn run_poll_loop(
     runtime: WechatRuntimeHandle,
     stdin_mgr: StdinManager,
+    app: Option<AppHandle>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
     let mut retry_delay_ms = 0;
@@ -199,15 +212,31 @@ async fn run_poll_loop(
 
         retry_delay_ms = match iteration {
             Ok(iteration) if iteration.status == Some(MonitorStatus::SessionExpired) => {
+                emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
                 iteration.next_timeout_ms
             }
-            Ok(iteration) if iteration.polled => 0,
+            Ok(iteration) if iteration.polled => {
+                emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
+                0
+            }
             Ok(_) => NO_ACCOUNT_RETRY_MS,
             Err(err) => {
                 eprintln!("[WeChat] polling failed: {err}");
                 ERROR_RETRY_MS
             }
         };
+    }
+}
+
+fn emit_desktop_user_messages(app: Option<&AppHandle>, messages: &[WechatDesktopUserMessage]) {
+    let Some(app) = app else {
+        return;
+    };
+
+    for message in messages {
+        if let Err(err) = emit_to_frontend(app, "wechat:desktop_user_message", message) {
+            eprintln!("[WeChat] desktop user message emit failed: {err}");
+        }
     }
 }
 
@@ -247,8 +276,8 @@ mod tests {
         let stdin_mgr = StdinManager::new();
         let task = WechatPollingTask::default();
 
-        assert!(task.start(runtime.clone(), stdin_mgr.clone()).await);
-        assert!(!task.start(runtime, stdin_mgr).await);
+        assert!(task.start(runtime.clone(), stdin_mgr.clone(), None).await);
+        assert!(!task.start(runtime, stdin_mgr, None).await);
         assert!(task.is_running().await);
 
         assert!(task.stop().await);
@@ -290,6 +319,16 @@ mod tests {
         assert!(iteration.polled);
         assert_eq!(iteration.inbound_text_count, 1);
         assert_eq!(iteration.claude_effect_count, 1);
+        assert_eq!(iteration.desktop_user_messages.len(), 1);
+        assert_eq!(
+            iteration.desktop_user_messages[0].desktop_session_id,
+            "stdin-1"
+        );
+        assert_eq!(
+            iteration.desktop_user_messages[0].content,
+            "hello from WeChat"
+        );
+        assert!(iteration.desktop_user_messages[0].attachments.is_empty());
         assert_eq!(iteration.next_timeout_ms, 25_000);
 
         let line = lines.next_line().await.unwrap().unwrap();

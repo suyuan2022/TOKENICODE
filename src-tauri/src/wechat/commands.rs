@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::{
     commands::StdinManager,
@@ -58,6 +58,7 @@ pub struct WechatQrPollResponse {
 
 #[tauri::command]
 pub async fn wechat_get_status(
+    app: AppHandle,
     runtime: State<'_, WechatRuntimeHandle>,
     polling_task: State<'_, WechatPollingTask>,
     stdin_mgr: State<'_, StdinManager>,
@@ -68,6 +69,7 @@ pub async fn wechat_get_status(
             runtime.inner(),
             polling_task.inner(),
             stdin_mgr.inner(),
+            Some(app),
         )
         .await
         {
@@ -93,6 +95,7 @@ pub async fn wechat_start_qr_login() -> Result<WechatQrStartResponse, String> {
 
 #[tauri::command]
 pub async fn wechat_poll_qr_login(
+    app: AppHandle,
     qrcode_id: String,
     verify_code: Option<String>,
     runtime: State<'_, WechatRuntimeHandle>,
@@ -112,6 +115,7 @@ pub async fn wechat_poll_qr_login(
                 runtime.inner(),
                 polling_task.inner(),
                 stdin_mgr.inner(),
+                Some(app),
             )
             .await;
             Ok(WechatQrPollResponse {
@@ -155,13 +159,21 @@ pub async fn wechat_disconnect(
 
 #[tauri::command]
 pub async fn wechat_start_polling(
+    app: AppHandle,
     session_id: String,
     runtime: State<'_, WechatRuntimeHandle>,
     polling_task: State<'_, WechatPollingTask>,
     stdin_mgr: State<'_, StdinManager>,
 ) -> Result<(), String> {
     set_desktop_session(runtime.inner(), Some(session_id)).await;
-    if start_polling_task(runtime.inner(), polling_task.inner(), stdin_mgr.inner()).await {
+    if start_polling_task(
+        runtime.inner(),
+        polling_task.inner(),
+        stdin_mgr.inner(),
+        Some(app),
+    )
+    .await
+    {
         let store = runtime.state_store().await;
         notify_lifecycle(WechatLifecycleEffect::NotifyStart, &store).await;
     }
@@ -193,17 +205,21 @@ async fn start_polling_task(
     runtime: &WechatRuntimeHandle,
     polling_task: &WechatPollingTask,
     stdin_mgr: &StdinManager,
+    app: Option<AppHandle>,
 ) -> bool {
-    polling_task.start(runtime.clone(), stdin_mgr.clone()).await
+    polling_task
+        .start(runtime.clone(), stdin_mgr.clone(), app)
+        .await
 }
 
 async fn start_polling_task_if_desktop_session(
     runtime: &WechatRuntimeHandle,
     polling_task: &WechatPollingTask,
     stdin_mgr: &StdinManager,
+    app: Option<AppHandle>,
 ) -> bool {
     if runtime.desktop_session_id().await.is_some() {
-        start_polling_task(runtime, polling_task, stdin_mgr).await
+        start_polling_task(runtime, polling_task, stdin_mgr, app).await
     } else {
         false
     }
@@ -266,11 +282,15 @@ mod tests {
         let polling_task = WechatPollingTask::default();
         let stdin_mgr = StdinManager::new();
 
-        assert!(!start_polling_task_if_desktop_session(&runtime, &polling_task, &stdin_mgr).await);
+        assert!(
+            !start_polling_task_if_desktop_session(&runtime, &polling_task, &stdin_mgr, None).await
+        );
 
         runtime.set_desktop_session("stdin-1".into()).await;
 
-        assert!(start_polling_task_if_desktop_session(&runtime, &polling_task, &stdin_mgr).await);
+        assert!(
+            start_polling_task_if_desktop_session(&runtime, &polling_task, &stdin_mgr, None).await
+        );
         assert!(polling_task.stop().await);
     }
 

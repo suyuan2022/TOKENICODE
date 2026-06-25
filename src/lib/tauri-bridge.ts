@@ -151,6 +151,18 @@ export interface WechatQrPoll {
   account?: WechatAccountInfo | null;
 }
 
+export interface WechatDesktopAttachment {
+  name: string;
+  path: string;
+  isImage: boolean;
+}
+
+export interface WechatDesktopUserMessageEvent {
+  desktopSessionId: string;
+  content: string;
+  attachments?: WechatDesktopAttachment[];
+}
+
 export interface StepResult {
   ok: boolean;
   message: string;
@@ -608,6 +620,15 @@ export function onSessionExit(
 ): Promise<UnlistenFn> {
   return listen<number | null>(
     `claude:exit:${stdinId}`,
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopUserMessage(
+  callback: (message: WechatDesktopUserMessageEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopUserMessageEvent>(
+    'wechat:desktop_user_message',
     (event) => callback(event.payload),
   );
 }
