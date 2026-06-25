@@ -9,8 +9,9 @@ import { ProviderTab } from './ProviderTab';
 import { CliTab } from './CliTab';
 import { McpTab } from './McpTab';
 import { FeedbackTab } from './FeedbackTab';
+import { WechatTab } from './WechatTab';
 
-type SettingsTab = 'general' | 'provider' | 'cli' | 'mcp' | 'feedback';
+type SettingsTab = 'general' | 'provider' | 'cli' | 'mcp' | 'wechat' | 'feedback';
 
 const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
   general: (
@@ -40,6 +41,14 @@ const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
       <circle cx="4" cy="11" r="0.75" fill="currentColor" />
     </svg>
   ),
+  wechat: (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 7a4.5 4.5 0 018.2 2.6L13 12l-3.6-.8A4.8 4.8 0 017.8 12H7a5 5 0 01-5-5z" />
+      <path d="M9.5 4.2A4 4 0 0114 8a3.8 3.8 0 01-.9 2.5" />
+      <circle cx="5.7" cy="7" r=".45" fill="currentColor" />
+      <circle cx="8.3" cy="7" r=".45" fill="currentColor" />
+    </svg>
+  ),
   feedback: (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <path d="M2 3h12a1 1 0 011 1v7a1 1 0 01-1 1H6l-3 3V4a1 1 0 011-1z" />
@@ -53,6 +62,7 @@ const TAB_ITEMS: { id: SettingsTab; labelKey: string }[] = [
   { id: 'provider', labelKey: 'settings.tab.provider' },
   { id: 'cli', labelKey: 'settings.tab.cli' },
   { id: 'mcp', labelKey: 'settings.tab.mcp' },
+  { id: 'wechat', labelKey: 'settings.tab.wechat' },
   { id: 'feedback', labelKey: 'settings.tab.feedback' },
 ];
 
@@ -132,6 +142,7 @@ export function SettingsPanel() {
             {activeTab === 'provider' && <ProviderTab />}
             {activeTab === 'cli' && <CliTab />}
             {activeTab === 'mcp' && <McpTab />}
+            {activeTab === 'wechat' && <WechatTab />}
             {activeTab === 'feedback' && <FeedbackTab />}
           </div>
         </div>

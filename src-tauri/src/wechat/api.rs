@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
@@ -161,6 +162,48 @@ impl IlinkApiClient {
         )
     }
 
+    pub async fn execute_json<T: DeserializeOwned>(
+        &self,
+        request: IlinkHttpRequest,
+    ) -> Result<T, String> {
+        let method = match request.method {
+            IlinkHttpMethod::Get => reqwest::Method::GET,
+            IlinkHttpMethod::Post => reqwest::Method::POST,
+        };
+        let client = reqwest::Client::new();
+        let mut builder = client
+            .request(method, &request.url)
+            .timeout(Duration::from_millis(request.timeout_ms));
+        for (key, value) in &request.headers {
+            builder = builder.header(key, value);
+        }
+        if request.method == IlinkHttpMethod::Post {
+            builder = builder.json(&request.body);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|err| format!("iLink request failed: {err}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| format!("iLink response read failed: {err}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "iLink HTTP {status}: {}",
+                truncate_for_error(&body)
+            ));
+        }
+        serde_json::from_str(&body).map_err(|err| {
+            format!(
+                "iLink response JSON parse failed: {err}: {}",
+                truncate_for_error(&body)
+            )
+        })
+    }
+
     fn get_request(&self, endpoint: &str, timeout_ms: u64) -> IlinkHttpRequest {
         IlinkHttpRequest {
             method: IlinkHttpMethod::Get,
@@ -283,6 +326,15 @@ fn percent_encode_query_value(input: &str) -> String {
     out
 }
 
+fn truncate_for_error(value: &str) -> String {
+    const MAX: usize = 512;
+    if value.len() <= MAX {
+        value.into()
+    } else {
+        format!("{}...", &value[..MAX])
+    }
+}
+
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
@@ -396,6 +448,26 @@ pub struct SendMessageResponse {
     pub ret: Option<i32>,
     pub errcode: Option<i32>,
     pub errmsg: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QrCodeResponse {
+    pub ret: Option<i32>,
+    pub errmsg: Option<String>,
+    pub qrcode: Option<String>,
+    pub qrcode_img_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QrStatusResponse {
+    pub ret: Option<i32>,
+    pub status: Option<String>,
+    pub retmsg: Option<String>,
+    pub bot_token: Option<String>,
+    pub ilink_bot_id: Option<String>,
+    pub baseurl: Option<String>,
+    pub ilink_user_id: Option<String>,
+    pub redirect_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

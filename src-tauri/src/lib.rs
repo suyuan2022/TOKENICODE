@@ -8163,6 +8163,10 @@ pub fn run() {
             send_control_request,
             commands::feedback::submit_feedback,
             commands::feedback::feedback_is_configured,
+            wechat::commands::wechat_get_status,
+            wechat::commands::wechat_start_qr_login,
+            wechat::commands::wechat_poll_qr_login,
+            wechat::commands::wechat_disconnect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

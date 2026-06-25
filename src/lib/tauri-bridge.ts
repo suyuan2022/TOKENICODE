@@ -128,6 +128,29 @@ export interface AuthStatus {
   unknown?: boolean;
 }
 
+export interface WechatAccountInfo {
+  accountId: string;
+  userId: string;
+  baseUrl: string;
+}
+
+export interface WechatStatus {
+  connected: boolean;
+  account: WechatAccountInfo | null;
+}
+
+export interface WechatQrStart {
+  qrcodeId: string;
+  qrcodeImage: string;
+}
+
+export interface WechatQrPoll {
+  status: string;
+  connected: boolean;
+  message?: string | null;
+  account?: WechatAccountInfo | null;
+}
+
 export interface StepResult {
   ok: boolean;
   message: string;
@@ -411,6 +434,21 @@ export const bridge = {
 
   openTerminalLogin: () =>
     invoke<void>('open_terminal_login'),
+
+  wechatGetStatus: () =>
+    invoke<WechatStatus>('wechat_get_status'),
+
+  wechatStartQrLogin: () =>
+    invoke<WechatQrStart>('wechat_start_qr_login'),
+
+  wechatPollQrLogin: (qrcodeId: string, verifyCode?: string) =>
+    invoke<WechatQrPoll>('wechat_poll_qr_login', {
+      qrcodeId,
+      verifyCode: verifyCode || null,
+    }),
+
+  wechatDisconnect: () =>
+    invoke<void>('wechat_disconnect'),
 
   // Session custom names (persisted to ~/.claude/tokenicode_session_names.json)
   loadCustomPreviews: () =>
