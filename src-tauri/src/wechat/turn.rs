@@ -48,6 +48,12 @@ pub enum WechatTurnEffect {
         context_token: String,
         text: String,
     },
+    SendWeChatFile {
+        to_user_id: String,
+        context_token: String,
+        path: String,
+        caption: Option<String>,
+    },
     StartTyping {
         to_user_id: String,
         context_token: String,

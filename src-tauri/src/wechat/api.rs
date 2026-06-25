@@ -82,6 +82,33 @@ impl IlinkApiClient {
         )
     }
 
+    pub fn get_upload_url_request(
+        &self,
+        filekey: &str,
+        media_type: UploadMediaType,
+        to_user_id: &str,
+        rawsize: u64,
+        rawfilemd5: &str,
+        filesize: u64,
+        aeskey: &str,
+    ) -> IlinkHttpRequest {
+        self.post_request(
+            "ilink/bot/getuploadurl",
+            json!({
+                "filekey": filekey,
+                "media_type": media_type as i32,
+                "to_user_id": to_user_id,
+                "rawsize": rawsize,
+                "rawfilemd5": rawfilemd5,
+                "filesize": filesize,
+                "no_need_thumb": true,
+                "aeskey": aeskey,
+                "base_info": base_info_value(),
+            }),
+            DEFAULT_API_TIMEOUT_MS,
+        )
+    }
+
     pub fn send_text_request(
         &self,
         to_user_id: &str,
@@ -109,6 +136,70 @@ impl IlinkApiClient {
                 "base_info": base_info_value(),
             }),
             DEFAULT_API_TIMEOUT_MS,
+        )
+    }
+
+    pub fn send_image_request(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        encrypt_query_param: &str,
+        aes_key: &str,
+        mid_size: u64,
+        caption: Option<&str>,
+        client_id: &str,
+    ) -> IlinkHttpRequest {
+        self.send_media_request(
+            to_user_id,
+            context_token,
+            media_item_list(
+                caption,
+                json!({
+                    "type": MessageItemType::Image as i32,
+                    "image_item": {
+                        "media": {
+                            "encrypt_query_param": encrypt_query_param,
+                            "aes_key": aes_key,
+                            "encrypt_type": 1,
+                        },
+                        "mid_size": mid_size,
+                    },
+                }),
+            ),
+            client_id,
+        )
+    }
+
+    pub fn send_file_request(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        encrypt_query_param: &str,
+        aes_key: &str,
+        file_name: &str,
+        raw_size: u64,
+        caption: Option<&str>,
+        client_id: &str,
+    ) -> IlinkHttpRequest {
+        self.send_media_request(
+            to_user_id,
+            context_token,
+            media_item_list(
+                caption,
+                json!({
+                    "type": MessageItemType::File as i32,
+                    "file_item": {
+                        "media": {
+                            "encrypt_query_param": encrypt_query_param,
+                            "aes_key": aes_key,
+                            "encrypt_type": 1,
+                        },
+                        "file_name": file_name,
+                        "len": raw_size.to_string(),
+                    },
+                }),
+            ),
+            client_id,
         )
     }
 
@@ -235,6 +326,43 @@ impl IlinkApiClient {
             endpoint.trim_start_matches('/')
         )
     }
+
+    fn send_media_request(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        item_list: Vec<Value>,
+        client_id: &str,
+    ) -> IlinkHttpRequest {
+        self.post_request(
+            "ilink/bot/sendmessage",
+            json!({
+                "msg": {
+                    "from_user_id": "",
+                    "to_user_id": to_user_id,
+                    "client_id": client_id,
+                    "message_type": MessageType::Bot as i32,
+                    "message_state": MessageState::Finish as i32,
+                    "item_list": item_list,
+                    "context_token": context_token,
+                },
+                "base_info": base_info_value(),
+            }),
+            DEFAULT_API_TIMEOUT_MS,
+        )
+    }
+}
+
+fn media_item_list(caption: Option<&str>, media_item: Value) -> Vec<Value> {
+    let mut items = Vec::new();
+    if let Some(caption) = caption.map(str::trim).filter(|value| !value.is_empty()) {
+        items.push(json!({
+            "type": MessageItemType::Text as i32,
+            "text_item": { "text": caption },
+        }));
+    }
+    items.push(media_item);
+    items
 }
 
 pub fn wechat_channel_version() -> String {
@@ -366,6 +494,15 @@ pub enum TypingStatus {
     Stop = 2,
 }
 
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadMediaType {
+    Image = 1,
+    Video = 2,
+    File = 3,
+    Voice = 4,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseInfo {
     pub channel_version: Option<String>,
@@ -455,6 +592,15 @@ pub struct SendMessageResponse {
     pub ret: Option<i32>,
     pub errcode: Option<i32>,
     pub errmsg: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetUploadUrlResponse {
+    pub ret: Option<i32>,
+    pub errcode: Option<i32>,
+    pub errmsg: Option<String>,
+    pub upload_param: Option<String>,
+    pub upload_full_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

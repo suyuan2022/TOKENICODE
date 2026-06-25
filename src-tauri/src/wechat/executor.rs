@@ -5,25 +5,29 @@ use std::{
 };
 
 use crate::{commands::StdinManager, protocol::ControlRequest};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use rand::RngCore;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
 use serde_json::Value;
 
 use super::{
     api::{
-        classify_send_response, GetConfigResponse, IlinkApiClient, IlinkHttpRequest,
-        SendMessageResponse, SendResponseClass, TypingStatus,
+        classify_send_response, GetConfigResponse, GetUploadUrlResponse, IlinkApiClient,
+        IlinkHttpRequest, SendMessageResponse, SendResponseClass, TypingStatus, UploadMediaType,
     },
     inbound::{InboundWechatMedia, InboundWechatMediaKind},
     media::{
-        build_cdn_download_request, decrypt_aes_128_ecb_pkcs7, parse_cdn_aes_key,
-        WechatCdnDownloadRequest,
+        aes_128_ecb_pkcs7_padded_size, build_cdn_download_request, build_cdn_upload_request,
+        decrypt_aes_128_ecb_pkcs7, encrypt_aes_128_ecb_pkcs7, parse_cdn_aes_key,
+        WechatCdnDownloadRequest, WechatCdnUploadRequest,
     },
     store::WechatStateStore,
     turn::WechatTurnEffect,
 };
 
 const MAX_WECHAT_TEXT_CHARS: usize = 3_800;
+const MAX_WECHAT_FILE_BYTES: u64 = 25 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WechatEffectDispatch {
@@ -125,7 +129,7 @@ pub async fn execute_turn_effects(
     store: &WechatStateStore,
     effects: &[WechatTurnEffect],
 ) -> Result<WechatEffectDispatch, String> {
-    execute_turn_effects_with_media(
+    execute_turn_effects_with_media_and_upload(
         stdin_mgr,
         store,
         effects,
@@ -135,6 +139,7 @@ pub async fn execute_turn_effects(
                 .await
         },
         download_cdn_media_bytes,
+        upload_cdn_media_bytes,
     )
     .await
 }
@@ -149,12 +154,13 @@ where
     F: FnMut(IlinkHttpRequest) -> Fut,
     Fut: Future<Output = Result<Value, String>>,
 {
-    execute_turn_effects_with_media(
+    execute_turn_effects_with_media_and_upload(
         stdin_mgr,
         store,
         effects,
         execute_wechat_request,
         download_cdn_media_bytes,
+        upload_cdn_media_bytes,
     )
     .await
 }
@@ -171,6 +177,33 @@ where
     Fut: Future<Output = Result<Value, String>>,
     G: FnMut(WechatCdnDownloadRequest) -> Gut,
     Gut: Future<Output = Result<Vec<u8>, String>>,
+{
+    execute_turn_effects_with_media_and_upload(
+        stdin_mgr,
+        store,
+        effects,
+        &mut execute_wechat_request,
+        &mut download_media,
+        upload_cdn_media_bytes,
+    )
+    .await
+}
+
+pub async fn execute_turn_effects_with_media_and_upload<F, Fut, G, Gut, H, Hut>(
+    stdin_mgr: &StdinManager,
+    store: &WechatStateStore,
+    effects: &[WechatTurnEffect],
+    mut execute_wechat_request: F,
+    mut download_media: G,
+    mut upload_media: H,
+) -> Result<WechatEffectDispatch, String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+    G: FnMut(WechatCdnDownloadRequest) -> Gut,
+    Gut: Future<Output = Result<Vec<u8>, String>>,
+    H: FnMut(WechatCdnUploadRequest) -> Hut,
+    Hut: Future<Output = Result<String, String>>,
 {
     let mut dispatch = WechatEffectDispatch::default();
     for effect in effects {
@@ -191,7 +224,14 @@ where
                 dispatch.desktop_user_messages.push(message);
             }
         }
-        if execute_wechat_effect_with(effect, store, &mut execute_wechat_request).await? {
+        if execute_wechat_effect_with_upload(
+            effect,
+            store,
+            &mut execute_wechat_request,
+            &mut upload_media,
+        )
+        .await?
+        {
             dispatch.wechat_effect_count += 1;
         }
     }
@@ -250,12 +290,126 @@ pub async fn execute_wechat_effect(
     effect: &WechatTurnEffect,
     store: &WechatStateStore,
 ) -> Result<bool, String> {
-    execute_wechat_effect_with(effect, store, |request| async move {
-        IlinkApiClient::new(None)
-            .execute_json::<Value>(request)
-            .await
-    })
+    execute_wechat_effect_with_upload(
+        effect,
+        store,
+        |request| async move {
+            IlinkApiClient::new(None)
+                .execute_json::<Value>(request)
+                .await
+        },
+        upload_cdn_media_bytes,
+    )
     .await
+}
+
+pub async fn execute_wechat_effect_with<F, Fut>(
+    effect: &WechatTurnEffect,
+    store: &WechatStateStore,
+    execute_request: F,
+) -> Result<bool, String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    execute_wechat_effect_with_upload(effect, store, execute_request, upload_cdn_media_bytes).await
+}
+
+pub async fn execute_wechat_effect_with_upload<F, Fut, H, Hut>(
+    effect: &WechatTurnEffect,
+    store: &WechatStateStore,
+    mut execute_request: F,
+    mut upload_media: H,
+) -> Result<bool, String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+    H: FnMut(WechatCdnUploadRequest) -> Hut,
+    Hut: Future<Output = Result<String, String>>,
+{
+    let Some(account) = store.load_account()? else {
+        return Ok(false);
+    };
+    let client = IlinkApiClient::with_base_url(Some(account.bot_token), account.base_url);
+
+    match effect {
+        WechatTurnEffect::SendWeChatText {
+            to_user_id,
+            context_token,
+            text,
+        } => {
+            let context_token = resolve_context_token(store, to_user_id, context_token)?;
+            let filtered_text = filter_wechat_markdown(text);
+            for chunk in split_wechat_text_chunks(&filtered_text) {
+                let request =
+                    client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
+                let response: SendMessageResponse =
+                    parse_response(execute_request(request).await?)?;
+                match classify_send_response(&response) {
+                    SendResponseClass::Ok => {}
+                    SendResponseClass::RateLimited => {
+                        return Err("WeChat sendmessage rate limited".into());
+                    }
+                    SendResponseClass::StaleSession => {
+                        return Err("WeChat sendmessage stale session; reconnect required".into());
+                    }
+                    SendResponseClass::Failed => {
+                        return Err(format!(
+                            "WeChat sendmessage failed: ret={:?} errcode={:?} errmsg={:?}",
+                            response.ret, response.errcode, response.errmsg
+                        ));
+                    }
+                }
+            }
+            Ok(true)
+        }
+        WechatTurnEffect::SendWeChatFile {
+            to_user_id,
+            context_token,
+            path,
+            caption,
+        } => {
+            let context_token = resolve_context_token(store, to_user_id, context_token)?;
+            execute_wechat_file_effect(
+                &client,
+                to_user_id,
+                &context_token,
+                path,
+                caption.as_deref(),
+                &mut execute_request,
+                &mut upload_media,
+            )
+            .await?;
+            Ok(true)
+        }
+        WechatTurnEffect::StartTyping {
+            to_user_id,
+            context_token,
+        } => {
+            execute_typing_effect(
+                &client,
+                to_user_id,
+                context_token,
+                TypingStatus::Start,
+                &mut execute_request,
+            )
+            .await
+        }
+        WechatTurnEffect::StopTyping {
+            to_user_id,
+            context_token,
+        } => {
+            execute_typing_effect(
+                &client,
+                to_user_id,
+                context_token,
+                TypingStatus::Stop,
+                &mut execute_request,
+            )
+            .await
+        }
+        _ => Ok(false),
+    }
 }
 
 pub async fn execute_wechat_lifecycle_effect(
@@ -307,81 +461,6 @@ where
     Ok(true)
 }
 
-pub async fn execute_wechat_effect_with<F, Fut>(
-    effect: &WechatTurnEffect,
-    store: &WechatStateStore,
-    mut execute_request: F,
-) -> Result<bool, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
-    let Some(account) = store.load_account()? else {
-        return Ok(false);
-    };
-    let client = IlinkApiClient::with_base_url(Some(account.bot_token), account.base_url);
-
-    match effect {
-        WechatTurnEffect::SendWeChatText {
-            to_user_id,
-            context_token,
-            text,
-        } => {
-            let context_token = resolve_context_token(store, to_user_id, context_token)?;
-            let filtered_text = filter_wechat_markdown(text);
-            for chunk in split_wechat_text_chunks(&filtered_text) {
-                let request =
-                    client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
-                let response: SendMessageResponse =
-                    parse_response(execute_request(request).await?)?;
-                match classify_send_response(&response) {
-                    SendResponseClass::Ok => {}
-                    SendResponseClass::RateLimited => {
-                        return Err("WeChat sendmessage rate limited".into());
-                    }
-                    SendResponseClass::StaleSession => {
-                        return Err("WeChat sendmessage stale session; reconnect required".into());
-                    }
-                    SendResponseClass::Failed => {
-                        return Err(format!(
-                            "WeChat sendmessage failed: ret={:?} errcode={:?} errmsg={:?}",
-                            response.ret, response.errcode, response.errmsg
-                        ));
-                    }
-                }
-            }
-            Ok(true)
-        }
-        WechatTurnEffect::StartTyping {
-            to_user_id,
-            context_token,
-        } => {
-            execute_typing_effect(
-                &client,
-                to_user_id,
-                context_token,
-                TypingStatus::Start,
-                &mut execute_request,
-            )
-            .await
-        }
-        WechatTurnEffect::StopTyping {
-            to_user_id,
-            context_token,
-        } => {
-            execute_typing_effect(
-                &client,
-                to_user_id,
-                context_token,
-                TypingStatus::Stop,
-                &mut execute_request,
-            )
-            .await
-        }
-        _ => Ok(false),
-    }
-}
-
 fn resolve_context_token(
     store: &WechatStateStore,
     to_user_id: &str,
@@ -395,6 +474,124 @@ fn resolve_context_token(
         .load_context_token(to_user_id)?
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| format!("WeChat context_token missing for user {to_user_id}"))
+}
+
+async fn execute_wechat_file_effect<F, Fut, H, Hut>(
+    client: &IlinkApiClient,
+    to_user_id: &str,
+    context_token: &str,
+    path: &str,
+    caption: Option<&str>,
+    execute_request: &mut F,
+    upload_media: &mut H,
+) -> Result<(), String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+    H: FnMut(WechatCdnUploadRequest) -> Hut,
+    Hut: Future<Output = Result<String, String>>,
+{
+    let path = Path::new(path);
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("WeChat file send stat failed for {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "WeChat file send path is not a file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_WECHAT_FILE_BYTES {
+        return Err(format!(
+            "WeChat file too large: {} bytes, max {} bytes",
+            metadata.len(),
+            MAX_WECHAT_FILE_BYTES
+        ));
+    }
+
+    let plaintext = std::fs::read(path)
+        .map_err(|err| format!("WeChat file send read failed for {}: {err}", path.display()))?;
+    let raw_size = plaintext.len() as u64;
+    let encrypted_size = aes_128_ecb_pkcs7_padded_size(plaintext.len()) as u64;
+    let raw_md5 = format!("{:x}", md5::compute(&plaintext));
+    let filekey = random_hex_16();
+    let aes_key = random_bytes_16();
+    let aeskey_hex = lower_hex(&aes_key);
+    let is_image = is_wechat_image_path(path);
+    let media_type = if is_image {
+        UploadMediaType::Image
+    } else {
+        UploadMediaType::File
+    };
+
+    let upload_url_request = client.get_upload_url_request(
+        &filekey,
+        media_type,
+        to_user_id,
+        raw_size,
+        &raw_md5,
+        encrypted_size,
+        &aeskey_hex,
+    );
+    let upload_url_response: GetUploadUrlResponse =
+        parse_response(execute_request(upload_url_request).await?)?;
+    if upload_url_response.ret.unwrap_or_default() != 0 {
+        return Err(format!(
+            "WeChat getuploadurl failed: ret={:?} errcode={:?} errmsg={:?}",
+            upload_url_response.ret, upload_url_response.errcode, upload_url_response.errmsg
+        ));
+    }
+
+    let encrypted = encrypt_aes_128_ecb_pkcs7(&plaintext, &aes_key)?;
+    let upload_request = build_cdn_upload_request(
+        upload_url_response.upload_param.as_deref(),
+        upload_url_response.upload_full_url.as_deref(),
+        &filekey,
+        encrypted,
+    )?;
+    let encrypt_query_param = upload_media(upload_request).await?;
+    let aes_key_base64 = BASE64_STANDARD.encode(aeskey_hex.as_bytes());
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "file".into());
+    let caption = caption.map(filter_wechat_markdown);
+    let caption = caption.as_deref();
+    let send_request = if is_image {
+        client.send_image_request(
+            to_user_id,
+            context_token,
+            &encrypt_query_param,
+            &aes_key_base64,
+            encrypted_size,
+            caption,
+            &new_client_id(),
+        )
+    } else {
+        client.send_file_request(
+            to_user_id,
+            context_token,
+            &encrypt_query_param,
+            &aes_key_base64,
+            &file_name,
+            raw_size,
+            caption,
+            &new_client_id(),
+        )
+    };
+
+    let response: SendMessageResponse = parse_response(execute_request(send_request).await?)?;
+    match classify_send_response(&response) {
+        SendResponseClass::Ok => Ok(()),
+        SendResponseClass::RateLimited => Err("WeChat sendmessage rate limited".into()),
+        SendResponseClass::StaleSession => {
+            Err("WeChat sendmessage stale session; reconnect required".into())
+        }
+        SendResponseClass::Failed => Err(format!(
+            "WeChat sendmessage failed: ret={:?} errcode={:?} errmsg={:?}",
+            response.ret, response.errcode, response.errmsg
+        )),
+    }
 }
 
 async fn execute_typing_effect<F, Fut>(
@@ -463,6 +660,28 @@ async fn download_cdn_media_bytes(request: WechatCdnDownloadRequest) -> Result<V
         return Err(format!("WeChat CDN HTTP {status}"));
     }
     Ok(bytes.to_vec())
+}
+
+async fn upload_cdn_media_bytes(request: WechatCdnUploadRequest) -> Result<String, String> {
+    let response = reqwest::Client::new()
+        .post(&request.url)
+        .timeout(Duration::from_millis(request.timeout_ms))
+        .header("Content-Type", "application/octet-stream")
+        .body(request.encrypted_body)
+        .send()
+        .await
+        .map_err(|err| format!("WeChat CDN upload failed: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("WeChat CDN upload HTTP {status}"));
+    }
+    response
+        .headers()
+        .get("x-encrypted-param")
+        .ok_or_else(|| "WeChat CDN upload response missing x-encrypted-param".to_string())?
+        .to_str()
+        .map(|value| value.to_string())
+        .map_err(|err| format!("WeChat CDN upload x-encrypted-param invalid: {err}"))
 }
 
 fn media_prompt_for_claude(media: &InboundWechatMedia, saved_path: &Path) -> String {
@@ -717,6 +936,38 @@ fn contains_cjk(text: &str) -> bool {
     })
 }
 
+fn is_wechat_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn random_bytes_16() -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes
+}
+
+fn random_hex_16() -> String {
+    lower_hex(&random_bytes_16())
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -727,7 +978,6 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use serde_json::json;
     use std::path::Path;
     use std::process::Stdio;
@@ -737,8 +987,9 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     use crate::wechat::{
+        api::wechat_channel_version,
         inbound::{InboundWechatCdnMedia, InboundWechatMedia, InboundWechatMediaKind},
-        media::WechatCdnDownloadRequest,
+        media::{WechatCdnDownloadRequest, WechatCdnUploadRequest},
         store::{WechatAccount, WechatStateStore},
     };
 
@@ -1087,6 +1338,196 @@ mod tests {
         assert_eq!(
             requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
             "标题\n引用\n**bold** 中文 删除 \n```ts\nconst x = \"~~keep~~\";\n```\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_wechat_file_effect_uploads_image_and_posts_image_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let file_path = dir.path().join("generated.png");
+        std::fs::write(&file_path, b"hello generated image").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let uploads = Arc::new(Mutex::new(Vec::<WechatCdnUploadRequest>::new()));
+        let captured_requests = requests.clone();
+        let captured_uploads = uploads.clone();
+        let stdin_mgr = StdinManager::new();
+
+        let dispatch = execute_turn_effects_with_media_and_upload(
+            &stdin_mgr,
+            &store,
+            &[WechatTurnEffect::SendWeChatFile {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                path: file_path.display().to_string(),
+                caption: None,
+            }],
+            move |request| {
+                let captured_requests = captured_requests.clone();
+                async move {
+                    let mut requests = captured_requests.lock().unwrap();
+                    let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
+                    requests.push(request);
+                    if is_upload_request {
+                        Ok(json!({ "ret": 0, "upload_param": "upload=param" }))
+                    } else {
+                        Ok(json!({ "ret": 0 }))
+                    }
+                }
+            },
+            |_request| async { unreachable!("image upload should not download media") },
+            move |request| {
+                let captured_uploads = captured_uploads.clone();
+                async move {
+                    captured_uploads.lock().unwrap().push(request);
+                    Ok("download-param".to_string())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatch.wechat_effect_count, 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+
+        let upload_url_request = &requests[0];
+        assert_eq!(
+            upload_url_request.url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/getuploadurl"
+        );
+        assert_eq!(upload_url_request.body["media_type"], 1);
+        assert_eq!(upload_url_request.body["to_user_id"], "user-1");
+        assert_eq!(upload_url_request.body["rawsize"], 21);
+        assert_eq!(upload_url_request.body["filesize"], 32);
+        assert_eq!(upload_url_request.body["no_need_thumb"], true);
+        assert_eq!(
+            upload_url_request.body["base_info"]["channel_version"],
+            serde_json::Value::String(wechat_channel_version())
+        );
+        let filekey = upload_url_request.body["filekey"].as_str().unwrap();
+        assert_eq!(filekey.len(), 32);
+        let aeskey = upload_url_request.body["aeskey"].as_str().unwrap();
+        assert_eq!(aeskey.len(), 32);
+
+        let uploads = uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(
+            uploads[0].url,
+            format!(
+                "https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=upload%3Dparam&filekey={filekey}"
+            )
+        );
+        assert_eq!(uploads[0].encrypted_body.len(), 32);
+        assert_ne!(uploads[0].encrypted_body, b"hello generated image");
+
+        let send_message_request = &requests[1];
+        assert_eq!(
+            send_message_request.url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/sendmessage"
+        );
+        assert_eq!(send_message_request.body["msg"]["to_user_id"], "user-1");
+        assert_eq!(send_message_request.body["msg"]["context_token"], "ctx-1");
+        assert_eq!(send_message_request.body["msg"]["item_list"][0]["type"], 2);
+        assert_eq!(
+            send_message_request.body["msg"]["item_list"][0]["image_item"]["media"]
+                ["encrypt_query_param"],
+            "download-param"
+        );
+        assert_eq!(
+            send_message_request.body["msg"]["item_list"][0]["image_item"]["media"]["aes_key"],
+            BASE64_STANDARD.encode(aeskey.as_bytes())
+        );
+        assert_eq!(
+            send_message_request.body["msg"]["item_list"][0]["image_item"]["mid_size"],
+            32
+        );
+    }
+
+    #[tokio::test]
+    async fn send_wechat_file_effect_uploads_non_image_as_file_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let file_path = dir.path().join("report.txt");
+        let plaintext = b"hello generated document";
+        std::fs::write(&file_path, plaintext).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let uploads = Arc::new(Mutex::new(Vec::<WechatCdnUploadRequest>::new()));
+        let captured_requests = requests.clone();
+        let captured_uploads = uploads.clone();
+        let stdin_mgr = StdinManager::new();
+
+        let dispatch = execute_turn_effects_with_media_and_upload(
+            &stdin_mgr,
+            &store,
+            &[WechatTurnEffect::SendWeChatFile {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                path: file_path.display().to_string(),
+                caption: Some("##### 附件\n*中文*".into()),
+            }],
+            move |request| {
+                let captured_requests = captured_requests.clone();
+                async move {
+                    let mut requests = captured_requests.lock().unwrap();
+                    let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
+                    requests.push(request);
+                    if is_upload_request {
+                        Ok(json!({
+                            "ret": 0,
+                            "upload_full_url": "https://novac2c.cdn.weixin.qq.com/c2c/full-upload"
+                        }))
+                    } else {
+                        Ok(json!({ "ret": 0 }))
+                    }
+                }
+            },
+            |_request| async { unreachable!("file upload should not download media") },
+            move |request| {
+                let captured_uploads = captured_uploads.clone();
+                async move {
+                    captured_uploads.lock().unwrap().push(request);
+                    Ok("download-param".to_string())
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatch.wechat_effect_count, 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body["media_type"], 3);
+        assert_eq!(requests[0].body["rawsize"], plaintext.len() as u64);
+        let uploads = uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(
+            uploads[0].url,
+            "https://novac2c.cdn.weixin.qq.com/c2c/full-upload"
+        );
+        assert_ne!(uploads[0].encrypted_body, plaintext);
+
+        let send_message_request = &requests[1];
+        assert_eq!(send_message_request.body["msg"]["item_list"][0]["type"], 1);
+        assert_eq!(
+            send_message_request.body["msg"]["item_list"][0]["text_item"]["text"],
+            "附件\n中文"
+        );
+        assert_eq!(send_message_request.body["msg"]["item_list"][1]["type"], 4);
+        assert_eq!(
+            send_message_request.body["msg"]["item_list"][1]["file_item"]["media"]
+                ["encrypt_query_param"],
+            "download-param"
+        );
+        assert_eq!(
+            send_message_request.body["msg"]["item_list"][1]["file_item"]["file_name"],
+            "report.txt"
+        );
+        assert_eq!(
+            send_message_request.body["msg"]["item_list"][1]["file_item"]["len"],
+            plaintext.len().to_string()
         );
     }
 
