@@ -17,6 +17,8 @@ use super::{
     turn::WechatTurnEffect,
 };
 
+const MAX_WECHAT_TEXT_CHARS: usize = 3_800;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WechatEffectDispatch {
     pub claude_effect_count: usize,
@@ -150,20 +152,28 @@ where
             context_token,
             text,
         } => {
-            let request =
-                client.send_text_request(to_user_id, context_token, text, &new_client_id());
-            let response: SendMessageResponse = parse_response(execute_request(request).await?)?;
-            match classify_send_response(&response) {
-                SendResponseClass::Ok => Ok(true),
-                SendResponseClass::RateLimited => Err("WeChat sendmessage rate limited".into()),
-                SendResponseClass::StaleSession => {
-                    Err("WeChat sendmessage stale session; reconnect required".into())
+            for chunk in split_wechat_text_chunks(text) {
+                let request =
+                    client.send_text_request(to_user_id, context_token, &chunk, &new_client_id());
+                let response: SendMessageResponse =
+                    parse_response(execute_request(request).await?)?;
+                match classify_send_response(&response) {
+                    SendResponseClass::Ok => {}
+                    SendResponseClass::RateLimited => {
+                        return Err("WeChat sendmessage rate limited".into());
+                    }
+                    SendResponseClass::StaleSession => {
+                        return Err("WeChat sendmessage stale session; reconnect required".into());
+                    }
+                    SendResponseClass::Failed => {
+                        return Err(format!(
+                            "WeChat sendmessage failed: ret={:?} errcode={:?} errmsg={:?}",
+                            response.ret, response.errcode, response.errmsg
+                        ));
+                    }
                 }
-                SendResponseClass::Failed => Err(format!(
-                    "WeChat sendmessage failed: ret={:?} errcode={:?} errmsg={:?}",
-                    response.ret, response.errcode, response.errmsg
-                )),
             }
+            Ok(true)
         }
         WechatTurnEffect::StartTyping {
             to_user_id,
@@ -243,6 +253,51 @@ fn parse_response<T: DeserializeOwned>(value: Value) -> Result<T, String> {
 
 fn new_client_id() -> String {
     format!("tc-{}-{}", now_ms(), rand::random::<u32>())
+}
+
+fn split_wechat_text_chunks(text: &str) -> Vec<String> {
+    if text.chars().count() <= MAX_WECHAT_TEXT_CHARS {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while remaining.chars().count() > MAX_WECHAT_TEXT_CHARS {
+        let hard_split = byte_index_after_chars(remaining, MAX_WECHAT_TEXT_CHARS);
+        let split_at = preferred_split_boundary(remaining, hard_split).unwrap_or(hard_split);
+        let (chunk, rest) = remaining.split_at(split_at);
+        chunks.push(chunk.to_string());
+        remaining = rest;
+    }
+    if !remaining.is_empty() {
+        chunks.push(remaining.to_string());
+    }
+    chunks
+}
+
+fn preferred_split_boundary(text: &str, hard_split: usize) -> Option<usize> {
+    let candidate = &text[..hard_split];
+    candidate
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| *ch == '\n')
+        .or_else(|| {
+            candidate
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| ch.is_whitespace())
+        })
+        .map(|(index, ch)| index + ch.len_utf8())
+        .filter(|index| *index > 0)
+}
+
+fn byte_index_after_chars(text: &str, max_chars: usize) -> usize {
+    for (index, (byte_index, ch)) in text.char_indices().enumerate() {
+        if index + 1 == max_chars {
+            return byte_index + ch.len_utf8();
+        }
+    }
+    text.len()
 }
 
 fn now_ms() -> u64 {
@@ -423,6 +478,61 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("tc-"));
+    }
+
+    #[tokio::test]
+    async fn send_wechat_text_effect_splits_long_text_on_newline_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let first_line = "好".repeat(3_790);
+        let second_line = "界".repeat(20);
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: format!("{first_line}\n{second_line}"),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body["msg"]["context_token"], "ctx-1");
+        assert_eq!(requests[1].body["msg"]["context_token"], "ctx-1");
+        assert_eq!(
+            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
+            format!("{first_line}\n")
+        );
+        assert_eq!(
+            requests[1].body["msg"]["item_list"][0]["text_item"]["text"],
+            second_line
+        );
+    }
+
+    #[test]
+    fn split_wechat_text_chunks_keeps_unicode_characters_intact_without_boundaries() {
+        let text = format!("{}{}", "好".repeat(MAX_WECHAT_TEXT_CHARS), "界");
+
+        let chunks = split_wechat_text_chunks(&text);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), MAX_WECHAT_TEXT_CHARS);
+        assert_eq!(chunks[0], "好".repeat(MAX_WECHAT_TEXT_CHARS));
+        assert_eq!(chunks[1], "界");
     }
 
     #[tokio::test]
