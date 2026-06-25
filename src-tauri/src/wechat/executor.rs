@@ -1,6 +1,7 @@
 use std::{
     future::Future,
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{commands::StdinManager, protocol::ControlRequest};
@@ -12,6 +13,11 @@ use super::{
     api::{
         classify_send_response, GetConfigResponse, IlinkApiClient, IlinkHttpRequest,
         SendMessageResponse, SendResponseClass, TypingStatus,
+    },
+    inbound::{InboundWechatMedia, InboundWechatMediaKind},
+    media::{
+        build_cdn_download_request, decrypt_aes_128_ecb_pkcs7, parse_cdn_aes_key,
+        WechatCdnDownloadRequest,
     },
     store::WechatStateStore,
     turn::WechatTurnEffect,
@@ -102,11 +108,17 @@ pub async fn execute_turn_effects(
     store: &WechatStateStore,
     effects: &[WechatTurnEffect],
 ) -> Result<WechatEffectDispatch, String> {
-    execute_turn_effects_with(stdin_mgr, store, effects, |request| async move {
-        IlinkApiClient::new(None)
-            .execute_json::<Value>(request)
-            .await
-    })
+    execute_turn_effects_with_media(
+        stdin_mgr,
+        store,
+        effects,
+        |request| async move {
+            IlinkApiClient::new(None)
+                .execute_json::<Value>(request)
+                .await
+        },
+        download_cdn_media_bytes,
+    )
     .await
 }
 
@@ -114,15 +126,41 @@ pub async fn execute_turn_effects_with<F, Fut>(
     stdin_mgr: &StdinManager,
     store: &WechatStateStore,
     effects: &[WechatTurnEffect],
-    mut execute_wechat_request: F,
+    execute_wechat_request: F,
 ) -> Result<WechatEffectDispatch, String>
 where
     F: FnMut(IlinkHttpRequest) -> Fut,
     Fut: Future<Output = Result<Value, String>>,
 {
+    execute_turn_effects_with_media(
+        stdin_mgr,
+        store,
+        effects,
+        execute_wechat_request,
+        download_cdn_media_bytes,
+    )
+    .await
+}
+
+pub async fn execute_turn_effects_with_media<F, Fut, G, Gut>(
+    stdin_mgr: &StdinManager,
+    store: &WechatStateStore,
+    effects: &[WechatTurnEffect],
+    mut execute_wechat_request: F,
+    mut download_media: G,
+) -> Result<WechatEffectDispatch, String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+    G: FnMut(WechatCdnDownloadRequest) -> Gut,
+    Gut: Future<Output = Result<Vec<u8>, String>>,
+{
     let mut dispatch = WechatEffectDispatch::default();
     for effect in effects {
-        if execute_claude_effect(stdin_mgr, effect).await? {
+        let handled_claude = execute_claude_effect(stdin_mgr, effect).await?
+            || execute_claude_media_effect_with(stdin_mgr, store, effect, &mut download_media)
+                .await?;
+        if handled_claude {
             dispatch.claude_effect_count += 1;
         }
         if execute_wechat_effect_with(effect, store, &mut execute_wechat_request).await? {
@@ -130,6 +168,43 @@ where
         }
     }
     Ok(dispatch)
+}
+
+pub async fn execute_claude_media_effect_with<F, Fut>(
+    stdin_mgr: &StdinManager,
+    store: &WechatStateStore,
+    effect: &WechatTurnEffect,
+    mut download_media: F,
+) -> Result<bool, String>
+where
+    F: FnMut(WechatCdnDownloadRequest) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, String>>,
+{
+    let WechatTurnEffect::DownloadMediaToClaude {
+        desktop_session_id,
+        media,
+    } = effect
+    else {
+        return Ok(false);
+    };
+
+    let request = build_cdn_download_request(&media.cdn)?;
+    let encrypted = download_media(request).await?;
+    let aes_key = parse_cdn_aes_key(&media.cdn.aes_key)?;
+    let decrypted = decrypt_aes_128_ecb_pkcs7(&encrypted, &aes_key)?;
+    let saved_path = store.save_inbound_media(media, &decrypted)?;
+    let content = media_prompt_for_claude(media, &saved_path);
+    let payload = json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": content,
+        },
+    });
+    stdin_mgr
+        .send(desktop_session_id, &payload.to_string())
+        .await?;
+    Ok(true)
 }
 
 pub async fn execute_wechat_effect(
@@ -332,6 +407,42 @@ fn new_client_id() -> String {
     format!("tc-{}-{}", now_ms(), rand::random::<u32>())
 }
 
+async fn download_cdn_media_bytes(request: WechatCdnDownloadRequest) -> Result<Vec<u8>, String> {
+    let response = reqwest::Client::new()
+        .get(&request.url)
+        .timeout(Duration::from_millis(request.timeout_ms))
+        .send()
+        .await
+        .map_err(|err| format!("WeChat CDN download failed: {err}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("WeChat CDN response read failed: {err}"))?;
+    if !status.is_success() {
+        return Err(format!("WeChat CDN HTTP {status}"));
+    }
+    Ok(bytes.to_vec())
+}
+
+fn media_prompt_for_claude(media: &InboundWechatMedia, saved_path: &Path) -> String {
+    let label = match media.kind {
+        InboundWechatMediaKind::Image => "微信发来的图片",
+        InboundWechatMediaKind::File => "微信发来的文件",
+    };
+    let name = media
+        .file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("：{value}"))
+        .unwrap_or_default();
+    format!(
+        "{label}{name}\n\n[Attached files]\n{}",
+        saved_path.display()
+    )
+}
+
 fn split_wechat_text_chunks(text: &str) -> Vec<String> {
     if text.chars().count() <= MAX_WECHAT_TEXT_CHARS {
         return vec![text.to_string()];
@@ -387,14 +498,20 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use serde_json::json;
+    use std::path::Path;
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::{Child, Command};
     use tokio::time::{timeout, Duration};
 
-    use crate::wechat::store::{WechatAccount, WechatStateStore};
+    use crate::wechat::{
+        inbound::{InboundWechatCdnMedia, InboundWechatMedia, InboundWechatMediaKind},
+        media::WechatCdnDownloadRequest,
+        store::{WechatAccount, WechatStateStore},
+    };
 
     #[tokio::test]
     async fn send_to_claude_effect_writes_user_ndjson_to_existing_stdin_manager() {
@@ -423,6 +540,75 @@ mod tests {
                 },
             })
         );
+
+        stdin_mgr.remove("stdin-1").await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn download_media_to_claude_effect_saves_decrypted_file_and_writes_attachment_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let stdin_mgr = StdinManager::new();
+        let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
+        let captured_downloads = Arc::new(Mutex::new(Vec::<WechatCdnDownloadRequest>::new()));
+        let encrypted = BASE64_STANDARD
+            .decode("xhoD0c7E8emien3r349dx0yFRk8xSm9+WOSTOn8Wjn4=")
+            .unwrap();
+        let captured = captured_downloads.clone();
+
+        let dispatch = execute_turn_effects_with_media(
+            &stdin_mgr,
+            &store,
+            &[WechatTurnEffect::DownloadMediaToClaude {
+                desktop_session_id: "stdin-1".into(),
+                media: InboundWechatMedia {
+                    message_id: "img-1".into(),
+                    from_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                    received_at_ms: 1_000,
+                    kind: InboundWechatMediaKind::Image,
+                    file_name: None,
+                    size_hint: Some("2048".into()),
+                    cdn: InboundWechatCdnMedia {
+                        encrypt_query_param: Some("cdn=query".into()),
+                        aes_key: "MDEyMzQ1Njc4OWFiY2RlZg==".into(),
+                        encrypt_type: Some(1),
+                        full_url: None,
+                    },
+                },
+            }],
+            |_request| async { Ok(json!({ "ret": 0 })) },
+            move |request| {
+                let captured = captured.clone();
+                let encrypted = encrypted.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(encrypted)
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatch.claude_effect_count, 1);
+        assert_eq!(dispatch.wechat_effect_count, 0);
+        assert_eq!(
+            captured_downloads.lock().unwrap()[0].url,
+            "https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=cdn%3Dquery"
+        );
+
+        let line = lines.next_line().await.unwrap().unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let content = actual["message"]["content"].as_str().unwrap();
+        assert!(content.starts_with("微信发来的图片"));
+        let saved_path = content
+            .split("[Attached files]\n")
+            .nth(1)
+            .expect("attachment marker")
+            .trim();
+        assert!(Path::new(saved_path).starts_with(dir.path().join("inbound-media")));
+        assert_eq!(std::fs::read(saved_path).unwrap(), b"hello wechat media");
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;
