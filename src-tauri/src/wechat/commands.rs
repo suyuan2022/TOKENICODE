@@ -7,7 +7,7 @@ use crate::{
     commands::StdinManager,
     wechat::{
         api::{IlinkApiClient, QrCodeResponse, QrStatusResponse},
-        executor::execute_wechat_effect,
+        executor::{execute_wechat_effect, execute_wechat_lifecycle_effect, WechatLifecycleEffect},
         login::{parse_qr_code_response, parse_qr_status_response, WechatQrPoll},
         poller::WechatPollingTask,
         runtime::WechatRuntimeHandle,
@@ -64,12 +64,15 @@ pub async fn wechat_get_status(
 ) -> Result<WechatStatusResponse, String> {
     let account = state_store().load_account()?;
     if account.is_some() {
-        start_polling_task_if_desktop_session(
+        if start_polling_task_if_desktop_session(
             runtime.inner(),
             polling_task.inner(),
             stdin_mgr.inner(),
         )
-        .await;
+        .await
+        {
+            notify_lifecycle(WechatLifecycleEffect::NotifyStart, &state_store()).await;
+        }
     }
     Ok(WechatStatusResponse {
         connected: account.is_some(),
@@ -102,7 +105,9 @@ pub async fn wechat_poll_qr_login(
         .await?;
     match parse_qr_status_response(response, now_ms())? {
         WechatQrPoll::Connected { account } => {
-            state_store().save_account(&account)?;
+            let store = state_store();
+            store.save_account(&account)?;
+            notify_lifecycle(WechatLifecycleEffect::NotifyStart, &store).await;
             start_polling_task_if_desktop_session(
                 runtime.inner(),
                 polling_task.inner(),
@@ -144,6 +149,7 @@ pub async fn wechat_disconnect(
             eprintln!("[WeChat] disconnect effect failed: {err}");
         }
     }
+    notify_lifecycle(WechatLifecycleEffect::NotifyStop, &store).await;
     store.clear_account()
 }
 
@@ -155,13 +161,22 @@ pub async fn wechat_start_polling(
     stdin_mgr: State<'_, StdinManager>,
 ) -> Result<(), String> {
     set_desktop_session(runtime.inner(), Some(session_id)).await;
-    start_polling_task(runtime.inner(), polling_task.inner(), stdin_mgr.inner()).await;
+    if start_polling_task(runtime.inner(), polling_task.inner(), stdin_mgr.inner()).await {
+        let store = runtime.state_store().await;
+        notify_lifecycle(WechatLifecycleEffect::NotifyStart, &store).await;
+    }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn wechat_stop_polling(polling_task: State<'_, WechatPollingTask>) -> Result<(), String> {
-    polling_task.stop().await;
+pub async fn wechat_stop_polling(
+    runtime: State<'_, WechatRuntimeHandle>,
+    polling_task: State<'_, WechatPollingTask>,
+) -> Result<(), String> {
+    if polling_task.stop().await {
+        let store = runtime.state_store().await;
+        notify_lifecycle(WechatLifecycleEffect::NotifyStop, &store).await;
+    }
     Ok(())
 }
 
@@ -178,17 +193,19 @@ async fn start_polling_task(
     runtime: &WechatRuntimeHandle,
     polling_task: &WechatPollingTask,
     stdin_mgr: &StdinManager,
-) {
-    polling_task.start(runtime.clone(), stdin_mgr.clone()).await;
+) -> bool {
+    polling_task.start(runtime.clone(), stdin_mgr.clone()).await
 }
 
 async fn start_polling_task_if_desktop_session(
     runtime: &WechatRuntimeHandle,
     polling_task: &WechatPollingTask,
     stdin_mgr: &StdinManager,
-) {
+) -> bool {
     if runtime.desktop_session_id().await.is_some() {
-        start_polling_task(runtime, polling_task, stdin_mgr).await;
+        start_polling_task(runtime, polling_task, stdin_mgr).await
+    } else {
+        false
     }
 }
 
@@ -196,6 +213,12 @@ async fn set_desktop_session(runtime: &WechatRuntimeHandle, session_id: Option<S
     match session_id.filter(|value| !value.trim().is_empty()) {
         Some(session_id) => runtime.set_desktop_session(session_id).await,
         None => runtime.clear_desktop_session().await,
+    }
+}
+
+async fn notify_lifecycle(effect: WechatLifecycleEffect, store: &WechatStateStore) {
+    if let Err(err) = execute_wechat_lifecycle_effect(effect, store).await {
+        eprintln!("[WeChat] lifecycle notify effect failed: {err}");
     }
 }
 
@@ -234,6 +257,21 @@ mod tests {
         set_desktop_session(&runtime, None).await;
 
         assert_eq!(runtime.desktop_session_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn start_polling_task_if_desktop_session_only_starts_with_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = WechatRuntimeHandle::new(WechatStateStore::new(dir.path().to_path_buf()));
+        let polling_task = WechatPollingTask::default();
+        let stdin_mgr = StdinManager::new();
+
+        assert!(!start_polling_task_if_desktop_session(&runtime, &polling_task, &stdin_mgr).await);
+
+        runtime.set_desktop_session("stdin-1".into()).await;
+
+        assert!(start_polling_task_if_desktop_session(&runtime, &polling_task, &stdin_mgr).await);
+        assert!(polling_task.stop().await);
     }
 
     #[test]

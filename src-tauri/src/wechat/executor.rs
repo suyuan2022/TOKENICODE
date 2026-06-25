@@ -25,6 +25,12 @@ pub struct WechatEffectDispatch {
     pub wechat_effect_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WechatLifecycleEffect {
+    NotifyStart,
+    NotifyStop,
+}
+
 pub async fn execute_claude_effect(
     stdin_mgr: &StdinManager,
     effect: &WechatTurnEffect,
@@ -136,6 +142,55 @@ pub async fn execute_wechat_effect(
             .await
     })
     .await
+}
+
+pub async fn execute_wechat_lifecycle_effect(
+    effect: WechatLifecycleEffect,
+    store: &WechatStateStore,
+) -> Result<bool, String> {
+    execute_wechat_lifecycle_effect_with(effect, store, |request| async move {
+        IlinkApiClient::new(None)
+            .execute_json::<Value>(request)
+            .await
+    })
+    .await
+}
+
+pub async fn execute_wechat_lifecycle_effect_with<F, Fut>(
+    effect: WechatLifecycleEffect,
+    store: &WechatStateStore,
+    mut execute_request: F,
+) -> Result<bool, String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    let Some(account) = store.load_account()? else {
+        return Ok(false);
+    };
+    let client = IlinkApiClient::with_base_url(Some(account.bot_token), account.base_url);
+    let request = match effect {
+        WechatLifecycleEffect::NotifyStart => client.notify_start_request(),
+        WechatLifecycleEffect::NotifyStop => client.notify_stop_request(),
+    };
+
+    match execute_request(request).await {
+        Ok(response) => {
+            if let Some(ret) = response.get("ret").and_then(Value::as_i64) {
+                if ret != 0 {
+                    let errmsg = response
+                        .get("errmsg")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    eprintln!("[WeChat] lifecycle notify returned ret={ret} errmsg={errmsg}");
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("[WeChat] lifecycle notify failed: {err}");
+        }
+    }
+    Ok(true)
 }
 
 pub async fn execute_wechat_effect_with<F, Fut>(
@@ -514,6 +569,77 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("tc-"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_start_effect_posts_notify_start_with_saved_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_lifecycle_effect_with(
+            WechatLifecycleEffect::NotifyStart,
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request.url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/msg/notifystart"
+        );
+        assert_eq!(
+            request.headers.get("Authorization"),
+            Some(&"Bearer bot-token".into())
+        );
+        assert!(request.body.get("base_info").is_some());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_notify_failure_is_non_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+
+        let handled = execute_wechat_lifecycle_effect_with(
+            WechatLifecycleEffect::NotifyStop,
+            &store,
+            |_request| async { Err("network down".into()) },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_notify_ret_failure_is_non_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+
+        let handled = execute_wechat_lifecycle_effect_with(
+            WechatLifecycleEffect::NotifyStop,
+            &store,
+            |_request| async { Ok(json!({ "ret": -1, "errmsg": "unsupported" })) },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
     }
 
     #[tokio::test]
