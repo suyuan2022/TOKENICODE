@@ -173,6 +173,7 @@ impl WechatRuntime {
                         text: UNSUPPORTED_VOICE_NOTICE.into(),
                     });
                 }
+                ParsedInboundWechatMessage::Media(_) => {}
                 ParsedInboundWechatMessage::Ignore => {}
             }
         }
