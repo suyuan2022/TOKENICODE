@@ -55,6 +55,10 @@ impl WechatRuntimeHandle {
             .map(ToOwned::to_owned)
     }
 
+    pub async fn state_store(&self) -> WechatStateStore {
+        self.inner.lock().await.store.clone()
+    }
+
     pub async fn next_get_updates_request(&self) -> Result<Option<IlinkHttpRequest>, String> {
         self.inner.lock().await.next_get_updates_request()
     }

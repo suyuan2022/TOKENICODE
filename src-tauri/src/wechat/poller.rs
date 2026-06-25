@@ -8,11 +8,13 @@ use tokio::{
     task::JoinHandle,
 };
 
+use serde_json::{json, Value};
+
 use crate::{
     commands::StdinManager,
     wechat::{
         api::{GetUpdatesResponse, IlinkApiClient, IlinkHttpRequest},
-        executor::execute_claude_effect,
+        executor::{execute_claude_effect, execute_wechat_effect_with},
         monitor::MonitorStatus,
         runtime::WechatRuntimeHandle,
     },
@@ -85,6 +87,7 @@ pub struct WechatPollIteration {
     pub status: Option<MonitorStatus>,
     pub inbound_text_count: usize,
     pub claude_effect_count: usize,
+    pub wechat_effect_count: usize,
     pub next_timeout_ms: u64,
 }
 
@@ -92,9 +95,17 @@ pub async fn poll_once(
     runtime: &WechatRuntimeHandle,
     stdin_mgr: &StdinManager,
 ) -> Result<WechatPollIteration, String> {
-    poll_once_with(runtime, stdin_mgr, now_ms(), |request| async move {
-        IlinkApiClient::new(None).execute_json(request).await
-    })
+    poll_once_with_executors(
+        runtime,
+        stdin_mgr,
+        now_ms(),
+        |request| async move { IlinkApiClient::new(None).execute_json(request).await },
+        |request| async move {
+            IlinkApiClient::new(None)
+                .execute_json::<Value>(request)
+                .await
+        },
+    )
     .await
 }
 
@@ -108,12 +119,36 @@ where
     F: FnOnce(IlinkHttpRequest) -> Fut,
     Fut: Future<Output = Result<GetUpdatesResponse, String>>,
 {
+    poll_once_with_executors(
+        runtime,
+        stdin_mgr,
+        received_at_ms,
+        execute_updates,
+        |_request| async { Ok(json!({ "ret": 0 })) },
+    )
+    .await
+}
+
+pub async fn poll_once_with_executors<F, Fut, G, Gut>(
+    runtime: &WechatRuntimeHandle,
+    stdin_mgr: &StdinManager,
+    received_at_ms: u64,
+    execute_updates: F,
+    mut execute_wechat_request: G,
+) -> Result<WechatPollIteration, String>
+where
+    F: FnOnce(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<GetUpdatesResponse, String>>,
+    G: FnMut(IlinkHttpRequest) -> Gut,
+    Gut: Future<Output = Result<Value, String>>,
+{
     let Some(request) = runtime.next_get_updates_request().await? else {
         return Ok(WechatPollIteration {
             polled: false,
             status: None,
             inbound_text_count: 0,
             claude_effect_count: 0,
+            wechat_effect_count: 0,
             next_timeout_ms: NO_ACCOUNT_RETRY_MS,
         });
     };
@@ -124,10 +159,15 @@ where
         .process_updates_response(response, received_at_ms)
         .await?;
 
+    let store = runtime.state_store().await;
     let mut claude_effect_count = 0;
+    let mut wechat_effect_count = 0;
     for effect in &outcome.effects {
         if execute_claude_effect(stdin_mgr, effect).await? {
             claude_effect_count += 1;
+        }
+        if execute_wechat_effect_with(effect, &store, &mut execute_wechat_request).await? {
+            wechat_effect_count += 1;
         }
     }
 
@@ -136,6 +176,7 @@ where
         status: Some(outcome.status),
         inbound_text_count: outcome.inbound_text_count,
         claude_effect_count,
+        wechat_effect_count,
         next_timeout_ms: outcome.next_timeout_ms,
     })
 }
@@ -183,6 +224,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::process::Stdio;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -192,10 +234,10 @@ mod tests {
         commands::StdinManager,
         wechat::{
             api::{
-                GetUpdatesResponse, MessageItem, MessageItemType, MessageType, TextItem,
-                WechatMessage,
+                GetUpdatesResponse, IlinkHttpRequest, MessageItem, MessageItemType, MessageType,
+                TextItem, WechatMessage,
             },
-            poller::{poll_once_with, WechatPollingTask},
+            poller::{poll_once_with, poll_once_with_executors, WechatPollingTask},
             runtime::WechatRuntimeHandle,
             store::{WechatAccount, WechatStateStore},
         },
@@ -264,6 +306,69 @@ mod tests {
                     "content": "hello from WeChat",
                 },
             })
+        );
+
+        stdin_mgr.remove("stdin-1").await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn poll_once_dispatches_wechat_outbound_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let runtime = WechatRuntimeHandle::new(store);
+        runtime.set_desktop_session("stdin-1".into()).await;
+
+        let stdin_mgr = StdinManager::new();
+        let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
+        let outbound_requests = Arc::new(StdMutex::new(Vec::<IlinkHttpRequest>::new()));
+        let captured = outbound_requests.clone();
+
+        let iteration = poll_once_with_executors(
+            &runtime,
+            &stdin_mgr,
+            1_000,
+            |_request| async {
+                Ok(GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "hello from WeChat")],
+                    get_updates_buf: Some("cursor-1".into()),
+                    longpolling_timeout_ms: Some(25_000),
+                })
+            },
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    let mut requests = captured.lock().unwrap();
+                    requests.push(request);
+                    if requests.len() == 1 {
+                        Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
+                    } else {
+                        Ok(json!({ "ret": 0 }))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(iteration.claude_effect_count, 1);
+        assert_eq!(iteration.wechat_effect_count, 1);
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(line.contains("hello from WeChat"));
+
+        let outbound_requests = outbound_requests.lock().unwrap();
+        assert_eq!(outbound_requests.len(), 2);
+        assert_eq!(
+            outbound_requests[0].url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/getconfig"
+        );
+        assert_eq!(
+            outbound_requests[1].url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
         );
 
         stdin_mgr.remove("stdin-1").await;

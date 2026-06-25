@@ -458,6 +458,14 @@ pub struct SendMessageResponse {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetConfigResponse {
+    pub ret: Option<i32>,
+    pub errcode: Option<i32>,
+    pub errmsg: Option<String>,
+    pub typing_ticket: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QrCodeResponse {
     pub ret: Option<i32>,
     pub errmsg: Option<String>,
