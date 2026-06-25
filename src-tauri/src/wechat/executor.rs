@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::commands::StdinManager;
+use crate::{commands::StdinManager, protocol::ControlRequest};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use serde_json::Value;
@@ -79,6 +79,12 @@ pub async fn execute_claude_effect(
             stdin_mgr
                 .send(desktop_session_id, &payload.to_string())
                 .await?;
+            Ok(true)
+        }
+        WechatTurnEffect::InterruptClaude { desktop_session_id } => {
+            let payload = serde_json::to_string(&ControlRequest::interrupt())
+                .map_err(|err| format!("Failed to serialize interrupt request: {err}"))?;
+            stdin_mgr.send(desktop_session_id, &payload).await?;
             Ok(true)
         }
         _ => Ok(false),
@@ -315,6 +321,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::{Child, Command};
+    use tokio::time::{timeout, Duration};
 
     use crate::wechat::store::{WechatAccount, WechatStateStore};
 
@@ -425,6 +432,35 @@ mod tests {
                 },
             })
         );
+
+        stdin_mgr.remove("stdin-1").await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_effect_writes_control_request_to_existing_stdin_manager() {
+        let stdin_mgr = StdinManager::new();
+        let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
+
+        let handled = execute_claude_effect(
+            &stdin_mgr,
+            &WechatTurnEffect::InterruptClaude {
+                desktop_session_id: "stdin-1".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let line = timeout(Duration::from_millis(200), lines.next_line())
+            .await
+            .expect("interrupt effect wrote no control request")
+            .unwrap()
+            .unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(handled);
+        assert_eq!(actual["type"], "control_request");
+        assert!(actual["request_id"].as_str().is_some());
+        assert_eq!(actual["request"]["subtype"], "interrupt");
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;

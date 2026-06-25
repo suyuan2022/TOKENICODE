@@ -4,6 +4,8 @@ use serde_json::Value;
 
 const STALE_QUEUE_AFTER_MS: u64 = 60_000;
 const STALE_QUEUE_NOTICE: &str = "这条消息排队超过 60 秒，请重新发送。";
+const STOP_CONFIRM_NOTICE: &str = "已停止当前任务，并清空排队消息。";
+const STOP_IDLE_NOTICE: &str = "当前没有正在运行的任务。";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundWechatText {
@@ -41,6 +43,9 @@ pub enum WechatTurnEffect {
     StopTyping {
         to_user_id: String,
         context_token: String,
+    },
+    InterruptClaude {
+        desktop_session_id: String,
     },
     RespondPermission {
         desktop_session_id: String,
@@ -93,6 +98,10 @@ impl WechatTurnManager {
     }
 
     pub fn receive_text(&mut self, message: InboundWechatText) -> Vec<WechatTurnEffect> {
+        if parse_stop_command(&message.text) {
+            return self.stop_current_turn(message);
+        }
+
         let mut effects = self.discard_stale(message.received_at_ms);
         if self.pending_permission.is_some() {
             if let Some(allow) = parse_permission_decision(&message.text) {
@@ -188,6 +197,36 @@ impl WechatTurnManager {
             .map(|request| request.request_id.as_str())
     }
 
+    fn stop_current_turn(&mut self, command: InboundWechatText) -> Vec<WechatTurnEffect> {
+        let active_turn = self.active_turn.take();
+        let had_work =
+            active_turn.is_some() || !self.queue.is_empty() || self.pending_permission.is_some();
+        self.queue.clear();
+        self.pending_permission = None;
+
+        let mut effects = Vec::new();
+        if let Some(active_turn) = active_turn {
+            if let Some(desktop_session_id) = self.desktop_session_id.clone() {
+                effects.push(WechatTurnEffect::InterruptClaude { desktop_session_id });
+            }
+            effects.push(WechatTurnEffect::StopTyping {
+                to_user_id: active_turn.from_user_id,
+                context_token: active_turn.context_token,
+            });
+        }
+
+        effects.push(WechatTurnEffect::SendWeChatText {
+            to_user_id: command.from_user_id,
+            context_token: command.context_token,
+            text: if had_work {
+                STOP_CONFIRM_NOTICE.into()
+            } else {
+                STOP_IDLE_NOTICE.into()
+            },
+        });
+        effects
+    }
+
     fn discard_stale(&mut self, now_ms: u64) -> Vec<WechatTurnEffect> {
         let mut fresh = VecDeque::new();
         let mut effects = Vec::new();
@@ -240,6 +279,13 @@ fn parse_permission_decision(text: &str) -> Option<bool> {
         "deny" | "reject" | "no" | "n" | "拒绝" | "不允许" => Some(false),
         _ => None,
     }
+}
+
+fn parse_stop_command(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "/stop" | "stop" | "/cancel" | "cancel" | "停止" | "中止" | "终止" | "取消"
+    )
 }
 
 #[cfg(test)]
@@ -459,6 +505,46 @@ mod tests {
         );
         assert_eq!(manager.pending_permission_request_id(), None);
         assert_eq!(manager.queued_len(), 0);
+    }
+
+    #[test]
+    fn stop_command_interrupts_active_session_and_clears_wechat_work() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+        manager.set_desktop_session("stdin-1".into());
+        manager.receive_text(text_message("msg-1", "first", 0));
+        manager.receive_text(text_message("msg-2", "second", 1_000));
+        manager.request_permission(WechatPermissionRequest {
+            request_id: "perm-1".into(),
+            tool_name: "Bash".into(),
+            input_preview: "{}".into(),
+            tool_use_id: None,
+            updated_input: serde_json::json!({}),
+        });
+
+        let effects = manager.receive_text(text_message("msg-3", "/stop", 2_000));
+
+        assert_eq!(
+            effects,
+            vec![
+                WechatTurnEffect::InterruptClaude {
+                    desktop_session_id: "stdin-1".into(),
+                },
+                WechatTurnEffect::StopTyping {
+                    to_user_id: "user@im.wechat".into(),
+                    context_token: "ctx-msg-1".into(),
+                },
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user@im.wechat".into(),
+                    context_token: "ctx-msg-3".into(),
+                    text: "已停止当前任务，并清空排队消息。".into(),
+                },
+            ],
+        );
+        assert_eq!(manager.active_turn_message_id(), None);
+        assert_eq!(manager.queued_len(), 0);
+        assert_eq!(manager.pending_permission_request_id(), None);
+        assert!(manager.finish_turn("late answer".into(), 3_000).is_empty());
     }
 
     #[test]
