@@ -173,7 +173,11 @@ impl WechatRuntime {
                         text: UNSUPPORTED_VOICE_NOTICE.into(),
                     });
                 }
-                ParsedInboundWechatMessage::Media(_) => {}
+                ParsedInboundWechatMessage::Media(inbound) => {
+                    self.store
+                        .save_context_token(&inbound.from_user_id, &inbound.context_token)?;
+                    effects.extend(self.turn_manager.receive_media(inbound));
+                }
                 ParsedInboundWechatMessage::Ignore => {}
             }
         }
@@ -278,9 +282,10 @@ mod handle_tests {
 mod tests {
     use crate::wechat::{
         api::{
-            GetUpdatesResponse, MessageItem, MessageItemType, MessageType, TextItem, VoiceItem,
-            WechatMessage,
+            CdnMedia, GetUpdatesResponse, ImageItem, MessageItem, MessageItemType, MessageType,
+            TextItem, VoiceItem, WechatMessage,
         },
+        inbound::{InboundWechatCdnMedia, InboundWechatMedia, InboundWechatMediaKind},
         monitor::MonitorStatus,
         store::{WechatAccount, WechatStateStore},
         turn::WechatTurnEffect,
@@ -359,6 +364,62 @@ mod tests {
                 WechatTurnEffect::StartTyping {
                     to_user_id: "user-1".into(),
                     context_token: "ctx-1".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn processing_updates_persists_context_token_and_starts_media_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store.clone());
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+
+        let outcome = runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![image_message(8, "user-1", "ctx-image")],
+                    get_updates_buf: Some("cursor-image".into()),
+                    longpolling_timeout_ms: Some(12_000),
+                },
+                1_000,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.inbound_text_count, 0);
+        assert_eq!(
+            store.load_context_token("user-1").unwrap(),
+            Some("ctx-image".into())
+        );
+        assert_eq!(
+            outcome.effects,
+            vec![
+                WechatTurnEffect::DownloadMediaToClaude {
+                    desktop_session_id: "stdin-1".into(),
+                    media: InboundWechatMedia {
+                        message_id: "8".into(),
+                        from_user_id: "user-1".into(),
+                        context_token: "ctx-image".into(),
+                        received_at_ms: 1_000,
+                        kind: InboundWechatMediaKind::Image,
+                        file_name: None,
+                        size_hint: Some("2048".into()),
+                        cdn: InboundWechatCdnMedia {
+                            encrypt_query_param: Some("image-query".into()),
+                            aes_key: "image-key".into(),
+                            encrypt_type: Some(1),
+                            full_url: None,
+                        },
+                    },
+                },
+                WechatTurnEffect::StartTyping {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-image".into(),
                 },
             ]
         );
@@ -723,6 +784,30 @@ mod tests {
             item_list: vec![MessageItem {
                 item_type: Some(MessageItemType::Voice as i32),
                 voice_item: Some(VoiceItem::default()),
+                ..MessageItem::default()
+            }],
+            context_token: Some(context_token.into()),
+            ..WechatMessage::default()
+        }
+    }
+
+    fn image_message(message_id: i64, from_user_id: &str, context_token: &str) -> WechatMessage {
+        WechatMessage {
+            message_id: Some(message_id),
+            from_user_id: Some(from_user_id.into()),
+            message_type: Some(MessageType::User as i32),
+            item_list: vec![MessageItem {
+                item_type: Some(MessageItemType::Image as i32),
+                image_item: Some(ImageItem {
+                    media: Some(CdnMedia {
+                        encrypt_query_param: Some("image-query".into()),
+                        aes_key: Some("image-key".into()),
+                        encrypt_type: Some(1),
+                        full_url: None,
+                    }),
+                    mid_size: Some(2048),
+                    ..ImageItem::default()
+                }),
                 ..MessageItem::default()
             }],
             context_token: Some(context_token.into()),

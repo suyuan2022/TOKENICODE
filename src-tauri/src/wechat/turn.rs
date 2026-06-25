@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use crate::wechat::inbound::InboundWechatMedia;
 use serde_json::Value;
 
 const STALE_QUEUE_AFTER_MS: u64 = 60_000;
@@ -38,6 +39,10 @@ pub enum WechatTurnEffect {
         desktop_session_id: String,
         text: String,
     },
+    DownloadMediaToClaude {
+        desktop_session_id: String,
+        media: InboundWechatMedia,
+    },
     SendWeChatText {
         to_user_id: String,
         context_token: String,
@@ -63,12 +68,48 @@ pub enum WechatTurnEffect {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InboundWechatTurn {
+    Text(InboundWechatText),
+    Media(InboundWechatMedia),
+}
+
+impl InboundWechatTurn {
+    fn message_id(&self) -> &str {
+        match self {
+            Self::Text(turn) => &turn.message_id,
+            Self::Media(turn) => &turn.message_id,
+        }
+    }
+
+    fn from_user_id(&self) -> &str {
+        match self {
+            Self::Text(turn) => &turn.from_user_id,
+            Self::Media(turn) => &turn.from_user_id,
+        }
+    }
+
+    fn context_token(&self) -> &str {
+        match self {
+            Self::Text(turn) => &turn.context_token,
+            Self::Media(turn) => &turn.context_token,
+        }
+    }
+
+    fn received_at_ms(&self) -> u64 {
+        match self {
+            Self::Text(turn) => turn.received_at_ms,
+            Self::Media(turn) => turn.received_at_ms,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WechatTurnManager {
     connected: bool,
     desktop_session_id: Option<String>,
-    active_turn: Option<InboundWechatText>,
-    queue: VecDeque<InboundWechatText>,
+    active_turn: Option<InboundWechatTurn>,
+    queue: VecDeque<InboundWechatTurn>,
     pending_permission: Option<WechatPermissionRequest>,
 }
 
@@ -87,8 +128,8 @@ impl WechatTurnManager {
             .take()
             .map(|active_turn| {
                 vec![WechatTurnEffect::StopTyping {
-                    to_user_id: active_turn.from_user_id,
-                    context_token: active_turn.context_token,
+                    to_user_id: active_turn.from_user_id().to_string(),
+                    context_token: active_turn.context_token().to_string(),
                 }]
             })
             .unwrap_or_default();
@@ -119,7 +160,14 @@ impl WechatTurnManager {
                 return effects;
             }
         }
-        self.queue.push_back(message);
+        self.queue.push_back(InboundWechatTurn::Text(message));
+        effects.extend(self.start_next_turn());
+        effects
+    }
+
+    pub fn receive_media(&mut self, media: InboundWechatMedia) -> Vec<WechatTurnEffect> {
+        let mut effects = self.discard_stale(media.received_at_ms);
+        self.queue.push_back(InboundWechatTurn::Media(media));
         effects.extend(self.start_next_turn());
         effects
     }
@@ -132,13 +180,13 @@ impl WechatTurnManager {
 
         let mut effects = vec![
             WechatTurnEffect::SendWeChatText {
-                to_user_id: active_turn.from_user_id.clone(),
-                context_token: active_turn.context_token.clone(),
+                to_user_id: active_turn.from_user_id().to_string(),
+                context_token: active_turn.context_token().to_string(),
                 text,
             },
             WechatTurnEffect::StopTyping {
-                to_user_id: active_turn.from_user_id,
-                context_token: active_turn.context_token,
+                to_user_id: active_turn.from_user_id().to_string(),
+                context_token: active_turn.context_token().to_string(),
             },
         ];
         effects.extend(self.discard_stale(finished_at_ms));
@@ -160,8 +208,8 @@ impl WechatTurnManager {
         );
         self.pending_permission = Some(request);
         vec![WechatTurnEffect::SendWeChatText {
-            to_user_id: active_turn.from_user_id.clone(),
-            context_token: active_turn.context_token.clone(),
+            to_user_id: active_turn.from_user_id().to_string(),
+            context_token: active_turn.context_token().to_string(),
             text,
         }]
     }
@@ -184,9 +232,7 @@ impl WechatTurnManager {
     }
 
     pub fn active_turn_message_id(&self) -> Option<&str> {
-        self.active_turn
-            .as_ref()
-            .map(|turn| turn.message_id.as_str())
+        self.active_turn.as_ref().map(InboundWechatTurn::message_id)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -220,8 +266,8 @@ impl WechatTurnManager {
                 effects.push(WechatTurnEffect::InterruptClaude { desktop_session_id });
             }
             effects.push(WechatTurnEffect::StopTyping {
-                to_user_id: active_turn.from_user_id,
-                context_token: active_turn.context_token,
+                to_user_id: active_turn.from_user_id().to_string(),
+                context_token: active_turn.context_token().to_string(),
             });
         }
 
@@ -293,10 +339,10 @@ impl WechatTurnManager {
         let mut effects = Vec::new();
 
         while let Some(item) = self.queue.pop_front() {
-            if now_ms.saturating_sub(item.received_at_ms) > STALE_QUEUE_AFTER_MS {
+            if now_ms.saturating_sub(item.received_at_ms()) > STALE_QUEUE_AFTER_MS {
                 effects.push(WechatTurnEffect::SendWeChatText {
-                    to_user_id: item.from_user_id,
-                    context_token: item.context_token,
+                    to_user_id: item.from_user_id().to_string(),
+                    context_token: item.context_token().to_string(),
                     text: STALE_QUEUE_NOTICE.into(),
                 });
             } else {
@@ -319,16 +365,20 @@ impl WechatTurnManager {
             return Vec::new();
         };
 
-        let effects = vec![
-            WechatTurnEffect::SendToClaude {
+        let mut effects = vec![match &next_turn {
+            InboundWechatTurn::Text(turn) => WechatTurnEffect::SendToClaude {
                 desktop_session_id,
-                text: next_turn.text.clone(),
+                text: turn.text.clone(),
             },
-            WechatTurnEffect::StartTyping {
-                to_user_id: next_turn.from_user_id.clone(),
-                context_token: next_turn.context_token.clone(),
+            InboundWechatTurn::Media(turn) => WechatTurnEffect::DownloadMediaToClaude {
+                desktop_session_id,
+                media: turn.clone(),
             },
-        ];
+        }];
+        effects.push(WechatTurnEffect::StartTyping {
+            to_user_id: next_turn.from_user_id().to_string(),
+            context_token: next_turn.context_token().to_string(),
+        });
         self.active_turn = Some(next_turn);
         effects
     }
