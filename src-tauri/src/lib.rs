@@ -3,6 +3,7 @@ pub mod env_manager;
 mod events;
 pub mod path_access;
 mod protocol;
+pub mod wechat;
 // windows_ps compiles on all platforms so its pure-logic tests run on
 // non-Windows CI; it is only *invoked* from `#[cfg(target_os = "windows")]`
 // code paths.
