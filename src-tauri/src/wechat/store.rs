@@ -64,6 +64,26 @@ impl WechatStateStore {
         Ok(self.load_context_tokens()?.get(user_id).cloned())
     }
 
+    pub fn save_send_circuit_open_until(&self, open_until_ms: u64) -> StoreResult<()> {
+        write_text(&self.send_circuit_path(), &open_until_ms.to_string())
+    }
+
+    pub fn load_send_circuit_open_until(&self) -> StoreResult<Option<u64>> {
+        match fs::read_to_string(self.send_circuit_path()) {
+            Ok(value) => value
+                .trim()
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|err| format!("parse send circuit: {err}")),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("read send circuit: {err}")),
+        }
+    }
+
+    pub fn clear_send_circuit(&self) -> StoreResult<()> {
+        remove_if_exists(&self.send_circuit_path())
+    }
+
     pub fn save_inbound_media(
         &self,
         media: &InboundWechatMedia,
@@ -91,6 +111,10 @@ impl WechatStateStore {
 
     fn context_tokens_path(&self) -> PathBuf {
         self.dir.join("context_tokens.json")
+    }
+
+    fn send_circuit_path(&self) -> PathBuf {
+        self.dir.join("send_circuit_until_ms")
     }
 }
 

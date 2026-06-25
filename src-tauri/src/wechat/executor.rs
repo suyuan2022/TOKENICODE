@@ -28,6 +28,7 @@ use super::{
 
 const MAX_WECHAT_TEXT_CHARS: usize = 3_800;
 const MAX_WECHAT_FILE_BYTES: u64 = 25 * 1024 * 1024;
+const SEND_CIRCUIT_OPEN_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WechatEffectDispatch {
@@ -343,23 +344,7 @@ where
             for chunk in split_wechat_text_chunks(&filtered_text) {
                 let request =
                     client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
-                let response: SendMessageResponse =
-                    parse_response(execute_request(request).await?)?;
-                match classify_send_response(&response) {
-                    SendResponseClass::Ok => {}
-                    SendResponseClass::RateLimited => {
-                        return Err("WeChat sendmessage rate limited".into());
-                    }
-                    SendResponseClass::StaleSession => {
-                        return Err("WeChat sendmessage stale session; reconnect required".into());
-                    }
-                    SendResponseClass::Failed => {
-                        return Err(format!(
-                            "WeChat sendmessage failed: ret={:?} errcode={:?} errmsg={:?}",
-                            response.ret, response.errcode, response.errmsg
-                        ));
-                    }
-                }
+                execute_send_message_request(store, request, &mut execute_request).await?;
             }
             Ok(true)
         }
@@ -370,8 +355,10 @@ where
             caption,
         } => {
             let context_token = resolve_context_token(store, to_user_id, context_token)?;
+            ensure_send_circuit_closed(store)?;
             execute_wechat_file_effect(
                 &client,
+                store,
                 to_user_id,
                 &context_token,
                 path,
@@ -478,6 +465,7 @@ fn resolve_context_token(
 
 async fn execute_wechat_file_effect<F, Fut, H, Hut>(
     client: &IlinkApiClient,
+    store: &WechatStateStore,
     to_user_id: &str,
     context_token: &str,
     path: &str,
@@ -580,10 +568,26 @@ where
         )
     };
 
-    let response: SendMessageResponse = parse_response(execute_request(send_request).await?)?;
+    execute_send_message_request(store, send_request, execute_request).await
+}
+
+async fn execute_send_message_request<F, Fut>(
+    store: &WechatStateStore,
+    request: IlinkHttpRequest,
+    execute_request: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    ensure_send_circuit_closed(store)?;
+    let response: SendMessageResponse = parse_response(execute_request(request).await?)?;
     match classify_send_response(&response) {
         SendResponseClass::Ok => Ok(()),
-        SendResponseClass::RateLimited => Err("WeChat sendmessage rate limited".into()),
+        SendResponseClass::RateLimited => {
+            trip_send_circuit(store)?;
+            Err("WeChat sendmessage rate limited".into())
+        }
         SendResponseClass::StaleSession => {
             Err("WeChat sendmessage stale session; reconnect required".into())
         }
@@ -592,6 +596,26 @@ where
             response.ret, response.errcode, response.errmsg
         )),
     }
+}
+
+fn ensure_send_circuit_closed(store: &WechatStateStore) -> Result<(), String> {
+    let Some(open_until_ms) = store.load_send_circuit_open_until()? else {
+        return Ok(());
+    };
+    let now = now_ms();
+    if now >= open_until_ms {
+        store.clear_send_circuit()?;
+        return Ok(());
+    }
+
+    Err(format!(
+        "WeChat sendmessage circuit breaker open, {}ms remaining",
+        open_until_ms.saturating_sub(now)
+    ))
+}
+
+fn trip_send_circuit(store: &WechatStateStore) -> Result<(), String> {
+    store.save_send_circuit_open_until(now_ms().saturating_add(SEND_CIRCUIT_OPEN_MS))
 }
 
 async fn execute_typing_effect<F, Fut>(
@@ -1339,6 +1363,186 @@ mod tests {
             requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
             "标题\n引用\n**bold** 中文 删除 \n```ts\nconst x = \"~~keep~~\";\n```\n"
         );
+    }
+
+    #[tokio::test]
+    async fn send_wechat_text_rate_limit_opens_circuit_and_next_send_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let first_error = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "first".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": -2, "errmsg": "frequency limited" }))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(first_error.contains("rate limited"));
+
+        let captured = requests.clone();
+        let second_error = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "second".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(second_error.contains("circuit breaker open"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_session_response_does_not_open_rate_limit_circuit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let first_error = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "first".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": -2, "errmsg": "unknown error" }))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(first_error.contains("stale session"));
+
+        let captured = requests.clone();
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "second".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn expired_send_circuit_allows_next_message_and_clears_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        store.save_send_circuit_open_until(1).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "after cooldown".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(store.load_send_circuit_open_until().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn send_wechat_file_effect_fails_fast_without_upload_when_circuit_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        store
+            .save_send_circuit_open_until(now_ms().saturating_add(30_000))
+            .unwrap();
+        let file_path = dir.path().join("generated.png");
+        std::fs::write(&file_path, b"hello generated image").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let uploads = Arc::new(Mutex::new(Vec::<WechatCdnUploadRequest>::new()));
+        let captured_requests = requests.clone();
+        let captured_uploads = uploads.clone();
+
+        let error = execute_wechat_effect_with_upload(
+            &WechatTurnEffect::SendWeChatFile {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                path: file_path.display().to_string(),
+                caption: None,
+            },
+            &store,
+            move |request| {
+                let captured_requests = captured_requests.clone();
+                async move {
+                    captured_requests.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+            move |request| {
+                let captured_uploads = captured_uploads.clone();
+                async move {
+                    captured_uploads.lock().unwrap().push(request);
+                    Ok("download-param".to_string())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("circuit breaker open"));
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(uploads.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
