@@ -8040,6 +8040,7 @@ pub fn run() {
         .manage(wechat::runtime::WechatRuntimeHandle::new(
             wechat::store::default_wechat_state_store(),
         ))
+        .manage(wechat::poller::WechatPollingTask::default())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // titleBarStyle: "Overlay" in tauri.conf.json handles macOS traffic lights
@@ -8170,6 +8171,8 @@ pub fn run() {
             wechat::commands::wechat_start_qr_login,
             wechat::commands::wechat_poll_qr_login,
             wechat::commands::wechat_disconnect,
+            wechat::commands::wechat_start_polling,
+            wechat::commands::wechat_stop_polling,
             wechat::commands::wechat_set_desktop_session,
         ])
         .run(tauri::generate_context!())

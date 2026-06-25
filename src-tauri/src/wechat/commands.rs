@@ -3,11 +3,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tauri::State;
 
-use crate::wechat::{
-    api::{IlinkApiClient, QrCodeResponse, QrStatusResponse},
-    login::{parse_qr_code_response, parse_qr_status_response, WechatQrPoll},
-    runtime::WechatRuntimeHandle,
-    store::{default_wechat_state_store, WechatAccount, WechatStateStore},
+use crate::{
+    commands::StdinManager,
+    wechat::{
+        api::{IlinkApiClient, QrCodeResponse, QrStatusResponse},
+        login::{parse_qr_code_response, parse_qr_status_response, WechatQrPoll},
+        poller::WechatPollingTask,
+        runtime::WechatRuntimeHandle,
+        store::{default_wechat_state_store, WechatAccount, WechatStateStore},
+    },
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,8 +56,20 @@ pub struct WechatQrPollResponse {
 }
 
 #[tauri::command]
-pub async fn wechat_get_status() -> Result<WechatStatusResponse, String> {
+pub async fn wechat_get_status(
+    runtime: State<'_, WechatRuntimeHandle>,
+    polling_task: State<'_, WechatPollingTask>,
+    stdin_mgr: State<'_, StdinManager>,
+) -> Result<WechatStatusResponse, String> {
     let account = state_store().load_account()?;
+    if account.is_some() {
+        start_polling_task_if_desktop_session(
+            runtime.inner(),
+            polling_task.inner(),
+            stdin_mgr.inner(),
+        )
+        .await;
+    }
     Ok(WechatStatusResponse {
         connected: account.is_some(),
         account: account.map(WechatAccountInfo::from),
@@ -75,6 +91,9 @@ pub async fn wechat_start_qr_login() -> Result<WechatQrStartResponse, String> {
 pub async fn wechat_poll_qr_login(
     qrcode_id: String,
     verify_code: Option<String>,
+    runtime: State<'_, WechatRuntimeHandle>,
+    polling_task: State<'_, WechatPollingTask>,
+    stdin_mgr: State<'_, StdinManager>,
 ) -> Result<WechatQrPollResponse, String> {
     let client = IlinkApiClient::new(None);
     let response: QrStatusResponse = client
@@ -83,6 +102,12 @@ pub async fn wechat_poll_qr_login(
     match parse_qr_status_response(response, now_ms())? {
         WechatQrPoll::Connected { account } => {
             state_store().save_account(&account)?;
+            start_polling_task_if_desktop_session(
+                runtime.inner(),
+                polling_task.inner(),
+                stdin_mgr.inner(),
+            )
+            .await;
             Ok(WechatQrPollResponse {
                 status: "connected".into(),
                 connected: true,
@@ -106,8 +131,27 @@ pub async fn wechat_poll_qr_login(
 }
 
 #[tauri::command]
-pub async fn wechat_disconnect() -> Result<(), String> {
+pub async fn wechat_disconnect(polling_task: State<'_, WechatPollingTask>) -> Result<(), String> {
+    polling_task.stop().await;
     state_store().clear_account()
+}
+
+#[tauri::command]
+pub async fn wechat_start_polling(
+    session_id: String,
+    runtime: State<'_, WechatRuntimeHandle>,
+    polling_task: State<'_, WechatPollingTask>,
+    stdin_mgr: State<'_, StdinManager>,
+) -> Result<(), String> {
+    set_desktop_session(runtime.inner(), Some(session_id)).await;
+    start_polling_task(runtime.inner(), polling_task.inner(), stdin_mgr.inner()).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn wechat_stop_polling(polling_task: State<'_, WechatPollingTask>) -> Result<(), String> {
+    polling_task.stop().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -117,6 +161,24 @@ pub async fn wechat_set_desktop_session(
 ) -> Result<(), String> {
     set_desktop_session(runtime.inner(), session_id).await;
     Ok(())
+}
+
+async fn start_polling_task(
+    runtime: &WechatRuntimeHandle,
+    polling_task: &WechatPollingTask,
+    stdin_mgr: &StdinManager,
+) {
+    polling_task.start(runtime.clone(), stdin_mgr.clone()).await;
+}
+
+async fn start_polling_task_if_desktop_session(
+    runtime: &WechatRuntimeHandle,
+    polling_task: &WechatPollingTask,
+    stdin_mgr: &StdinManager,
+) {
+    if runtime.desktop_session_id().await.is_some() {
+        start_polling_task(runtime, polling_task, stdin_mgr).await;
+    }
 }
 
 async fn set_desktop_session(runtime: &WechatRuntimeHandle, session_id: Option<String>) {

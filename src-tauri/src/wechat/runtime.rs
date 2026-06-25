@@ -39,6 +39,10 @@ impl WechatRuntimeHandle {
         self.inner.lock().await.set_desktop_session(session_id);
     }
 
+    pub async fn connect(&self) {
+        self.inner.lock().await.connect();
+    }
+
     pub async fn clear_desktop_session(&self) {
         self.inner.lock().await.clear_desktop_session();
     }
@@ -49,6 +53,21 @@ impl WechatRuntimeHandle {
             .await
             .desktop_session_id()
             .map(ToOwned::to_owned)
+    }
+
+    pub async fn next_get_updates_request(&self) -> Result<Option<IlinkHttpRequest>, String> {
+        self.inner.lock().await.next_get_updates_request()
+    }
+
+    pub async fn process_updates_response(
+        &self,
+        response: GetUpdatesResponse,
+        received_at_ms: u64,
+    ) -> Result<WechatPollOutcome, String> {
+        self.inner
+            .lock()
+            .await
+            .process_updates_response(response, received_at_ms)
     }
 }
 

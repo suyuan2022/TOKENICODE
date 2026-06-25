@@ -450,6 +450,12 @@ export const bridge = {
   wechatDisconnect: () =>
     invoke<void>('wechat_disconnect'),
 
+  wechatStartPolling: (sessionId: string) =>
+    invoke<void>('wechat_start_polling', { sessionId }),
+
+  wechatStopPolling: () =>
+    invoke<void>('wechat_stop_polling'),
+
   wechatSetDesktopSession: (sessionId: string | null) =>
     invoke<void>('wechat_set_desktop_session', { sessionId }),
 
