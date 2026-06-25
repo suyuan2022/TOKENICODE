@@ -328,7 +328,8 @@ where
             text,
         } => {
             let context_token = resolve_context_token(store, to_user_id, context_token)?;
-            for chunk in split_wechat_text_chunks(text) {
+            let filtered_text = filter_wechat_markdown(text);
+            for chunk in split_wechat_text_chunks(&filtered_text) {
                 let request =
                     client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
                 let response: SendMessageResponse =
@@ -558,6 +559,162 @@ fn byte_index_after_chars(text: &str, max_chars: usize) -> usize {
         }
     }
     text.len()
+}
+
+fn filter_wechat_markdown(text: &str) -> String {
+    let mut filtered = String::with_capacity(text.len());
+    let mut in_code_fence = false;
+
+    for line in text.split_inclusive('\n') {
+        let (body, line_break) = line
+            .strip_suffix('\n')
+            .map(|body| (body, "\n"))
+            .unwrap_or((line, ""));
+
+        if body.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            filtered.push_str(line);
+            continue;
+        }
+        if in_code_fence {
+            filtered.push_str(line);
+            continue;
+        }
+
+        filtered.push_str(&filter_wechat_inline_markdown(strip_wechat_line_markers(
+            body,
+        )));
+        filtered.push_str(line_break);
+    }
+
+    filtered
+}
+
+fn strip_wechat_line_markers(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix('>') {
+        return rest.trim_start_matches([' ', '\t']);
+    }
+
+    let hash_count = line.bytes().take_while(|byte| *byte == b'#').count();
+    if (5..=6).contains(&hash_count) && line.as_bytes().get(hash_count) == Some(&b' ') {
+        return line[hash_count + 1..].trim_start_matches([' ', '\t']);
+    }
+
+    line
+}
+
+fn filter_wechat_inline_markdown(line: &str) -> String {
+    let without_images = remove_markdown_images(line);
+    let without_strikethrough = without_images.replace("~~", "");
+    strip_cjk_emphasis(&without_strikethrough)
+}
+
+fn remove_markdown_images(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find("![") {
+        out.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 2..];
+        let Some(label_end) = after_start.find("](") else {
+            out.push_str(&remaining[start..]);
+            return out;
+        };
+        let after_url_start = &after_start[label_end + 2..];
+        let Some(url_end) = after_url_start.find(')') else {
+            out.push_str(&remaining[start..]);
+            return out;
+        };
+        remaining = &after_url_start[url_end + 1..];
+    }
+
+    out.push_str(remaining);
+    out
+}
+
+fn strip_cjk_emphasis(text: &str) -> String {
+    let text = strip_cjk_wrapping_marker(text, "***");
+    let text = strip_cjk_wrapping_marker(&text, "___");
+    let text = strip_cjk_single_marker(&text, '*');
+    strip_cjk_single_marker(&text, '_')
+}
+
+fn strip_cjk_wrapping_marker(text: &str, marker: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find(marker) {
+        out.push_str(&remaining[..start]);
+        let content_start = start + marker.len();
+        let Some(end) = remaining[content_start..].find(marker) else {
+            out.push_str(&remaining[start..]);
+            return out;
+        };
+        let content_end = content_start + end;
+        let content = &remaining[content_start..content_end];
+        if contains_cjk(content) {
+            out.push_str(content);
+        } else {
+            out.push_str(marker);
+            out.push_str(content);
+            out.push_str(marker);
+        }
+        remaining = &remaining[content_end + marker.len()..];
+    }
+
+    out.push_str(remaining);
+    out
+}
+
+fn strip_cjk_single_marker(text: &str, marker: char) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while let Some(start) = find_single_marker(text, marker, cursor) {
+        out.push_str(&text[cursor..start]);
+        let content_start = start + marker.len_utf8();
+        let Some(end) = find_single_marker(text, marker, content_start) else {
+            out.push_str(&text[start..]);
+            return out;
+        };
+        let content = &text[content_start..end];
+        if contains_cjk(content) {
+            out.push_str(content);
+        } else {
+            out.push(marker);
+            out.push_str(content);
+            out.push(marker);
+        }
+        cursor = end + marker.len_utf8();
+    }
+
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn find_single_marker(text: &str, marker: char, start: usize) -> Option<usize> {
+    text[start..].char_indices().find_map(|(offset, ch)| {
+        let index = start + offset;
+        if ch == marker && !has_adjacent_marker(text, index, marker) {
+            Some(index)
+        } else {
+            None
+        }
+    })
+}
+
+fn has_adjacent_marker(text: &str, index: usize, marker: char) -> bool {
+    let before = text[..index].chars().next_back();
+    let after = text[index + marker.len_utf8()..].chars().next();
+    before == Some(marker) || after == Some(marker)
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|ch| {
+        ('\u{2E80}'..='\u{9FFF}').contains(&ch)
+            || ('\u{AC00}'..='\u{D7AF}').contains(&ch)
+            || ('\u{F900}'..='\u{FAFF}').contains(&ch)
+    })
 }
 
 fn now_ms() -> u64 {
@@ -896,6 +1053,40 @@ mod tests {
         assert_eq!(
             requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
             "async follow-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_wechat_text_effect_filters_wechat_incompatible_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "##### 标题\n> 引用\n**bold** *中文* ~~删除~~ ![alt](https://x.test/a.png)\n```ts\nconst x = \"~~keep~~\";\n```\n".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
+            "标题\n引用\n**bold** 中文 删除 \n```ts\nconst x = \"~~keep~~\";\n```\n"
         );
     }
 
