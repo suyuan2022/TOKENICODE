@@ -1,6 +1,6 @@
 use crate::wechat::{
     api::{GetUpdatesResponse, IlinkApiClient, IlinkHttpRequest},
-    inbound::parse_inbound_text,
+    inbound::{parse_inbound_message, ParsedInboundWechatMessage},
     monitor::{MonitorStatus, WechatMonitorState},
     store::WechatStateStore,
     turn::{WechatPermissionRequest, WechatTurnEffect, WechatTurnManager},
@@ -8,6 +8,8 @@ use crate::wechat::{
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+const UNSUPPORTED_VOICE_NOTICE: &str = "不支持语音，请发文字";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WechatPollOutcome {
@@ -152,13 +154,27 @@ impl WechatRuntime {
         let mut effects = Vec::new();
         let mut inbound_text_count = 0;
         for message in tick.messages {
-            let Some(inbound) = parse_inbound_text(message, received_at_ms)? else {
-                continue;
-            };
-            self.store
-                .save_context_token(&inbound.from_user_id, &inbound.context_token)?;
-            inbound_text_count += 1;
-            effects.extend(self.turn_manager.receive_text(inbound));
+            match parse_inbound_message(message, received_at_ms)? {
+                ParsedInboundWechatMessage::Text(inbound) => {
+                    self.store
+                        .save_context_token(&inbound.from_user_id, &inbound.context_token)?;
+                    inbound_text_count += 1;
+                    effects.extend(self.turn_manager.receive_text(inbound));
+                }
+                ParsedInboundWechatMessage::UnsupportedVoice {
+                    from_user_id,
+                    context_token,
+                } => {
+                    self.store
+                        .save_context_token(&from_user_id, &context_token)?;
+                    effects.push(WechatTurnEffect::SendWeChatText {
+                        to_user_id: from_user_id,
+                        context_token,
+                        text: UNSUPPORTED_VOICE_NOTICE.into(),
+                    });
+                }
+                ParsedInboundWechatMessage::Ignore => {}
+            }
         }
 
         Ok(WechatPollOutcome {
@@ -261,7 +277,8 @@ mod handle_tests {
 mod tests {
     use crate::wechat::{
         api::{
-            GetUpdatesResponse, MessageItem, MessageItemType, MessageType, TextItem, WechatMessage,
+            GetUpdatesResponse, MessageItem, MessageItemType, MessageType, TextItem, VoiceItem,
+            WechatMessage,
         },
         monitor::MonitorStatus,
         store::{WechatAccount, WechatStateStore},
@@ -344,6 +361,53 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn raw_voice_without_transcript_replies_with_unsupported_notice_without_starting_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store.clone());
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+
+        let outcome = runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![raw_voice_message(8, "user-1", "ctx-voice")],
+                    get_updates_buf: Some("cursor-voice".into()),
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.inbound_text_count, 0);
+        assert_eq!(
+            store.load_context_token("user-1").unwrap(),
+            Some("ctx-voice".into())
+        );
+        assert_eq!(
+            outcome.effects,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-voice".into(),
+                text: "不支持语音，请发文字".into(),
+            }]
+        );
+        assert!(runtime
+            .process_stream_event(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": "answer from Claude"
+                }),
+                2_000,
+            )
+            .is_empty());
     }
 
     #[test]
@@ -639,6 +703,25 @@ mod tests {
                 text_item: Some(TextItem {
                     text: Some(text.into()),
                 }),
+                ..MessageItem::default()
+            }],
+            context_token: Some(context_token.into()),
+            ..WechatMessage::default()
+        }
+    }
+
+    fn raw_voice_message(
+        message_id: i64,
+        from_user_id: &str,
+        context_token: &str,
+    ) -> WechatMessage {
+        WechatMessage {
+            message_id: Some(message_id),
+            from_user_id: Some(from_user_id.into()),
+            message_type: Some(MessageType::User as i32),
+            item_list: vec![MessageItem {
+                item_type: Some(MessageItemType::Voice as i32),
+                voice_item: Some(VoiceItem::default()),
                 ..MessageItem::default()
             }],
             context_token: Some(context_token.into()),

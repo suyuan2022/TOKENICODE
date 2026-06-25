@@ -11,6 +11,45 @@ pub fn parse_inbound_text(
     message: WechatMessage,
     received_at_ms: u64,
 ) -> Result<Option<InboundWechatText>, String> {
+    parse_inbound_text_message(&message, received_at_ms)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedInboundWechatMessage {
+    Text(InboundWechatText),
+    UnsupportedVoice {
+        from_user_id: String,
+        context_token: String,
+    },
+    Ignore,
+}
+
+pub fn parse_inbound_message(
+    message: WechatMessage,
+    received_at_ms: u64,
+) -> Result<ParsedInboundWechatMessage, String> {
+    if message.message_type != Some(MESSAGE_TYPE_USER) {
+        return Ok(ParsedInboundWechatMessage::Ignore);
+    }
+
+    if let Some(inbound) = parse_inbound_text_message(&message, received_at_ms)? {
+        return Ok(ParsedInboundWechatMessage::Text(inbound));
+    }
+
+    if has_voice_without_transcript(&message.item_list) {
+        return Ok(ParsedInboundWechatMessage::UnsupportedVoice {
+            from_user_id: required(message.from_user_id.as_deref(), "from_user_id")?,
+            context_token: required(message.context_token.as_deref(), "context_token")?,
+        });
+    }
+
+    Ok(ParsedInboundWechatMessage::Ignore)
+}
+
+fn parse_inbound_text_message(
+    message: &WechatMessage,
+    received_at_ms: u64,
+) -> Result<Option<InboundWechatText>, String> {
     if message.message_type != Some(MESSAGE_TYPE_USER) {
         return Ok(None);
     }
@@ -18,12 +57,12 @@ pub fn parse_inbound_text(
     let Some(text) = body_from_item_list(&message.item_list) else {
         return Ok(None);
     };
-    let from_user_id = required(message.from_user_id, "from_user_id")?;
-    let context_token = required(message.context_token, "context_token")?;
+    let from_user_id = required(message.from_user_id.as_deref(), "from_user_id")?;
+    let context_token = required(message.context_token.as_deref(), "context_token")?;
     let message_id = message
         .message_id
         .map(|id| id.to_string())
-        .or_else(|| message.client_id)
+        .or_else(|| message.client_id.clone())
         .or_else(|| message.seq.map(|seq| format!("seq-{seq}")))
         .ok_or_else(|| "inbound WeChat user message missing message_id".to_string())?;
 
@@ -66,6 +105,19 @@ fn body_from_item(item: &MessageItem) -> Option<String> {
     }
 }
 
+fn has_voice_without_transcript(items: &[MessageItem]) -> bool {
+    items.iter().any(|item| {
+        item.item_type == Some(MESSAGE_ITEM_VOICE)
+            && item
+                .voice_item
+                .as_ref()
+                .and_then(|voice| voice.text.as_deref())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .is_none()
+    })
+}
+
 fn with_quote_prefix(item: &MessageItem, text: &str) -> String {
     let Some(ref_msg) = item.ref_msg.as_ref() else {
         return text.into();
@@ -93,9 +145,10 @@ fn with_quote_prefix(item: &MessageItem, text: &str) -> String {
     }
 }
 
-fn required(value: Option<String>, field: &str) -> Result<String, String> {
+fn required(value: Option<&str>, field: &str) -> Result<String, String> {
     value
         .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
         .ok_or_else(|| format!("inbound WeChat user message missing {field}"))
 }
 
@@ -157,6 +210,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.text, "voice transcript");
+    }
+
+    #[test]
+    fn text_parser_ignores_raw_voice_without_context_token() {
+        let parsed = parse_inbound_text(
+            WechatMessage {
+                from_user_id: Some("user-1".into()),
+                message_type: Some(1),
+                item_list: vec![MessageItem {
+                    item_type: Some(3),
+                    voice_item: Some(VoiceItem::default()),
+                    ..MessageItem::default()
+                }],
+                ..WechatMessage::default()
+            },
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(parsed, None);
     }
 
     #[test]
