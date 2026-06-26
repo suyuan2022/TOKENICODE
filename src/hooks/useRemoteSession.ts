@@ -94,7 +94,10 @@ export function applyRemoteDesktopUserMessage(
 
 export interface RemoteClearDesktopConversationDeps {
   getTabForStdin: (stdinId: string) => string | undefined;
+  ensureTab: (tabId: string) => void;
   clearMessages: (tabId: string) => void;
+  clearCliResumeId: (tabId: string) => void;
+  clearSessionIdentity: (tabId: string) => void;
   touchWechatRemoteSession: (preview: string, modifiedAt: number) => void;
 }
 
@@ -102,15 +105,26 @@ export function applyRemoteClearDesktopConversation(
   message: WechatDesktopClearConversationEvent,
   deps: RemoteClearDesktopConversationDeps = {
     getTabForStdin: (stdinId) => useSessionStore.getState().getTabForStdin(stdinId),
+    ensureTab: (tabId) => useChatStore.getState().ensureTab(tabId),
     clearMessages: (tabId) => useChatStore.getState().clearMessages(tabId),
+    clearCliResumeId: (tabId) => useSessionStore.getState().setCliResumeId(tabId, null),
+    clearSessionIdentity: (tabId) => useChatStore.getState().setSessionMeta(tabId, {
+      sessionId: undefined,
+      stdinReady: false,
+      pendingReadyMessage: undefined,
+      turnAcceptedForResume: undefined,
+      interruptedAssistantText: undefined,
+    }),
     touchWechatRemoteSession: (preview, modifiedAt) =>
       useSessionStore.getState().touchWechatRemoteSession(preview, modifiedAt),
   },
 ): boolean {
-  const tabId = deps.getTabForStdin(message.desktopSessionId);
-  if (!tabId) return false;
+  const tabId = deps.getTabForStdin(message.desktopSessionId) ?? WECHAT_REMOTE_SESSION_ID;
 
+  deps.ensureTab(tabId);
   deps.clearMessages(tabId);
+  deps.clearCliResumeId(tabId);
+  deps.clearSessionIdentity(tabId);
   if (tabId === WECHAT_REMOTE_SESSION_ID) {
     deps.touchWechatRemoteSession('微信接入', Date.now());
   }

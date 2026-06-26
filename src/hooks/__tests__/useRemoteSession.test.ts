@@ -147,35 +147,45 @@ describe('applyRemoteDesktopUserMessage', () => {
 describe('applyRemoteClearDesktopConversation', () => {
   it('clears the tab that owns the WeChat stdin route without dropping the route', () => {
     const cleared: string[] = [];
+    const resumeCleared: string[] = [];
 
     const handled = applyRemoteClearDesktopConversation(
       { desktopSessionId: 'stdin-wechat' },
       {
         getTabForStdin: (stdinId) =>
           stdinId === 'stdin-wechat' ? WECHAT_REMOTE_SESSION_ID : undefined,
+        ensureTab: () => {},
         clearMessages: (tabId) => cleared.push(tabId),
+        clearCliResumeId: (tabId) => resumeCleared.push(tabId),
+        clearSessionIdentity: () => {},
         touchWechatRemoteSession: () => {},
       },
     );
 
     expect(handled).toBe(true);
     expect(cleared).toEqual([WECHAT_REMOTE_SESSION_ID]);
+    expect(resumeCleared).toEqual([WECHAT_REMOTE_SESSION_ID]);
   });
 
-  it('ignores clear events for unknown stdin routes', () => {
+  it('falls back to the fixed WeChat tab when clearing a stale stdin route', () => {
     const cleared: string[] = [];
+    const resumeCleared: string[] = [];
 
     const handled = applyRemoteClearDesktopConversation(
       { desktopSessionId: 'missing-stdin' },
       {
         getTabForStdin: () => undefined,
+        ensureTab: () => {},
         clearMessages: (tabId) => cleared.push(tabId),
+        clearCliResumeId: (tabId) => resumeCleared.push(tabId),
+        clearSessionIdentity: () => {},
         touchWechatRemoteSession: () => {},
       },
     );
 
-    expect(handled).toBe(false);
-    expect(cleared).toEqual([]);
+    expect(handled).toBe(true);
+    expect(cleared).toEqual([WECHAT_REMOTE_SESSION_ID]);
+    expect(resumeCleared).toEqual([WECHAT_REMOTE_SESSION_ID]);
   });
 });
 

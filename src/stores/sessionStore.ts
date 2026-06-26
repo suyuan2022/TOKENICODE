@@ -22,6 +22,8 @@ export function setOrphanDrainCallback(cb: (stdinId: string, tabId: string) => v
 const CUSTOM_PREVIEWS_KEY = 'tokenicode_custom_previews';
 const LAST_SESSION_KEY = 'tokenicode_last_session';
 const STDIN_TO_TAB_KEY = 'tokenicode_stdinToTab';
+const WECHAT_REMOTE_CLI_RESUME_KEY = 'tokenicode_wechat_remote_cli_resume_id';
+const WECHAT_REMOTE_HIDDEN_SESSIONS_KEY = 'tokenicode_wechat_remote_hidden_session_ids';
 
 function loadCustomPreviewsSync(): Record<string, string> {
   try {
@@ -59,6 +61,58 @@ function loadStdinToTabSync(): Record<string, string> {
 
 function saveStdinToTab(map: Record<string, string>) {
   sessionStorage.setItem(STDIN_TO_TAB_KEY, JSON.stringify(map));
+}
+
+function loadWechatRemoteCliResumeId(): string | null {
+  return localStorage.getItem(WECHAT_REMOTE_CLI_RESUME_KEY);
+}
+
+function loadWechatRemoteHiddenSessionIds(): Set<string> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(WECHAT_REMOTE_HIDDEN_SESSIONS_KEY) || '[]');
+    return new Set(Array.isArray(raw) ? raw.filter((value) => typeof value === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function rememberWechatRemoteCliSessionId(id: string | null | undefined) {
+  if (!id || id.startsWith('desk_')) return;
+  const hidden = loadWechatRemoteHiddenSessionIds();
+  hidden.add(id);
+  localStorage.setItem(WECHAT_REMOTE_HIDDEN_SESSIONS_KEY, JSON.stringify([...hidden]));
+}
+
+function saveWechatRemoteCliResumeId(id: string | null) {
+  if (id) {
+    localStorage.setItem(WECHAT_REMOTE_CLI_RESUME_KEY, id);
+    rememberWechatRemoteCliSessionId(id);
+  } else {
+    localStorage.removeItem(WECHAT_REMOTE_CLI_RESUME_KEY);
+  }
+}
+
+function getWechatRemoteCliResumeId(sessions: SessionListItem[]): string | null {
+  return sessions.find((session) => isWechatRemoteSessionId(session.id))?.cliResumeId
+    ?? loadWechatRemoteCliResumeId();
+}
+
+function restoreWechatRemoteCliResumeId(
+  sessions: SessionListItem[],
+  cliResumeId: string | null,
+): SessionListItem[] {
+  if (!cliResumeId) return sessions;
+  return sessions.map((session) =>
+    isWechatRemoteSessionId(session.id) && !session.cliResumeId
+      ? { ...session, cliResumeId }
+      : session,
+  );
+}
+
+function isLegacyWechatRemoteBootstrapSession(session: SessionListItem): boolean {
+  const preview = session.preview.trim();
+  return preview.startsWith('微信接入初始化，请只回复')
+    || preview.startsWith('微信接入专用会话初始化');
 }
 
 interface SessionState {
@@ -142,16 +196,40 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     try {
       const diskSessions = await bridge.listSessions();
       const existing = get().sessions;
+      const wechatRemoteCliResumeId = getWechatRemoteCliResumeId(existing);
+      const hiddenWechatSessionIds = loadWechatRemoteHiddenSessionIds();
+      if (wechatRemoteCliResumeId) hiddenWechatSessionIds.add(wechatRemoteCliResumeId);
+      const visibleDiskSessions = diskSessions.filter((session) => {
+        if (isLegacyWechatRemoteBootstrapSession(session)) {
+          rememberWechatRemoteCliSessionId(session.id);
+          hiddenWechatSessionIds.add(session.id);
+          return false;
+        }
+        return !hiddenWechatSessionIds.has(session.id);
+      });
       // Preserve draft sessions (path === '') that haven't been written to disk yet
       const drafts = existing.filter(
-        (s) => s.path === '' && !diskSessions.some((d) => d.id === s.id),
+        (s) => s.path === '' && !visibleDiskSessions.some((d) => d.id === s.id),
       );
       // Merge: preserve in-memory cliResumeId on disk sessions
-      const merged = diskSessions.map((d) => {
+      const merged = visibleDiskSessions.map((d) => {
         const mem = existing.find((s) => s.id === d.id);
         return mem?.cliResumeId ? { ...d, cliResumeId: mem.cliResumeId } : d;
       });
-      set({ sessions: [...drafts, ...merged], isLoading: false });
+      const sessions = restoreWechatRemoteCliResumeId(
+        [...drafts, ...merged],
+        wechatRemoteCliResumeId,
+      );
+      const selectedSessionId = hiddenWechatSessionIds.has(get().selectedSessionId || '')
+        ? WECHAT_REMOTE_SESSION_ID
+        : get().selectedSessionId;
+      const previousSessionId = hiddenWechatSessionIds.has(get().previousSessionId || '')
+        ? WECHAT_REMOTE_SESSION_ID
+        : get().previousSessionId;
+      if (selectedSessionId === WECHAT_REMOTE_SESSION_ID) {
+        saveLastSessionId(WECHAT_REMOTE_SESSION_ID);
+      }
+      set({ sessions, selectedSessionId, previousSessionId, isLoading: false });
     } catch {
       set({ isLoading: false });
     }
@@ -185,7 +263,10 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   }),
 
   ensureWechatRemoteSession: (projectPath) => set((state) => ({
-    sessions: upsertWechatRemoteSession(state.sessions, projectPath),
+    sessions: restoreWechatRemoteCliResumeId(
+      upsertWechatRemoteSession(state.sessions, projectPath),
+      getWechatRemoteCliResumeId(state.sessions),
+    ),
   })),
 
   touchWechatRemoteSession: (preview, modifiedAt) => set((state) => {
@@ -247,17 +328,41 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   getTabForStdin: (stdinId) => get().stdinToTab[stdinId],
 
-  setCliResumeId: (sessionId, cliResumeId) => set((state) => ({
-    sessions: state.sessions.map((s) =>
-      s.id === sessionId ? { ...s, cliResumeId } : s,
-    ),
-  })),
+  setCliResumeId: (sessionId, cliResumeId) => set((state) => {
+    if (isWechatRemoteSessionId(sessionId)) {
+      saveWechatRemoteCliResumeId(cliResumeId);
+    }
+    return {
+      sessions: state.sessions.map((s) =>
+        s.id === sessionId ? { ...s, cliResumeId } : s,
+      ),
+    };
+  }),
 
   removeDraft: (draftId) => set((state) => ({
     sessions: state.sessions.filter((s) => s.id !== draftId),
   })),
 
   promoteDraft: (oldDraftId, newRealId) => {
+    if (isWechatRemoteSessionId(oldDraftId)) {
+      saveLastSessionId(oldDraftId);
+      saveWechatRemoteCliResumeId(newRealId);
+      set((state) => ({
+        sessions: state.sessions.map((session) =>
+          isWechatRemoteSessionId(session.id)
+            ? { ...session, cliResumeId: newRealId, modifiedAt: Date.now() }
+            : session,
+        ),
+        selectedSessionId: state.selectedSessionId === newRealId
+          ? oldDraftId
+          : state.selectedSessionId,
+        previousSessionId: state.previousSessionId === newRealId
+          ? oldDraftId
+          : state.previousSessionId,
+      }));
+      return;
+    }
+
     saveLastSessionId(newRealId);
     // Keep the group ledger in sync: a draft promoted to its real CLI id must
     // stay in its task group (the ledger still referenced the old draft id).

@@ -240,7 +240,16 @@ where
         if let Some(clear) = desktop_clear_conversation_for_effect(effect) {
             dispatch.desktop_clear_conversations.push(clear);
         }
-        let mut handled_claude = execute_claude_effect(stdin_mgr, effect).await?;
+        let mut handled_claude = match execute_claude_effect(stdin_mgr, effect).await {
+            Ok(handled) => handled,
+            Err(err) if is_stale_clear_slash_effect(effect) => {
+                eprintln!(
+                    "[WeChat] clear slash command skipped because desktop route is stale: {err}"
+                );
+                false
+            }
+            Err(err) => return Err(err),
+        };
         if !handled_claude {
             if let Some(message) =
                 execute_claude_media_effect_with(stdin_mgr, store, effect, &mut download_media)
@@ -268,6 +277,14 @@ where
         }
     }
     Ok(dispatch)
+}
+
+fn is_stale_clear_slash_effect(effect: &WechatTurnEffect) -> bool {
+    matches!(
+        effect,
+        WechatTurnEffect::SendClaudeSlashCommand { command, .. }
+            if command.trim().eq_ignore_ascii_case("/clear")
+    )
 }
 
 pub async fn execute_claude_media_effect_with<F, Fut>(
@@ -1290,6 +1307,54 @@ mod tests {
                 desktop_session_id: "stdin-1".into(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn clear_context_continues_when_desktop_stdin_route_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let stdin_mgr = StdinManager::new();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let dispatch = execute_turn_effects_with(
+            &stdin_mgr,
+            &store,
+            &[
+                WechatTurnEffect::ClearDesktopConversation {
+                    desktop_session_id: "stale-stdin".into(),
+                },
+                WechatTurnEffect::SendClaudeSlashCommand {
+                    desktop_session_id: "stale-stdin".into(),
+                    command: "/clear".into(),
+                },
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                    text: "cleared".into(),
+                },
+            ],
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatch.claude_effect_count, 0);
+        assert_eq!(dispatch.wechat_effect_count, 1);
+        assert_eq!(
+            dispatch.desktop_clear_conversations,
+            vec![WechatDesktopClearConversation {
+                desktop_session_id: "stale-stdin".into(),
+            }]
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
