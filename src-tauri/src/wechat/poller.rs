@@ -303,6 +303,7 @@ mod tests {
                 GetUpdatesResponse, IlinkHttpRequest, MessageItem, MessageItemType, MessageType,
                 TextItem, WechatMessage,
             },
+            executor::execute_turn_effects_with,
             monitor::MonitorStatus,
             poller::{poll_once_with, poll_once_with_executors, WechatPollingTask},
             runtime::WechatRuntimeHandle,
@@ -446,6 +447,104 @@ mod tests {
         assert_eq!(
             outbound_requests[1].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
+        );
+
+        stdin_mgr.remove("stdin-1").await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn queued_wechat_message_discards_as_stale_through_outbound_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let runtime = WechatRuntimeHandle::new(store.clone());
+        runtime.set_desktop_session("stdin-1".into()).await;
+        let stdin_mgr = StdinManager::new();
+        let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
+
+        let first_iteration = poll_once_with_executors(
+            &runtime,
+            &stdin_mgr,
+            1_000,
+            |_request| async {
+                Ok(GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "first")],
+                    get_updates_buf: Some("cursor-1".into()),
+                    longpolling_timeout_ms: None,
+                })
+            },
+            |_request| async { Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" })) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_iteration.claude_effect_count, 1);
+        assert_eq!(first_iteration.wechat_effect_count, 1);
+        assert!(lines.next_line().await.unwrap().unwrap().contains("first"));
+
+        let second_iteration = poll_once_with_executors(
+            &runtime,
+            &stdin_mgr,
+            10_000,
+            |_request| async {
+                Ok(GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(8, "user-1", "ctx-2", "second")],
+                    get_updates_buf: Some("cursor-2".into()),
+                    longpolling_timeout_ms: None,
+                })
+            },
+            |_request| async { Ok(json!({ "ret": 0 })) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second_iteration.claude_effect_count, 0);
+        assert_eq!(second_iteration.wechat_effect_count, 0);
+
+        let effects = runtime
+            .process_stream_event(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": "answer one",
+                }),
+                71_001,
+            )
+            .await;
+        let outbound_requests = Arc::new(StdMutex::new(Vec::<IlinkHttpRequest>::new()));
+        let captured = outbound_requests.clone();
+        let dispatch = execute_turn_effects_with(&stdin_mgr, &store, &effects, move |request| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().unwrap().push(request);
+                Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(dispatch.wechat_effect_count, 3);
+        let send_texts: Vec<String> = outbound_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.ends_with("/ilink/bot/sendmessage"))
+            .filter_map(|request| {
+                request.body["msg"]["item_list"][0]["text_item"]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            send_texts,
+            vec!["answer one", "这条消息排队超过 60 秒，请重新发送。"]
         );
 
         stdin_mgr.remove("stdin-1").await;
