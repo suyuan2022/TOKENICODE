@@ -181,6 +181,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'error.cliExitedSilently': 'CLI 意外退出且无输出，请检查 CLI 是否已正确安装（设置 → CLI），以及 API 服务商是否已配置。',
     'error.userStopped': '已手动停止',
     'error.turnFailed': 'AI 响应异常中断',
+    'wechat.remoteStopped': '已从微信停止当前任务',
 
     // FilePreview
     'filePreview.htmlStaticPreview': '静态 HTML 预览（脚本已禁用）',
@@ -937,6 +938,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'error.cliExitedSilently': 'CLI process exited unexpectedly without output. Please check that Claude CLI is installed correctly (Settings → CLI) and that your API provider is configured.',
     'error.userStopped': 'Manually stopped',
     'error.turnFailed': 'AI response interrupted unexpectedly',
+    'wechat.remoteStopped': 'Stopped from WeChat',
 
     // FilePreview
     'filePreview.htmlStaticPreview': 'Static HTML preview (scripts disabled)',

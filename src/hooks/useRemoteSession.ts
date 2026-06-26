@@ -2,8 +2,10 @@ import { useEffect, useRef } from 'react';
 import {
   bridge,
   onWechatDesktopClearConversation,
+  onWechatDesktopStop,
   onWechatDesktopUserMessage,
   type WechatDesktopClearConversationEvent,
+  type WechatDesktopStopEvent,
   type WechatDesktopUserMessageEvent,
 } from '../lib/tauri-bridge';
 import {
@@ -29,6 +31,7 @@ import {
   teardownSession,
   waitForStdinCleared,
 } from '../lib/sessionLifecycle';
+import { t } from '../lib/i18n';
 
 export type RemoteSessionBridge = Pick<
   typeof bridge,
@@ -282,6 +285,60 @@ export function applyRemoteClearDesktopConversation(
   return true;
 }
 
+export interface RemoteDesktopStopDeps {
+  getTabForStdin: (stdinId: string) => string | undefined;
+  addMessage: (tabId: string, message: ChatMessage) => void;
+  setSessionStatus: (tabId: string, status: SessionStatus) => void;
+  setActivityStatus: (tabId: string, status: ActivityStatus) => void;
+  setSessionMeta: (tabId: string, meta: Partial<SessionMeta>) => void;
+  touchWechatRemoteSession: (preview: string, modifiedAt: number) => void;
+  newMessageId: () => string;
+  now: () => number;
+}
+
+export function applyRemoteDesktopStop(
+  message: WechatDesktopStopEvent,
+  deps: RemoteDesktopStopDeps = {
+    getTabForStdin: (stdinId) => useSessionStore.getState().getTabForStdin(stdinId),
+    addMessage: (tabId, chatMessage) => useChatStore.getState().addMessage(tabId, chatMessage),
+    setSessionStatus: (tabId, status) => useChatStore.getState().setSessionStatus(tabId, status),
+    setActivityStatus: (tabId, status) => useChatStore.getState().setActivityStatus(tabId, status),
+    setSessionMeta: (tabId, meta) => useChatStore.getState().setSessionMeta(tabId, meta),
+    touchWechatRemoteSession: (preview, modifiedAt) =>
+      useSessionStore.getState().touchWechatRemoteSession(preview, modifiedAt),
+    newMessageId: generateMessageId,
+    now: Date.now,
+  },
+): boolean {
+  if (message.source !== 'wechat') return false;
+
+  const tabId = deps.getTabForStdin(message.desktopSessionId);
+  if (!tabId) return false;
+
+  const timestamp = deps.now();
+  const content = t('wechat.remoteStopped') || '已从微信停止当前任务';
+
+  deps.addMessage(tabId, {
+    id: deps.newMessageId(),
+    role: 'system',
+    type: 'text',
+    content,
+    timestamp,
+    commandType: 'action',
+  });
+  deps.setSessionStatus(tabId, 'stopping');
+  deps.setActivityStatus(tabId, { phase: 'idle' });
+  deps.setSessionMeta(tabId, {
+    teardownReason: 'stop',
+    apiRetry: undefined,
+    lastProgressAt: timestamp,
+  });
+  if (tabId === WECHAT_REMOTE_SESSION_ID) {
+    deps.touchWechatRemoteSession(content, timestamp);
+  }
+  return true;
+}
+
 export function useRemoteSession() {
   const activeStdinId = useChatStore((state) =>
     state.tabs.get(WECHAT_REMOTE_SESSION_ID)?.sessionMeta.stdinId,
@@ -356,6 +413,7 @@ export function useRemoteSession() {
     let disposed = false;
     let unlistenUserMessage: (() => void) | undefined;
     let unlistenClearConversation: (() => void) | undefined;
+    let unlistenDesktopStop: (() => void) | undefined;
 
     onWechatDesktopUserMessage((message) => {
       if (!applyRemoteDesktopUserMessage(message)) {
@@ -389,10 +447,28 @@ export function useRemoteSession() {
       console.warn('[WeChat] failed to subscribe to remote clear events', err);
     });
 
+    onWechatDesktopStop((message) => {
+      if (!applyRemoteDesktopStop(message)) {
+        console.warn('[WeChat] received stop event for unknown desktop route', {
+          desktopSessionId: message.desktopSessionId,
+          source: message.source,
+        });
+      }
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlistenDesktopStop = fn;
+      }
+    }).catch((err) => {
+      console.warn('[WeChat] failed to subscribe to remote stop events', err);
+    });
+
     return () => {
       disposed = true;
       unlistenUserMessage?.();
       unlistenClearConversation?.();
+      unlistenDesktopStop?.();
     };
   }, []);
 }

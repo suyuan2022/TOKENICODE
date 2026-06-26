@@ -50,6 +50,7 @@ pub struct WechatEffectDispatch {
     pub wechat_effect_count: usize,
     pub desktop_user_messages: Vec<WechatDesktopUserMessage>,
     pub desktop_clear_conversations: Vec<WechatDesktopClearConversation>,
+    pub desktop_stops: Vec<WechatDesktopStop>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,6 +73,13 @@ pub struct WechatDesktopAttachment {
 #[serde(rename_all = "camelCase")]
 pub struct WechatDesktopClearConversation {
     pub desktop_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WechatDesktopStop {
+    pub desktop_session_id: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +247,9 @@ where
         let mut desktop_user_message = desktop_user_message_for_text_effect(effect);
         if let Some(clear) = desktop_clear_conversation_for_effect(effect) {
             dispatch.desktop_clear_conversations.push(clear);
+        }
+        if let Some(stop) = desktop_stop_for_effect(effect) {
+            dispatch.desktop_stops.push(stop);
         }
         let mut handled_claude = match execute_claude_effect(stdin_mgr, effect).await {
             Ok(handled) => handled,
@@ -954,6 +965,17 @@ fn desktop_clear_conversation_for_effect(
     })
 }
 
+fn desktop_stop_for_effect(effect: &WechatTurnEffect) -> Option<WechatDesktopStop> {
+    let WechatTurnEffect::InterruptClaude { desktop_session_id } = effect else {
+        return None;
+    };
+
+    Some(WechatDesktopStop {
+        desktop_session_id: desktop_session_id.clone(),
+        source: "wechat".into(),
+    })
+}
+
 fn media_display_text(media: &InboundWechatMedia) -> String {
     let label = match media.kind {
         InboundWechatMediaKind::Image => "微信发来的图片",
@@ -1546,6 +1568,43 @@ mod tests {
         assert_eq!(actual["type"], "control_request");
         assert!(actual["request_id"].as_str().is_some());
         assert_eq!(actual["request"]["subtype"], "interrupt");
+
+        stdin_mgr.remove("stdin-1").await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_effect_is_reported_as_wechat_desktop_stop_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let stdin_mgr = StdinManager::new();
+        let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
+
+        let dispatch = execute_turn_effects_with(
+            &stdin_mgr,
+            &store,
+            &[WechatTurnEffect::InterruptClaude {
+                desktop_session_id: "stdin-1".into(),
+            }],
+            |_request| async { Ok(json!({ "ret": 0 })) },
+        )
+        .await
+        .unwrap();
+
+        let line = timeout(Duration::from_millis(200), lines.next_line())
+            .await
+            .expect("interrupt effect wrote no control request")
+            .unwrap()
+            .unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(actual["request"]["subtype"], "interrupt");
+        assert_eq!(
+            dispatch.desktop_stops,
+            vec![WechatDesktopStop {
+                desktop_session_id: "stdin-1".into(),
+                source: "wechat".into(),
+            }]
+        );
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;

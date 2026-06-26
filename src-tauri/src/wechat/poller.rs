@@ -18,7 +18,8 @@ use crate::{
     wechat::{
         api::{GetUpdatesResponse, IlinkApiClient, IlinkHttpRequest},
         executor::{
-            execute_turn_effects_with, WechatDesktopClearConversation, WechatDesktopUserMessage,
+            execute_turn_effects_with, WechatDesktopClearConversation, WechatDesktopStop,
+            WechatDesktopUserMessage,
         },
         monitor::MonitorStatus,
         runtime::WechatRuntimeHandle,
@@ -103,6 +104,7 @@ pub struct WechatPollIteration {
     pub wechat_effect_count: usize,
     pub desktop_user_messages: Vec<WechatDesktopUserMessage>,
     pub desktop_clear_conversations: Vec<WechatDesktopClearConversation>,
+    pub desktop_stops: Vec<WechatDesktopStop>,
     pub next_timeout_ms: u64,
 }
 
@@ -176,6 +178,7 @@ where
             wechat_effect_count: 0,
             desktop_user_messages: Vec::new(),
             desktop_clear_conversations: Vec::new(),
+            desktop_stops: Vec::new(),
             next_timeout_ms: NO_ACCOUNT_RETRY_MS,
         });
     };
@@ -199,15 +202,17 @@ where
         || !outcome.effects.is_empty()
         || dispatch.claude_effect_count > 0
         || dispatch.wechat_effect_count > 0
+        || !dispatch.desktop_stops.is_empty()
     {
         eprintln!(
-            "[WeChat] poll dispatch: inbound_text={} effects={} claude_effects={} wechat_effects={} desktop_messages={} desktop_clears={}",
+            "[WeChat] poll dispatch: inbound_text={} effects={} claude_effects={} wechat_effects={} desktop_messages={} desktop_clears={} desktop_stops={}",
             outcome.inbound_text_count,
             outcome.effects.len(),
             dispatch.claude_effect_count,
             dispatch.wechat_effect_count,
             dispatch.desktop_user_messages.len(),
             dispatch.desktop_clear_conversations.len(),
+            dispatch.desktop_stops.len(),
         );
     }
 
@@ -220,6 +225,7 @@ where
         wechat_effect_count: dispatch.wechat_effect_count,
         desktop_user_messages: dispatch.desktop_user_messages,
         desktop_clear_conversations: dispatch.desktop_clear_conversations,
+        desktop_stops: dispatch.desktop_stops,
         next_timeout_ms: outcome.next_timeout_ms,
     })
 }
@@ -267,6 +273,7 @@ async fn run_poll_loop(
                     app.as_ref(),
                     &iteration.desktop_clear_conversations,
                 );
+                emit_desktop_stops(app.as_ref(), &iteration.desktop_stops);
                 iteration.next_timeout_ms
             }
             Ok(iteration) if iteration.polled => {
@@ -276,6 +283,7 @@ async fn run_poll_loop(
                     app.as_ref(),
                     &iteration.desktop_clear_conversations,
                 );
+                emit_desktop_stops(app.as_ref(), &iteration.desktop_stops);
                 0
             }
             Ok(_) => NO_ACCOUNT_RETRY_MS,
@@ -324,6 +332,18 @@ fn emit_desktop_clear_conversations(
     }
 }
 
+fn emit_desktop_stops(app: Option<&AppHandle>, messages: &[WechatDesktopStop]) {
+    let Some(app) = app else {
+        return;
+    };
+
+    for message in messages {
+        if let Err(err) = emit_to_frontend(app, "wechat:desktop_stop", message) {
+            eprintln!("[WeChat] desktop stop emit failed: {err}");
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -335,6 +355,7 @@ fn now_ms() -> u64 {
 mod tests {
     use std::process::Stdio;
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
 
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -590,6 +611,79 @@ mod tests {
             send_texts,
             vec!["answer one", "这条消息排队超过 60 秒，请重新发送。"]
         );
+
+        stdin_mgr.remove("stdin-1").await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn poll_once_reports_wechat_stop_to_frontend_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let runtime = WechatRuntimeHandle::new(store);
+        runtime.set_desktop_session("stdin-1".into()).await;
+        let stdin_mgr = StdinManager::new();
+        let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
+
+        let first_iteration = poll_once_with_executors(
+            &runtime,
+            &stdin_mgr,
+            1_000,
+            |_request| async {
+                Ok(GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "first")],
+                    get_updates_buf: Some("cursor-1".into()),
+                    longpolling_timeout_ms: None,
+                })
+            },
+            |_request| async { Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" })) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_iteration.claude_effect_count, 1);
+        assert!(lines.next_line().await.unwrap().unwrap().contains("first"));
+
+        let stop_iteration = poll_once_with_executors(
+            &runtime,
+            &stdin_mgr,
+            2_000,
+            |_request| async {
+                Ok(GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(8, "user-1", "ctx-2", "/stop")],
+                    get_updates_buf: Some("cursor-2".into()),
+                    longpolling_timeout_ms: None,
+                })
+            },
+            |_request| async { Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" })) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stop_iteration.claude_effect_count, 1);
+        assert_eq!(stop_iteration.desktop_user_messages.len(), 0);
+        assert_eq!(stop_iteration.desktop_stops.len(), 1);
+        assert_eq!(
+            stop_iteration.desktop_stops[0].desktop_session_id,
+            "stdin-1"
+        );
+        assert_eq!(stop_iteration.desktop_stops[0].source, "wechat");
+
+        let line = tokio::time::timeout(Duration::from_millis(200), lines.next_line())
+            .await
+            .expect("stop command wrote no interrupt request")
+            .unwrap()
+            .unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(actual["type"], "control_request");
+        assert_eq!(actual["request"]["subtype"], "interrupt");
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;

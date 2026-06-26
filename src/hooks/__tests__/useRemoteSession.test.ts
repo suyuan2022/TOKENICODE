@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   applyRemoteClearDesktopConversation,
+  applyRemoteDesktopStop,
   applyRemoteDesktopUserMessage,
   ensureWechatRemoteSession,
   resolveRemoteDesktopSessionId,
@@ -277,6 +278,80 @@ describe('applyRemoteClearDesktopConversation', () => {
     expect(handled).toBe(true);
     expect(cleared).toEqual([WECHAT_REMOTE_SESSION_ID]);
     expect(resumeCleared).toEqual([WECHAT_REMOTE_SESSION_ID]);
+  });
+});
+
+describe('applyRemoteDesktopStop', () => {
+  it('records a neutral WeChat stop message and marks the turn as user-stopped', () => {
+    const messages: ChatMessage[] = [];
+    const statuses: string[] = [];
+    const activities: string[] = [];
+    const metas: Array<Record<string, unknown>> = [];
+    const touches: Array<{ preview: string; modifiedAt: number }> = [];
+
+    const handled = applyRemoteDesktopStop(
+      {
+        desktopSessionId: 'stdin-wechat',
+        source: 'wechat',
+      },
+      {
+        getTabForStdin: (stdinId) =>
+          stdinId === 'stdin-wechat' ? WECHAT_REMOTE_SESSION_ID : undefined,
+        addMessage: (_tabId, message) => messages.push(message),
+        setSessionStatus: (_tabId, status) => statuses.push(status),
+        setActivityStatus: (_tabId, status) => activities.push(status.phase),
+        setSessionMeta: (_tabId, meta) => metas.push(meta),
+        touchWechatRemoteSession: (preview, modifiedAt) => touches.push({ preview, modifiedAt }),
+        newMessageId: () => 'remote-stop-1',
+        now: () => 789,
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(messages).toEqual([
+      {
+        id: 'remote-stop-1',
+        role: 'system',
+        type: 'text',
+        content: '已从微信停止当前任务',
+        timestamp: 789,
+        commandType: 'action',
+      },
+    ]);
+    expect(statuses).toEqual(['stopping']);
+    expect(activities).toEqual(['idle']);
+    expect(metas).toEqual([
+      {
+        teardownReason: 'stop',
+        apiRetry: undefined,
+        lastProgressAt: 789,
+      },
+    ]);
+    expect(touches).toEqual([{ preview: '已从微信停止当前任务', modifiedAt: 789 }]);
+  });
+
+  it('ignores stop events for unknown stdin routes', () => {
+    const messages: ChatMessage[] = [];
+
+    const handled = applyRemoteDesktopStop(
+      {
+        desktopSessionId: 'missing-stdin',
+        source: 'wechat',
+      },
+      {
+        getTabForStdin: () => undefined,
+        addMessage: (_tabId, message) => messages.push(message),
+        setSessionStatus: () => {},
+        setActivityStatus: () => {},
+        setSessionMeta: () => {},
+        touchWechatRemoteSession: () => {},
+        newMessageId: () => 'remote-stop-1',
+        now: () => 789,
+      },
+    );
+
+    expect(handled).toBe(false);
+    expect(messages).toEqual([]);
   });
 });
 

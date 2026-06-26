@@ -177,6 +177,11 @@ export interface WechatDesktopClearConversationEvent {
   desktopSessionId: string;
 }
 
+export interface WechatDesktopStopEvent {
+  desktopSessionId: string;
+  source: 'wechat' | string;
+}
+
 export interface StepResult {
   ok: boolean;
   message: string;
@@ -653,6 +658,15 @@ export function onWechatDesktopClearConversation(
 ): Promise<UnlistenFn> {
   return listen<WechatDesktopClearConversationEvent>(
     'wechat:clear_desktop_conversation',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopStop(
+  callback: (message: WechatDesktopStopEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopStopEvent>(
+    'wechat:desktop_stop',
     (event) => callback(event.payload),
   );
 }
