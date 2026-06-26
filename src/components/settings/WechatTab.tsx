@@ -6,8 +6,7 @@ import {
   type WechatStatus,
 } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
-
-type WechatPhase = 'loading' | 'idle' | 'requesting' | 'waiting' | 'scanned' | 'connected' | 'sessionExpired' | 'error';
+import { resolveWechatQrPollResult, type WechatPhase } from './wechatLoginState';
 
 export function WechatTab() {
   const t = useT();
@@ -83,22 +82,14 @@ export function WechatTab() {
     pollingRef.current = true;
     try {
       const result = await bridge.wechatPollQrLogin(qrcodeId);
-      if (result.connected) {
-        setAccount(result.account ?? null);
+      const next = resolveWechatQrPollResult(result);
+      setAccount(next.account);
+      setMessage(next.message);
+      if (next.clearQr) {
         setQrcodeId('');
         setQrcodeImage('');
-        setMessage('');
-        setPhase('connected');
-        return;
       }
-      setMessage(result.message ?? '');
-      if (result.status === 'scaned') {
-        setPhase('scanned');
-      } else if (result.status === 'wait' || result.status === 'need_verifycode') {
-        setPhase('waiting');
-      } else {
-        setPhase('error');
-      }
+      setPhase(next.phase);
     } catch (err) {
       setMessage(String(err));
       setPhase('error');
