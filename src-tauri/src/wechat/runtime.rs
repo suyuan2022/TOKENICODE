@@ -86,10 +86,21 @@ impl WechatRuntimeHandle {
         event: &Value,
         received_at_ms: u64,
     ) -> Vec<WechatTurnEffect> {
-        self.inner
-            .lock()
+        self.process_stream_event_for_session(None, event, received_at_ms)
             .await
-            .process_stream_event(event, received_at_ms)
+    }
+
+    pub async fn process_stream_event_for_session(
+        &self,
+        source_session_id: Option<&str>,
+        event: &Value,
+        received_at_ms: u64,
+    ) -> Vec<WechatTurnEffect> {
+        self.inner.lock().await.process_stream_event_for_session(
+            source_session_id,
+            event,
+            received_at_ms,
+        )
     }
 }
 
@@ -199,13 +210,38 @@ impl WechatRuntime {
         event: &Value,
         received_at_ms: u64,
     ) -> Vec<WechatTurnEffect> {
+        self.process_stream_event_for_session(None, event, received_at_ms)
+    }
+
+    pub fn process_stream_event_for_session(
+        &mut self,
+        source_session_id: Option<&str>,
+        event: &Value,
+        received_at_ms: u64,
+    ) -> Vec<WechatTurnEffect> {
+        if let Some(source_session_id) = source_session_id {
+            if self.turn_manager.desktop_session_id() != Some(source_session_id) {
+                return Vec::new();
+            }
+        }
+
         match event.get("type").and_then(Value::as_str) {
             Some("result") => self.process_result_event(event, received_at_ms),
             Some("assistant") | Some("stream_event") => {
+                let mut effects = Vec::new();
                 for (tool_use_id, path) in generated_file_tool_uses(event) {
                     self.turn_manager.remember_generated_file(tool_use_id, path);
                 }
-                Vec::new()
+                if let Some(delta) = streamed_text_delta(event) {
+                    self.turn_manager.receive_stream_text_delta(delta);
+                }
+                if let Some(stop_reason) = streamed_stop_reason(event) {
+                    effects.extend(self.turn_manager.finish_stream_text_block(stop_reason));
+                }
+                effects
+            }
+            Some("content_block_delta") | Some("message_delta") => {
+                self.process_top_level_stream_event(event)
             }
             Some("tool_result") => self.process_tool_result_event(event),
             Some("user") | Some("human") => self.process_nested_tool_result_event(event),
@@ -238,6 +274,15 @@ impl WechatRuntime {
         };
         self.turn_manager
             .finish_turn(text.to_string(), received_at_ms)
+    }
+
+    fn process_top_level_stream_event(&mut self, event: &Value) -> Vec<WechatTurnEffect> {
+        if let Some(delta) = streamed_text_delta(event) {
+            self.turn_manager.receive_stream_text_delta(delta);
+        }
+        streamed_stop_reason(event)
+            .map(|stop_reason| self.turn_manager.finish_stream_text_block(stop_reason))
+            .unwrap_or_default()
     }
 
     fn process_tool_result_event(&mut self, event: &Value) -> Vec<WechatTurnEffect> {
@@ -283,6 +328,34 @@ impl WechatRuntime {
 
         effects
     }
+}
+
+fn streamed_text_delta(event: &Value) -> Option<&str> {
+    let event = event.get("event").unwrap_or(event);
+    if event.get("type").and_then(Value::as_str) != Some("content_block_delta") {
+        return None;
+    }
+    let delta = event.get("delta")?;
+    if delta.get("type").and_then(Value::as_str) != Some("text_delta") {
+        return None;
+    }
+    delta
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+fn streamed_stop_reason(event: &Value) -> Option<&str> {
+    let event = event.get("event").unwrap_or(event);
+    if event.get("type").and_then(Value::as_str) != Some("message_delta") {
+        return None;
+    }
+    event
+        .get("delta")
+        .and_then(|delta| delta.get("stop_reason").or_else(|| delta.get("stopReason")))
+        .or_else(|| event.get("stop_reason").or_else(|| event.get("stopReason")))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
 }
 
 fn generated_file_tool_uses(event: &Value) -> Vec<(String, String)> {
@@ -655,6 +728,238 @@ mod tests {
                     to_user_id: "user-1".into(),
                     context_token: "ctx-1".into(),
                     text: "answer from Claude".into(),
+                },
+                WechatTurnEffect::StopTyping {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_events_from_other_desktop_session_do_not_finish_wechat_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "hello")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let wrong_session_effects = runtime.process_stream_event_for_session(
+            Some("other-stdin"),
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "result": "other session answer"
+            }),
+            2_000,
+        );
+        let right_session_effects = runtime.process_stream_event_for_session(
+            Some("stdin-1"),
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "result": "wechat answer"
+            }),
+            3_000,
+        );
+
+        assert!(wrong_session_effects.is_empty());
+        assert_eq!(
+            right_session_effects,
+            vec![
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                    text: "wechat answer".into(),
+                },
+                WechatTurnEffect::StopTyping {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn streamed_tool_use_text_is_sent_before_final_result_without_duplicate_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "找图片")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        assert!(runtime
+            .process_stream_event(
+                &json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": { "type": "text_delta", "text": "找一下工作区里的图片。" }
+                    }
+                }),
+                2_000,
+            )
+            .is_empty());
+        let interstitial = runtime.process_stream_event(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" }
+                }
+            }),
+            2_100,
+        );
+        assert_eq!(
+            interstitial,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "找一下工作区里的图片。".into(),
+            }]
+        );
+
+        runtime.process_stream_event(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": { "type": "text_delta", "text": "找到了，发给你。" }
+                }
+            }),
+            3_000,
+        );
+        assert!(runtime
+            .process_stream_event(
+                &json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "end_turn" }
+                    }
+                }),
+                3_100,
+            )
+            .is_empty());
+
+        let finish = runtime.process_stream_event(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "result": "找一下工作区里的图片。\n\n找到了，发给你。"
+            }),
+            4_000,
+        );
+
+        assert_eq!(
+            finish,
+            vec![
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                    text: "找到了，发给你。".into(),
+                },
+                WechatTurnEffect::StopTyping {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn result_sends_remainder_after_streamed_interstitial_when_final_was_not_streamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let mut runtime = WechatRuntime::new(store);
+        runtime.connect();
+        runtime.set_desktop_session("stdin-1".into());
+        runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "查状态")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        runtime.process_stream_event(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": { "type": "text_delta", "text": "我先检查一下。" }
+                }
+            }),
+            2_000,
+        );
+        let interstitial = runtime.process_stream_event(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" }
+                }
+            }),
+            2_100,
+        );
+        assert_eq!(
+            interstitial,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "我先检查一下。".into(),
+            }]
+        );
+
+        let finish = runtime.process_stream_event(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "result": "我先检查一下。\n\n检查完了，当前状态正常。"
+            }),
+            4_000,
+        );
+
+        assert_eq!(
+            finish,
+            vec![
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user-1".into(),
+                    context_token: "ctx-1".into(),
+                    text: "检查完了，当前状态正常。".into(),
                 },
                 WechatTurnEffect::StopTyping {
                     to_user_id: "user-1".into(),

@@ -92,6 +92,70 @@ enum InboundWechatTurn {
     Media(InboundWechatMedia),
 }
 
+#[derive(Debug, Default)]
+struct WechatStreamTextState {
+    turn_buffer: String,
+    pending_final: String,
+    sent_texts: Vec<String>,
+}
+
+impl WechatStreamTextState {
+    fn clear(&mut self) {
+        self.turn_buffer.clear();
+        self.pending_final.clear();
+        self.sent_texts.clear();
+    }
+
+    fn push_delta(&mut self, delta: &str) {
+        self.turn_buffer.push_str(delta);
+    }
+
+    fn take_turn_buffer(&mut self) -> Option<String> {
+        let text = std::mem::take(&mut self.turn_buffer);
+        non_empty_text(text)
+    }
+
+    fn append_pending_final(&mut self, text: String) {
+        if self.pending_final.trim().is_empty() {
+            self.pending_final = text;
+        } else {
+            self.pending_final.push_str("\n\n");
+            self.pending_final.push_str(text.trim());
+        }
+    }
+
+    fn take_pending_final(&mut self) -> Option<String> {
+        let text = std::mem::take(&mut self.pending_final);
+        non_empty_text(text)
+    }
+
+    fn remember_sent(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.sent_texts.push(text.trim().to_string());
+        }
+    }
+
+    fn result_remainder_after_streaming(&self, result: String) -> Option<String> {
+        let mut remainder = result.trim().to_string();
+        for sent in &self.sent_texts {
+            let sent = sent.trim();
+            if sent.is_empty() {
+                continue;
+            }
+            if remainder == sent {
+                remainder.clear();
+                break;
+            }
+            if let Some(stripped) = remainder.strip_prefix(sent) {
+                remainder = stripped
+                    .trim_start_matches(|c: char| c.is_whitespace())
+                    .to_string();
+            }
+        }
+        non_empty_text(remainder)
+    }
+}
+
 impl InboundWechatTurn {
     fn message_id(&self) -> &str {
         match self {
@@ -130,6 +194,7 @@ pub struct WechatTurnManager {
     queue: VecDeque<InboundWechatTurn>,
     pending_permission: Option<WechatPermissionRequest>,
     pending_generated_files: HashMap<String, String>,
+    stream_text: WechatStreamTextState,
 }
 
 impl WechatTurnManager {
@@ -142,6 +207,7 @@ impl WechatTurnManager {
         self.queue.clear();
         self.pending_permission = None;
         self.pending_generated_files.clear();
+        self.stream_text.clear();
 
         let effects = self
             .active_turn
@@ -215,20 +281,43 @@ impl WechatTurnManager {
         self.pending_permission = None;
         self.pending_generated_files.clear();
 
-        let mut effects = vec![
-            WechatTurnEffect::SendWeChatText {
-                to_user_id: active_turn.from_user_id().to_string(),
-                context_token: active_turn.context_token().to_string(),
-                text,
-            },
-            WechatTurnEffect::StopTyping {
-                to_user_id: active_turn.from_user_id().to_string(),
-                context_token: active_turn.context_token().to_string(),
-            },
-        ];
+        let mut effects = self.drain_stream_text_for(&active_turn, text);
+        effects.push(WechatTurnEffect::StopTyping {
+            to_user_id: active_turn.from_user_id().to_string(),
+            context_token: active_turn.context_token().to_string(),
+        });
+        self.stream_text.clear();
         effects.extend(self.discard_stale(finished_at_ms));
         effects.extend(self.start_next_turn());
         effects
+    }
+
+    pub(crate) fn receive_stream_text_delta(&mut self, delta: &str) {
+        if self.active_turn.is_some() && !delta.is_empty() {
+            self.stream_text.push_delta(delta);
+        }
+    }
+
+    pub(crate) fn finish_stream_text_block(&mut self, stop_reason: &str) -> Vec<WechatTurnEffect> {
+        let Some(active_turn) = self.active_turn.as_ref() else {
+            self.stream_text.clear();
+            return Vec::new();
+        };
+        let Some(text) = self.stream_text.take_turn_buffer() else {
+            return Vec::new();
+        };
+
+        if stop_reason == "tool_use" {
+            self.stream_text.remember_sent(&text);
+            return vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: active_turn.from_user_id().to_string(),
+                context_token: active_turn.context_token().to_string(),
+                text,
+            }];
+        }
+
+        self.stream_text.append_pending_final(text);
+        Vec::new()
     }
 
     pub fn request_permission(
@@ -326,6 +415,7 @@ impl WechatTurnManager {
         self.queue.clear();
         self.pending_permission = None;
         self.pending_generated_files.clear();
+        self.stream_text.clear();
 
         let mut effects = Vec::new();
         if let Some(active_turn) = active_turn {
@@ -482,7 +572,49 @@ impl WechatTurnManager {
             context_token: next_turn.context_token().to_string(),
         });
         self.active_turn = Some(next_turn);
+        self.stream_text.clear();
         effects
+    }
+
+    fn drain_stream_text_for(
+        &mut self,
+        active_turn: &InboundWechatTurn,
+        fallback_result: String,
+    ) -> Vec<WechatTurnEffect> {
+        let mut effects = Vec::new();
+        if let Some(text) = self.stream_text.take_pending_final() {
+            self.stream_text.remember_sent(&text);
+            effects.push(send_text_to_turn(active_turn, text));
+        }
+        if let Some(text) = self.stream_text.take_turn_buffer() {
+            self.stream_text.remember_sent(&text);
+            effects.push(send_text_to_turn(active_turn, text));
+        }
+
+        if let Some(remainder) = self
+            .stream_text
+            .result_remainder_after_streaming(fallback_result)
+        {
+            effects.push(send_text_to_turn(active_turn, remainder));
+        }
+
+        effects
+    }
+}
+
+fn send_text_to_turn(active_turn: &InboundWechatTurn, text: String) -> WechatTurnEffect {
+    WechatTurnEffect::SendWeChatText {
+        to_user_id: active_turn.from_user_id().to_string(),
+        context_token: active_turn.context_token().to_string(),
+        text,
+    }
+}
+
+fn non_empty_text(text: String) -> Option<String> {
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 

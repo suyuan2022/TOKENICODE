@@ -1661,9 +1661,12 @@ fn cleanup_mcp_scratch_config(stdin_id: &str) {
 async fn dispatch_wechat_stream_event(
     runtime: &wechat::runtime::WechatRuntimeHandle,
     stdin_mgr: &StdinManager,
+    source_session_id: &str,
     event: &Value,
 ) {
-    let effects = runtime.process_stream_event(event, wechat::now_ms()).await;
+    let effects = runtime
+        .process_stream_event_for_session(Some(source_session_id), event, wechat::now_ms())
+        .await;
     if effects.is_empty() {
         return;
     }
@@ -2258,7 +2261,13 @@ async fn start_claude_session(
                 Err(_) => continue, // skip non-JSON lines
             };
 
-            dispatch_wechat_stream_event(&wechat_runtime_clone, &stdin_mgr_for_wechat, &json).await;
+            dispatch_wechat_stream_event(
+                &wechat_runtime_clone,
+                &stdin_mgr_for_wechat,
+                &sid_clone,
+                &json,
+            )
+            .await;
 
             // Intercept control_request messages for SDK control protocol routing.
             // All modes use --permission-prompt-tool stdio. In bypass mode, we
@@ -2362,6 +2371,7 @@ async fn start_claude_session(
                             dispatch_wechat_stream_event(
                                 &wechat_runtime_clone,
                                 &stdin_mgr_for_wechat,
+                                &sid_clone,
                                 &perm_payload,
                             )
                             .await;
