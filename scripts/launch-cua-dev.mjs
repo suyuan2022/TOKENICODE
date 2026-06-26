@@ -37,6 +37,11 @@ const launcherSourcePath = join(debugDir, `${launcherName}.c`);
 const logPath = '/tmp/tokenicode-cua-dev.log';
 const launchServicesRegister = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
 const codesignIdentityEnv = 'TOKENICODE_CUA_CODESIGN_IDENTITY';
+const installedTokenicodeAppMarkers = [
+  '/Applications/TOKENICODE.app/Contents/MacOS/',
+  '/Applications/TCAlpha.app/Contents/MacOS/',
+  '/Applications/tokenicode-7.app/Contents/MacOS/',
+];
 
 const tauriConfig = {
   productName: appName,
@@ -261,6 +266,24 @@ async function stopOldCuaDevInstances() {
     })
     .map((proc) => proc.pid);
   return terminatePids(currentPids, 'old TOKENICODE development process tree');
+}
+
+function runningInstalledTokenicodeApps() {
+  return listProcesses()
+    .filter((proc) => installedTokenicodeAppMarkers.some((marker) => proc.command.includes(marker)))
+    .map((proc) => ({
+      pid: proc.pid,
+      command: proc.command.split(/\s+/)[0],
+    }));
+}
+
+function warnAboutInstalledTokenicodeApps(apps) {
+  if (apps.length === 0) return;
+  log(
+    'warning: installed TOKENICODE app(s) are running and may consume WeChat iLink updates before this CUA dev app. '
+    + 'Quit them before WeChat manual tests: '
+    + apps.map((app) => `${app.pid}:${app.command}`).join(', '),
+  );
 }
 
 function portOpen(port) {
@@ -560,6 +583,9 @@ async function verifyLaunch() {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
+  const installedAppConflicts = runningInstalledTokenicodeApps();
+  warnAboutInstalledTokenicodeApps(installedAppConflicts);
+
   const stopped = await stopOldCuaDevInstances();
   const devServer = await ensureFreshDevServer();
 
@@ -584,6 +610,7 @@ async function main() {
     devServer,
     wrapper,
     verification,
+    installedAppConflicts,
     computerUseTarget: wrapperApp,
   }, null, 2) + '\n');
 }
