@@ -218,7 +218,7 @@ export function WechatTab() {
             <img
               src={qrcodeImage}
               alt={t('wechat.qrAlt')}
-              className="h-96 w-96 shrink-0 rounded-lg border border-border-subtle bg-white p-4 shadow-sm [image-rendering:pixelated]"
+              className="h-80 w-80 shrink-0 rounded-lg border border-border-subtle bg-white p-3 shadow-sm [image-rendering:pixelated]"
             />
             <div className="min-w-0 pt-2">
               <div className="text-[13px] font-medium text-text-primary">
