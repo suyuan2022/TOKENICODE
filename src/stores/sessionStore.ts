@@ -109,6 +109,32 @@ function restoreWechatRemoteCliResumeId(
   );
 }
 
+function materializeWechatRemoteSession(
+  sessions: SessionListItem[],
+  backingSession: SessionListItem | undefined,
+  cliResumeId: string | null,
+): SessionListItem[] {
+  if (!backingSession || !cliResumeId) {
+    return restoreWechatRemoteCliResumeId(sessions, cliResumeId);
+  }
+
+  const sessionsWithRemote = sessions.some((session) => isWechatRemoteSessionId(session.id))
+    ? sessions
+    : upsertWechatRemoteSession(sessions, backingSession.project, backingSession.modifiedAt);
+
+  return sessionsWithRemote.map((session) => {
+    if (!isWechatRemoteSessionId(session.id)) return session;
+    return {
+      ...session,
+      path: backingSession.path,
+      project: session.project || backingSession.project,
+      projectDir: session.projectDir || backingSession.projectDir,
+      modifiedAt: Math.max(session.modifiedAt || 0, backingSession.modifiedAt || 0),
+      cliResumeId,
+    };
+  });
+}
+
 function isLegacyWechatRemoteBootstrapSession(session: SessionListItem): boolean {
   const preview = session.preview.trim();
   return preview.startsWith('微信接入初始化，请只回复')
@@ -197,6 +223,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       const diskSessions = await bridge.listSessions();
       const existing = get().sessions;
       const wechatRemoteCliResumeId = getWechatRemoteCliResumeId(existing);
+      const wechatRemoteBackingSession = wechatRemoteCliResumeId
+        ? diskSessions.find((session) => session.id === wechatRemoteCliResumeId)
+        : undefined;
       const hiddenWechatSessionIds = loadWechatRemoteHiddenSessionIds();
       if (wechatRemoteCliResumeId) hiddenWechatSessionIds.add(wechatRemoteCliResumeId);
       const visibleDiskSessions = diskSessions.filter((session) => {
@@ -216,8 +245,9 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
         const mem = existing.find((s) => s.id === d.id);
         return mem?.cliResumeId ? { ...d, cliResumeId: mem.cliResumeId } : d;
       });
-      const sessions = restoreWechatRemoteCliResumeId(
+      const sessions = materializeWechatRemoteSession(
         [...drafts, ...merged],
+        wechatRemoteBackingSession,
         wechatRemoteCliResumeId,
       );
       const selectedSessionId = hiddenWechatSessionIds.has(get().selectedSessionId || '')
@@ -329,12 +359,15 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   getTabForStdin: (stdinId) => get().stdinToTab[stdinId],
 
   setCliResumeId: (sessionId, cliResumeId) => set((state) => {
-    if (isWechatRemoteSessionId(sessionId)) {
+    const isWechatRemoteSession = isWechatRemoteSessionId(sessionId);
+    if (isWechatRemoteSession) {
       saveWechatRemoteCliResumeId(cliResumeId);
     }
     return {
       sessions: state.sessions.map((s) =>
-        s.id === sessionId ? { ...s, cliResumeId } : s,
+        s.id === sessionId
+          ? { ...s, cliResumeId, ...(isWechatRemoteSession && !cliResumeId ? { path: '' } : {}) }
+          : s,
       ),
     };
   }),

@@ -334,6 +334,7 @@ export function ConversationList() {
   // --- Session loading (slim version using session-loader) ---
   const handleLoadSession = useCallback(async (session: SessionListItem) => {
     const { path: sessionPath, id: sessionId, project: projectOrDir } = session;
+    const cliResumeId = session.cliResumeId || sessionId;
     const currentTabId = selectedId;
     if (currentTabId === sessionId) return;
 
@@ -384,9 +385,9 @@ export function ConversationList() {
     // TK-329: explicitly clear stdinId when loading from disk — no live process exists yet.
     // Only set the CLI UUID (for resume). Prevents inheriting a stale stdinId
     // from a previous session that might still be alive in the backend.
-    setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+    setSessionMeta(sessionId, { sessionId: cliResumeId, stdinId: undefined });
     // PRD §9: Write cliResumeId in sessionStore — InputBar reads this for resume
-    useSessionStore.getState().setCliResumeId(sessionId, sessionId);
+    useSessionStore.getState().setCliResumeId(sessionId, cliResumeId);
 
     try {
       const rawMessages = await bridge.loadSession(sessionPath);

@@ -114,8 +114,68 @@ describe('sessionStore WeChat remote session', () => {
     expect(
       state.sessions.find((session) => session.id === WECHAT_REMOTE_SESSION_ID)?.cliResumeId,
     ).toBe('real-wechat-session');
+    expect(
+      state.sessions.find((session) => session.id === WECHAT_REMOTE_SESSION_ID)?.path,
+    ).toBe('/sessions/real-wechat-session.jsonl');
     expect(state.selectedSessionId).toBe(WECHAT_REMOTE_SESSION_ID);
     expect(sessionStorage.getItem('tokenicode_last_session')).toBe(WECHAT_REMOTE_SESSION_ID);
+  });
+
+  it('restores the fixed WeChat row from the saved backing CLI session after app restart', async () => {
+    localStorage.setItem('tokenicode_wechat_remote_cli_resume_id', 'real-wechat-session');
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === 'list_sessions') {
+        return Promise.resolve([
+          diskSession('real-wechat-session', '微信接入初始化，请只回复：已准备好。'),
+          diskSession('normal-session', 'normal task'),
+        ]);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { useSessionStore } = await import('../sessionStore');
+    const store = useSessionStore.getState();
+
+    await store.fetchSessions();
+
+    const fixed = useSessionStore.getState().sessions.find(
+      (session) => session.id === WECHAT_REMOTE_SESSION_ID,
+    );
+    expect(fixed).toMatchObject({
+      id: WECHAT_REMOTE_SESSION_ID,
+      path: '/sessions/real-wechat-session.jsonl',
+      project: '/project',
+      cliResumeId: 'real-wechat-session',
+    });
+    expect(useSessionStore.getState().sessions.map((session) => session.id)).toEqual([
+      WECHAT_REMOTE_SESSION_ID,
+      'normal-session',
+    ]);
+  });
+
+  it('clears the fixed WeChat backing path when the remote context is cleared', async () => {
+    const { useSessionStore } = await import('../sessionStore');
+    const store = useSessionStore.getState();
+
+    store.ensureWechatRemoteSession('/project');
+    store.setCliResumeId(WECHAT_REMOTE_SESSION_ID, 'real-wechat-session');
+    await store.fetchSessions();
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === WECHAT_REMOTE_SESSION_ID
+          ? { ...session, path: '/sessions/real-wechat-session.jsonl' }
+          : session,
+      ),
+    }));
+
+    store.setCliResumeId(WECHAT_REMOTE_SESSION_ID, null);
+
+    const fixed = useSessionStore.getState().sessions.find(
+      (session) => session.id === WECHAT_REMOTE_SESSION_ID,
+    );
+    expect(fixed?.cliResumeId).toBeNull();
+    expect(fixed?.path).toBe('');
+    expect(localStorage.getItem('tokenicode_wechat_remote_cli_resume_id')).toBeNull();
   });
 
   it('hides legacy WeChat initialization sessions that were created before backing ids were tracked', async () => {
