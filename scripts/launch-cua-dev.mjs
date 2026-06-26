@@ -36,6 +36,7 @@ const launcherPath = join(wrapperApp, 'Contents', 'MacOS', launcherName);
 const launcherSourcePath = join(debugDir, `${launcherName}.c`);
 const logPath = '/tmp/tokenicode-cua-dev.log';
 const launchServicesRegister = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
+const codesignIdentityEnv = 'TOKENICODE_CUA_CODESIGN_IDENTITY';
 
 const tauriConfig = {
   productName: appName,
@@ -423,19 +424,48 @@ int main(void) {
   chmodSync(launcherPath, 0o755);
 }
 
+function codesignIdentities() {
+  return capture('security', ['find-identity', '-v', '-p', 'codesigning'])
+    .split('\n')
+    .map((line) => line.match(/^\s*\d+\)\s+[A-Fa-f0-9]+\s+"(.+)"\s*$/)?.[1])
+    .filter(Boolean);
+}
+
+function preferredCodesignIdentity() {
+  const configured = process.env[codesignIdentityEnv]?.trim();
+  if (configured) return configured;
+
+  const identities = codesignIdentities();
+  return identities.find((identity) => identity.includes('CUA Dev Local'))
+    || identities.find((identity) => identity.startsWith('Apple Development:'))
+    || identities.find((identity) => identity.startsWith('Developer ID Application:'))
+    || null;
+}
+
+function runCodesign(identity) {
+  execFileSync(
+    'codesign',
+    ['--force', '--deep', '--sign', identity, '--timestamp=none', wrapperApp],
+    { cwd: projectRoot, stdio: 'ignore', env: cuaEnv() },
+  );
+}
+
 function signWrapper() {
-  try {
-    log(`codesign --force --deep --sign - ${wrapperApp}`);
-    execFileSync(
-      'codesign',
-      ['--force', '--deep', '--sign', '-', '--timestamp=none', wrapperApp],
-      { cwd: projectRoot, stdio: 'ignore', env: cuaEnv() },
-    );
-    return { signed: true, identity: 'adhoc' };
-  } catch {
-    log('ad-hoc codesign failed; continuing with unsigned debug wrapper');
-    return { signed: false, identity: null };
+  const identity = preferredCodesignIdentity();
+  const candidates = identity ? [identity, '-'] : ['-'];
+  for (const candidate of candidates) {
+    try {
+      log(`codesign --force --deep --sign ${candidate === '-' ? '-' : `"${candidate}"`} ${wrapperApp}`);
+      runCodesign(candidate);
+      return { signed: true, identity: candidate === '-' ? 'adhoc' : candidate };
+    } catch {
+      if (candidate !== '-') {
+        log(`codesign identity "${candidate}" failed; falling back to ad-hoc signing`);
+      }
+    }
   }
+  log('codesign failed; continuing with unsigned debug wrapper');
+  return { signed: false, identity: null };
 }
 
 function writeWrapperApp() {
@@ -515,7 +545,7 @@ async function verifyLaunch() {
   const windowTitles = await waitFor(() => {
     const titles = processWindowTitles(pid);
     return titles.some((title) => title.includes(appName)) ? titles : null;
-  }, 15_000, 250);
+  }, 60_000, 250);
   if (!windowTitles) throw new Error(`Dev app process ${pid} did not expose a ${appName} window`);
 
   const bundle = processBundleId(pid);
