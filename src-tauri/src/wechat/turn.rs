@@ -9,7 +9,7 @@ const STOP_CONFIRM_NOTICE: &str = "已停止当前任务，并清空排队消息
 const STOP_IDLE_NOTICE: &str = "当前没有正在运行的任务。";
 const CLEAR_CONTEXT_NOTICE: &str = "已清空当前「微信接入」上下文。";
 const CLEAR_WHILE_RUNNING_NOTICE: &str = "当前任务正在运行，请先发送 /stop，再发送 /clear。";
-const HELP_NOTICE: &str = "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n/clear 或 /new 清空当前「微信接入」上下文\n\n权限请求时，回复 approve/deny 或 同意/拒绝。";
+const HELP_NOTICE: &str = "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n/clear 或 /new 清空当前「微信接入」上下文";
 const NO_DESKTOP_SESSION_NOTICE: &str =
     "微信已连接，但还没有绑定 TOKENICODE 的「微信接入」专用窗口。请先在桌面左侧打开「微信接入」并启动一次会话。";
 
@@ -803,7 +803,7 @@ mod tests {
             vec![WechatTurnEffect::SendWeChatText {
                 to_user_id: "user@im.wechat".into(),
                 context_token: "ctx-msg-1".into(),
-                text: "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n/clear 或 /new 清空当前「微信接入」上下文\n\n权限请求时，回复 approve/deny 或 同意/拒绝。"
+                text: "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n/clear 或 /new 清空当前「微信接入」上下文"
                     .into(),
             }],
         );
