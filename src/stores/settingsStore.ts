@@ -59,6 +59,7 @@ interface SettingsState {
   secondaryPanelWidth: number;
   settingsOpen: boolean;
   workingDirectory: string;
+  wechatWorkspacePath: string;
   selectedModel: string;
   sessionMode: SessionMode;
   locale: Locale;
@@ -104,6 +105,7 @@ interface SettingsState {
   setSecondaryPanelWidth: (width: number) => void;
   toggleSettings: () => void;
   setWorkingDirectory: (dir: string) => void;
+  setWechatWorkspacePath: (dir: string) => void;
   setSelectedModel: (model: string) => void;
   setSessionMode: (mode: SessionMode) => void;
   setLocale: (locale: Locale) => void;
@@ -146,6 +148,7 @@ export const useSettingsStore = create<SettingsState>()(
       settingsOpen: false,
       agentPanelOpen: false,
       workingDirectory: '',
+      wechatWorkspacePath: '',
       selectedModel: 'claude-sonnet-4-6',
       sessionMode: 'bypass',
       locale: 'zh',
@@ -200,6 +203,9 @@ export const useSettingsStore = create<SettingsState>()(
 
       setWorkingDirectory: (dir) =>
         set(() => ({ workingDirectory: dir })),
+
+      setWechatWorkspacePath: (dir) =>
+        set(() => ({ wechatWorkspacePath: dir.trim() })),
 
       setSelectedModel: (model) => {
         const old = get().selectedModel;
@@ -339,6 +345,7 @@ export const useSettingsStore = create<SettingsState>()(
         locale: state.locale,
         fontSize: state.fontSize,
         sidebarWidth: state.sidebarWidth,
+        wechatWorkspacePath: state.wechatWorkspacePath,
         setupCompleted: state.setupCompleted,
         thinkingLevel: state.thinkingLevel,
         updateAvailable: state.updateAvailable,

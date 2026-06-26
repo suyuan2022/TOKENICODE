@@ -3,6 +3,7 @@ import {
   WECHAT_REMOTE_SESSION_ID,
   WECHAT_REMOTE_SESSION_TITLE,
   createWechatRemoteSession,
+  resolveWechatRemoteWorkspace,
   upsertWechatRemoteSession,
 } from '../wechat-session';
 import type { SessionListItem } from '../tauri-bridge';
@@ -39,5 +40,25 @@ describe('WeChat fixed remote session', () => {
     expect(next.map((item) => item.id)).toEqual([WECHAT_REMOTE_SESSION_ID, 'normal']);
     expect(next.filter((item) => item.id === WECHAT_REMOTE_SESSION_ID)).toHaveLength(1);
     expect(next[0].modifiedAt).toBe(200);
+  });
+
+  it('uses the bound workspace before the active desktop workspace', () => {
+    expect(resolveWechatRemoteWorkspace('/bound', '/current', '/fallback')).toBe('/bound');
+    expect(resolveWechatRemoteWorkspace('  /bound  ', '/current', '/fallback')).toBe('/bound');
+    expect(resolveWechatRemoteWorkspace('', '/current', '/fallback')).toBe('/current');
+    expect(resolveWechatRemoteWorkspace('', '', '/fallback')).toBe('/fallback');
+  });
+
+  it('moves the fixed WeChat session when the bound workspace changes', () => {
+    const sessions = upsertWechatRemoteSession([session('normal')], '/old', 100);
+    const next = upsertWechatRemoteSession(sessions, '/new', 200);
+
+    expect(next[0]).toMatchObject({
+      id: WECHAT_REMOTE_SESSION_ID,
+      project: '/new',
+      projectDir: '-new',
+      modifiedAt: 200,
+    });
+    expect(next.map((item) => item.id)).toEqual([WECHAT_REMOTE_SESSION_ID, 'normal']);
   });
 });

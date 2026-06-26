@@ -41,6 +41,7 @@ describe('ensureWechatRemoteSession', () => {
     const stdinId = await ensureWechatRemoteSession({
       ...fakeBootstrapDeps(spawnCalls),
       getExistingStdinId: () => 'stdin-existing',
+      getExistingCwd: () => '/repo',
     });
 
     expect(stdinId).toBe('stdin-existing');
@@ -84,6 +85,42 @@ describe('ensureWechatRemoteSession', () => {
     expect(pollingRoutes).toEqual(['stdin-wechat-auto']);
     expect(touches).toEqual([{ preview: '微信接入', modifiedAt: 1234 }]);
     expect(metas.some((entry) => entry.meta.stdinReady === false)).toBe(true);
+  });
+
+  it('does not resume an old CLI session when pre-warming a bound workspace', async () => {
+    const spawnCalls: any[] = [];
+
+    await ensureWechatRemoteSession({
+      ...fakeBootstrapDeps(spawnCalls),
+      getCliResumeId: () => 'old-wechat-cli-session',
+    });
+
+    expect(spawnCalls[0].sessionParams.resume_session_id).toBeUndefined();
+  });
+
+  it('restarts the fixed WeChat process when the bound workspace changes', async () => {
+    const spawnCalls: any[] = [];
+    const stopped: string[] = [];
+
+    const stdinId = await ensureWechatRemoteSession({
+      ...fakeBootstrapDeps(spawnCalls),
+      getWorkingDirectory: () => '/new-repo',
+      getExistingStdinId: () => 'stdin-old',
+      getExistingCwd: () => '/old-repo',
+      stopExistingSession: async (oldStdinId) => {
+        stopped.push(oldStdinId);
+      },
+    });
+
+    expect(stopped).toEqual(['stdin-old']);
+    expect(stdinId).toBe('stdin-wechat-auto');
+    expect(spawnCalls[0]).toMatchObject({
+      tabId: WECHAT_REMOTE_SESSION_ID,
+      cwdSnapshot: '/new-repo',
+      sessionParams: {
+        cwd: '/new-repo',
+      },
+    });
   });
 });
 
@@ -261,6 +298,7 @@ function fakeBootstrapDeps(spawnCalls: unknown[]) {
   return {
     getWorkingDirectory: () => '/repo',
     getExistingStdinId: () => undefined,
+    getExistingCwd: () => undefined,
     getSettings: () => ({
       selectedModel: 'claude-opus-4-6',
       thinkingLevel: 'medium',
@@ -285,6 +323,7 @@ function fakeBootstrapDeps(spawnCalls: unknown[]) {
       };
     },
     startPolling: async () => {},
+    stopExistingSession: async () => {},
     makeStdinId: () => 'stdin-wechat-auto',
     onStream: () => {},
     onStderr: () => {},

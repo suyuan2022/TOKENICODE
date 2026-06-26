@@ -16,7 +16,7 @@ import { useGroupStore } from '../../stores/groupStore';
 import { initGroupPersistence } from '../../stores/groupPersistence';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { teardownSession, waitForStdinCleared } from '../../lib/sessionLifecycle';
-import { isWechatRemoteSessionId } from '../../lib/wechat-session';
+import { isWechatRemoteSessionId, resolveWechatRemoteWorkspace } from '../../lib/wechat-session';
 
 // --- Path utilities ---
 
@@ -111,6 +111,7 @@ export function ConversationList() {
   const clearContentSearch = useSessionStore((s) => s.clearContentSearch);
   const ensureWechatRemoteSession = useSessionStore((s) => s.ensureWechatRemoteSession);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
+  const wechatWorkspacePath = useSettingsStore((s) => s.wechatWorkspacePath);
 
   // Context menus
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -216,13 +217,14 @@ export function ConversationList() {
   useEffect(() => {
     const selectedSession = sessions.find((session) => session.id === selectedId);
     const fallbackSession = sessions.find((session) => !isWechatRemoteSessionId(session.id));
-    const projectPath = workingDirectory
-      || selectedSession?.project
-      || fallbackSession?.project
-      || '';
+    const projectPath = resolveWechatRemoteWorkspace(
+      wechatWorkspacePath,
+      workingDirectory,
+      selectedSession?.project || fallbackSession?.project || '',
+    );
     if (!projectPath) return;
     ensureWechatRemoteSession(projectPath);
-  }, [ensureWechatRemoteSession, selectedId, sessions.length, workingDirectory]);
+  }, [ensureWechatRemoteSession, selectedId, sessions.length, wechatWorkspacePath, workingDirectory]);
 
   // Listen for sessions:changed event for instant refresh
   useEffect(() => {

@@ -23,6 +23,17 @@ export function createWechatRemoteSession(
   };
 }
 
+export function resolveWechatRemoteWorkspace(
+  boundWorkspacePath: string | null | undefined,
+  activeWorkspacePath: string | null | undefined,
+  fallbackWorkspacePath: string | null | undefined = '',
+): string {
+  return boundWorkspacePath?.trim()
+    || activeWorkspacePath?.trim()
+    || fallbackWorkspacePath?.trim()
+    || '';
+}
+
 export function upsertWechatRemoteSession(
   sessions: SessionListItem[],
   projectPath: string,

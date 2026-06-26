@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { open } from '@tauri-apps/plugin-dialog';
 import {
   bridge,
   onWechatStatus,
@@ -7,7 +8,12 @@ import {
 } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { showToast } from '../shared/Toast';
-import { WECHAT_CONNECTED_EVENT } from '../../lib/wechat-session';
+import { useSessionStore } from '../../stores/sessionStore';
+import { useSettingsStore } from '../../stores/settingsStore';
+import {
+  WECHAT_CONNECTED_EVENT,
+  resolveWechatRemoteWorkspace,
+} from '../../lib/wechat-session';
 import {
   resolveWechatQrPollResult,
   resolveWechatStatusPhase,
@@ -16,8 +22,21 @@ import {
 
 const QR_EXPIRES_AFTER_MS = 140_000;
 
+function workspaceLabel(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+function compactWorkspacePath(path: string): string {
+  return path.replace(/^\/Users\/[^/]+/, '~');
+}
+
 export function WechatTab() {
   const t = useT();
+  const sessions = useSessionStore((state) => state.sessions);
+  const ensureWechatRemoteSession = useSessionStore((state) => state.ensureWechatRemoteSession);
+  const workingDirectory = useSettingsStore((state) => state.workingDirectory);
+  const wechatWorkspacePath = useSettingsStore((state) => state.wechatWorkspacePath);
+  const setWechatWorkspacePath = useSettingsStore((state) => state.setWechatWorkspacePath);
   const [phase, setPhase] = useState<WechatPhase>('loading');
   const [account, setAccount] = useState<WechatAccountInfo | null>(null);
   const [qrcodeId, setQrcodeId] = useState('');
@@ -28,6 +47,40 @@ export function WechatTab() {
   const [pollBaseUrl, setPollBaseUrl] = useState('');
   const [message, setMessage] = useState('');
   const pollingRef = useRef(false);
+  const workspaceOptions = useMemo(() => {
+    const paths = [
+      wechatWorkspacePath,
+      workingDirectory,
+      ...sessions.map((session) => session.project || session.projectDir),
+    ]
+      .map((path) => path?.trim())
+      .filter((path): path is string => Boolean(path));
+    return Array.from(new Set(paths));
+  }, [sessions, wechatWorkspacePath, workingDirectory]);
+  const effectiveWorkspacePath = resolveWechatRemoteWorkspace(
+    wechatWorkspacePath,
+    workingDirectory,
+  );
+
+  const bindWorkspace = useCallback((path: string) => {
+    setWechatWorkspacePath(path);
+    const nextWorkspace = resolveWechatRemoteWorkspace(path, workingDirectory);
+    if (nextWorkspace) {
+      ensureWechatRemoteSession(nextWorkspace);
+      window.dispatchEvent(new Event(WECHAT_CONNECTED_EVENT));
+    }
+  }, [ensureWechatRemoteSession, setWechatWorkspacePath, workingDirectory]);
+
+  const chooseWorkspace = useCallback(async () => {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: t('wechat.workspaceSelectTitle'),
+    });
+    if (typeof selected === 'string') {
+      bindWorkspace(selected);
+    }
+  }, [bindWorkspace, t]);
 
   const applyStatus = useCallback((status: WechatStatus) => {
     setAccount(status.account);
@@ -267,6 +320,58 @@ export function WechatTab() {
             {phase === 'sessionExpired' ? t('wechat.sessionExpiredDetail') : message}
           </div>
         )}
+      </div>
+
+      <div className="rounded-lg border border-border-subtle bg-bg-secondary/40 p-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium text-text-primary">
+              {t('wechat.workspaceBinding')}
+            </div>
+            <div className="mt-1 text-xs text-text-tertiary leading-relaxed">
+              {effectiveWorkspacePath
+                ? t('wechat.workspaceBindingDetail').replace(
+                  '{workspace}',
+                  compactWorkspacePath(effectiveWorkspacePath),
+                )
+                : t('wechat.workspaceBindingEmpty')}
+            </div>
+          </div>
+          {workingDirectory && (
+            <button
+              onClick={() => bindWorkspace(workingDirectory)}
+              className="shrink-0 px-3 py-1.5 text-[13px] font-medium rounded-lg border border-border-subtle
+                text-text-muted hover:bg-bg-tertiary hover:text-text-primary transition-smooth"
+            >
+              {t('wechat.bindCurrentWorkspace')}
+            </button>
+          )}
+        </div>
+
+        <div className="mt-3 flex items-center gap-2">
+          <select
+            value={wechatWorkspacePath}
+            onChange={(event) => bindWorkspace(event.target.value)}
+            className="min-w-0 flex-1 rounded-lg border border-border-subtle bg-bg-primary px-3 py-2
+              text-[13px] text-text-primary outline-none focus:border-accent"
+          >
+            <option value="">
+              {t('wechat.followCurrentWorkspace')}
+            </option>
+            {workspaceOptions.map((path) => (
+              <option key={path} value={path}>
+                {workspaceLabel(path)} · {compactWorkspacePath(path)}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={chooseWorkspace}
+            className="px-3 py-2 text-[13px] font-medium rounded-lg border border-border-subtle
+              text-text-muted hover:bg-bg-tertiary hover:text-text-primary transition-smooth"
+          >
+            {t('wechat.chooseWorkspace')}
+          </button>
+        </div>
       </div>
     </div>
   );

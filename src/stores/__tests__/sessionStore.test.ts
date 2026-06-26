@@ -143,4 +143,20 @@ describe('sessionStore WeChat remote session', () => {
       'legacy-wechat-session',
     );
   });
+
+  it('moves the fixed WeChat session to a newly bound workspace', async () => {
+    const { useSessionStore } = await import('../sessionStore');
+    const store = useSessionStore.getState();
+
+    store.ensureWechatRemoteSession('/old-project');
+    store.ensureWechatRemoteSession('/new-project');
+
+    const state = useSessionStore.getState();
+    const fixedSessions = state.sessions.filter((session) => session.id === WECHAT_REMOTE_SESSION_ID);
+    expect(fixedSessions).toHaveLength(1);
+    expect(fixedSessions[0]).toMatchObject({
+      project: '/new-project',
+      projectDir: '-new-project',
+    });
+  });
 });
