@@ -46,6 +46,8 @@ export function WechatTab() {
   const [now, setNow] = useState(() => Date.now());
   const [pollBaseUrl, setPollBaseUrl] = useState('');
   const [message, setMessage] = useState('');
+  const [splitOutboundTextByLineBreaks, setSplitOutboundTextByLineBreaks] = useState(true);
+  const [savingPreferences, setSavingPreferences] = useState(false);
   const pollingRef = useRef(false);
   const workspaceOptions = useMemo(() => {
     const paths = [
@@ -103,6 +105,35 @@ export function WechatTab() {
   useEffect(() => {
     refreshStatus();
   }, [refreshStatus]);
+
+  useEffect(() => {
+    let disposed = false;
+    bridge.wechatGetPreferences()
+      .then((preferences) => {
+        if (!disposed) {
+          setSplitOutboundTextByLineBreaks(preferences.splitOutboundTextByLineBreaks);
+        }
+      })
+      .catch((err) => setMessage(String(err)));
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const updateSplitOutboundTextByLineBreaks = useCallback(async (enabled: boolean) => {
+    const previous = splitOutboundTextByLineBreaks;
+    setSplitOutboundTextByLineBreaks(enabled);
+    setSavingPreferences(true);
+    try {
+      const preferences = await bridge.wechatSetPreferences(enabled);
+      setSplitOutboundTextByLineBreaks(preferences.splitOutboundTextByLineBreaks);
+    } catch (err) {
+      setSplitOutboundTextByLineBreaks(previous);
+      showToast(String(err), 'error');
+    } finally {
+      setSavingPreferences(false);
+    }
+  }, [splitOutboundTextByLineBreaks]);
 
   useEffect(() => {
     let disposed = false;
@@ -320,6 +351,35 @@ export function WechatTab() {
             {phase === 'sessionExpired' ? t('wechat.sessionExpiredDetail') : message}
           </div>
         )}
+      </div>
+
+      <div className="rounded-lg border border-border-subtle bg-bg-secondary/40 p-4">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium text-text-primary">
+              {t('wechat.replySegmentation')}
+            </div>
+            <div className="mt-1 text-xs text-text-tertiary leading-relaxed">
+              {t('wechat.replySegmentationDetail')}
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={splitOutboundTextByLineBreaks}
+            disabled={savingPreferences}
+            onClick={() => updateSplitOutboundTextByLineBreaks(!splitOutboundTextByLineBreaks)}
+            className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-60 ${
+              splitOutboundTextByLineBreaks ? 'bg-accent' : 'bg-bg-tertiary'
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                splitOutboundTextByLineBreaks ? 'translate-x-5' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
+        </div>
       </div>
 
       <div className="rounded-lg border border-border-subtle bg-bg-secondary/40 p-4">

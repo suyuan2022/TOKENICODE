@@ -12,7 +12,7 @@ use crate::{
         now_ms,
         poller::WechatPollingTask,
         runtime::WechatRuntimeHandle,
-        store::{default_wechat_state_store, WechatAccount, WechatStateStore},
+        store::{default_wechat_state_store, WechatAccount, WechatPreferences, WechatStateStore},
     },
 };
 
@@ -58,6 +58,22 @@ pub struct WechatQrPollResponse {
     pub message: Option<String>,
     pub account: Option<WechatAccountInfo>,
     pub redirect_base_url: Option<String>,
+}
+
+#[tauri::command]
+pub fn wechat_get_preferences() -> Result<WechatPreferences, String> {
+    state_store().load_preferences()
+}
+
+#[tauri::command]
+pub fn wechat_set_preferences(
+    split_outbound_text_by_line_breaks: bool,
+) -> Result<WechatPreferences, String> {
+    let preferences = WechatPreferences {
+        split_outbound_text_by_line_breaks,
+    };
+    state_store().save_preferences(&preferences)?;
+    Ok(preferences)
 }
 
 #[tauri::command]

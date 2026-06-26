@@ -404,6 +404,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'wechat.followCurrentWorkspace': '跟随当前工作区',
     'wechat.chooseWorkspace': '选择文件夹…',
     'wechat.workspaceSelectTitle': '选择微信接入绑定工作区',
+    'wechat.replySegmentation': '按段发送回复',
+    'wechat.replySegmentationDetail': '开启后，按 Claude 的原始换行把回复拆成多条微信消息；关闭后合并发送。',
 
     // Provider
     'provider.title': 'API 提供商',
@@ -1161,6 +1163,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'wechat.followCurrentWorkspace': 'Follow current workspace',
     'wechat.chooseWorkspace': 'Choose folder…',
     'wechat.workspaceSelectTitle': 'Choose bound workspace for WeChat',
+    'wechat.replySegmentation': 'Send Replies by Paragraph',
+    'wechat.replySegmentationDetail': 'When enabled, Claude line breaks become separate WeChat messages. Turn it off to send one combined reply.',
 
     // Provider
     'provider.title': 'API Provider',

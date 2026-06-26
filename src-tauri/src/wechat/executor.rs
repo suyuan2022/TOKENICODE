@@ -406,12 +406,17 @@ where
         } => {
             let context_token = resolve_context_token(store, to_user_id, context_token)?;
             let filtered_text = filter_wechat_markdown(text);
-            let chunks = split_wechat_text_messages(&filtered_text);
+            let preferences = store.load_preferences()?;
+            let chunks = split_wechat_text_messages_with_preferences(
+                &filtered_text,
+                preferences.split_outbound_text_by_line_breaks,
+            );
             eprintln!(
-                "[WeChat] sending text reply as {} message(s), original_chars={}, filtered_chars={}",
+                "[WeChat] sending text reply as {} message(s), original_chars={}, filtered_chars={}, line_split={}",
                 chunks.len(),
                 text.chars().count(),
-                filtered_text.chars().count()
+                filtered_text.chars().count(),
+                preferences.split_outbound_text_by_line_breaks
             );
             for chunk in chunks {
                 let request =
@@ -1135,7 +1140,14 @@ fn split_wechat_text_chunks(text: &str) -> Vec<String> {
     chunks
 }
 
-fn split_wechat_text_messages(text: &str) -> Vec<String> {
+fn split_wechat_text_messages_with_preferences(text: &str, split_line_breaks: bool) -> Vec<String> {
+    if !split_line_breaks {
+        return split_wechat_text_chunks(text)
+            .into_iter()
+            .filter(|chunk| !chunk.trim().is_empty())
+            .collect();
+    }
+
     split_wechat_line_units(text)
         .into_iter()
         .flat_map(|unit| split_wechat_text_chunks(&unit))
@@ -1976,6 +1988,46 @@ mod tests {
                 "但坚果云赢在不用管。\n```ts\nconst size = \"50G\";\nconsole.log(size);\n```",
                 "下一步看文件大小。",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_wechat_text_effect_can_keep_line_breaks_in_one_wechat_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        store
+            .save_preferences(&crate::wechat::store::WechatPreferences {
+                split_outbound_text_by_line_breaks: false,
+            })
+            .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "第一段\n第二段\n第三段".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
+            "第一段\n第二段\n第三段"
         );
     }
 

@@ -140,6 +140,10 @@ export interface WechatStatus {
   account: WechatAccountInfo | null;
 }
 
+export interface WechatPreferences {
+  splitOutboundTextByLineBreaks: boolean;
+}
+
 export interface WechatStatusEvent {
   status: 'sessionExpired' | string;
   connected: boolean;
@@ -468,6 +472,14 @@ export const bridge = {
 
   wechatGetStatus: () =>
     invoke<WechatStatus>('wechat_get_status'),
+
+  wechatGetPreferences: () =>
+    invoke<WechatPreferences>('wechat_get_preferences'),
+
+  wechatSetPreferences: (splitOutboundTextByLineBreaks: boolean) =>
+    invoke<WechatPreferences>('wechat_set_preferences', {
+      splitOutboundTextByLineBreaks,
+    }),
 
   wechatStartQrLogin: () =>
     invoke<WechatQrStart>('wechat_start_qr_login'),

@@ -31,6 +31,20 @@ pub struct WechatTypingTicket {
     pub fetched_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WechatPreferences {
+    pub split_outbound_text_by_line_breaks: bool,
+}
+
+impl Default for WechatPreferences {
+    fn default() -> Self {
+        Self {
+            split_outbound_text_by_line_breaks: true,
+        }
+    }
+}
+
 impl WechatStateStore {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
@@ -116,6 +130,14 @@ impl WechatStateStore {
         remove_if_exists(&self.typing_tickets_path())
     }
 
+    pub fn save_preferences(&self, preferences: &WechatPreferences) -> StoreResult<()> {
+        write_json(&self.preferences_path(), preferences)
+    }
+
+    pub fn load_preferences(&self) -> StoreResult<WechatPreferences> {
+        Ok(read_json(&self.preferences_path())?.unwrap_or_default())
+    }
+
     pub fn save_inbound_media(
         &self,
         media: &InboundWechatMedia,
@@ -155,6 +177,10 @@ impl WechatStateStore {
 
     fn typing_tickets_path(&self) -> PathBuf {
         self.dir.join("typing_tickets.json")
+    }
+
+    fn preferences_path(&self) -> PathBuf {
+        self.dir.join("preferences.json")
     }
 }
 
@@ -279,6 +305,25 @@ mod tests {
                 fetched_at_ms: 123,
             })
         );
+    }
+
+    #[test]
+    fn preferences_default_to_line_break_splitting_and_persist_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+
+        assert_eq!(
+            store.load_preferences().unwrap(),
+            WechatPreferences::default()
+        );
+
+        let preferences = WechatPreferences {
+            split_outbound_text_by_line_breaks: false,
+        };
+        store.save_preferences(&preferences).unwrap();
+
+        let reloaded = WechatStateStore::new(dir.path().to_path_buf());
+        assert_eq!(reloaded.load_preferences().unwrap(), preferences);
     }
 
     #[test]

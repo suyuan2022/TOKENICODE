@@ -8199,6 +8199,8 @@ pub fn run() {
             commands::feedback::submit_feedback,
             commands::feedback::feedback_is_configured,
             wechat::commands::wechat_get_status,
+            wechat::commands::wechat_get_preferences,
+            wechat::commands::wechat_set_preferences,
             wechat::commands::wechat_start_qr_login,
             wechat::commands::wechat_poll_qr_login,
             wechat::commands::wechat_disconnect,
