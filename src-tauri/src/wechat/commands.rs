@@ -39,6 +39,7 @@ impl From<WechatAccount> for WechatAccountInfo {
 #[serde(rename_all = "camelCase")]
 pub struct WechatStatusResponse {
     pub connected: bool,
+    pub polling: bool,
     pub account: Option<WechatAccountInfo>,
 }
 
@@ -69,7 +70,7 @@ pub async fn wechat_get_status(
 ) -> Result<WechatStatusResponse, String> {
     let account = state_store().load_account()?;
     if account.is_some() {
-        if start_polling_task_if_desktop_session(
+        if start_polling_task(
             runtime.inner(),
             polling_task.inner(),
             stdin_mgr.inner(),
@@ -82,6 +83,7 @@ pub async fn wechat_get_status(
     }
     Ok(WechatStatusResponse {
         connected: account.is_some(),
+        polling: polling_task.is_running().await,
         account: account.map(WechatAccountInfo::from),
     })
 }
@@ -120,7 +122,7 @@ pub async fn wechat_poll_qr_login(
             let store = state_store();
             store.save_account(&account)?;
             notify_lifecycle(WechatLifecycleEffect::NotifyStart, &store).await;
-            start_polling_task_if_desktop_session(
+            start_polling_task(
                 runtime.inner(),
                 polling_task.inner(),
                 stdin_mgr.inner(),
@@ -230,6 +232,7 @@ async fn start_polling_task(
         .await
 }
 
+#[cfg(test)]
 async fn start_polling_task_if_desktop_session(
     runtime: &WechatRuntimeHandle,
     polling_task: &WechatPollingTask,
@@ -334,6 +337,17 @@ mod tests {
         set_desktop_session(&runtime, None).await;
 
         assert_eq!(runtime.desktop_session_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn start_polling_task_starts_without_desktop_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = WechatRuntimeHandle::new(WechatStateStore::new(dir.path().to_path_buf()));
+        let polling_task = WechatPollingTask::default();
+        let stdin_mgr = StdinManager::new();
+
+        assert!(start_polling_task(&runtime, &polling_task, &stdin_mgr, None).await);
+        assert!(polling_task.stop().await);
     }
 
     #[tokio::test]

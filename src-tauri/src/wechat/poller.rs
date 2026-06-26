@@ -195,6 +195,22 @@ where
     )
     .await?;
 
+    if outcome.inbound_text_count > 0
+        || !outcome.effects.is_empty()
+        || dispatch.claude_effect_count > 0
+        || dispatch.wechat_effect_count > 0
+    {
+        eprintln!(
+            "[WeChat] poll dispatch: inbound_text={} effects={} claude_effects={} wechat_effects={} desktop_messages={} desktop_clears={}",
+            outcome.inbound_text_count,
+            outcome.effects.len(),
+            dispatch.claude_effect_count,
+            dispatch.wechat_effect_count,
+            dispatch.desktop_user_messages.len(),
+            dispatch.desktop_clear_conversations.len(),
+        );
+    }
+
     Ok(WechatPollIteration {
         polled: true,
         status: Some(outcome.status),

@@ -136,6 +136,7 @@ export interface WechatAccountInfo {
 
 export interface WechatStatus {
   connected: boolean;
+  polling: boolean;
   account: WechatAccountInfo | null;
 }
 

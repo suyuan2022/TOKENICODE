@@ -379,28 +379,27 @@ impl WechatTurnManager {
                 text: CLEAR_WHILE_RUNNING_NOTICE.into(),
             }];
         }
-        let Some(desktop_session_id) = self.desktop_session_id.clone() else {
-            return vec![WechatTurnEffect::SendWeChatText {
-                to_user_id: message.from_user_id,
-                context_token: message.context_token,
-                text: NO_DESKTOP_SESSION_NOTICE.into(),
-            }];
-        };
-
-        vec![
+        let desktop_session_id = self.desktop_session_id.clone();
+        let mut effects = vec![
             WechatTurnEffect::ClearDesktopConversation {
-                desktop_session_id: desktop_session_id.clone(),
-            },
-            WechatTurnEffect::SendClaudeSlashCommand {
-                desktop_session_id,
-                command: "/clear".into(),
+                desktop_session_id: desktop_session_id.clone().unwrap_or_default(),
             },
             WechatTurnEffect::SendWeChatText {
                 to_user_id: message.from_user_id,
                 context_token: message.context_token,
                 text: CLEAR_CONTEXT_NOTICE.into(),
             },
-        ]
+        ];
+        if let Some(desktop_session_id) = desktop_session_id {
+            effects.insert(
+                1,
+                WechatTurnEffect::SendClaudeSlashCommand {
+                    desktop_session_id,
+                    command: "/clear".into(),
+                },
+            );
+        }
+        effects
     }
 
     fn status_notice(&self) -> String {
@@ -899,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_command_requires_a_bound_desktop_session() {
+    fn clear_command_without_desktop_session_still_clears_fixed_window() {
         let mut manager = WechatTurnManager::default();
         manager.connect();
 
@@ -907,11 +906,16 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![WechatTurnEffect::SendWeChatText {
-                to_user_id: "user@im.wechat".into(),
-                context_token: "ctx-msg-1".into(),
-                text: NO_DESKTOP_SESSION_NOTICE.into(),
-            }],
+            vec![
+                WechatTurnEffect::ClearDesktopConversation {
+                    desktop_session_id: String::new(),
+                },
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user@im.wechat".into(),
+                    context_token: "ctx-msg-1".into(),
+                    text: "已清空当前「微信接入」上下文。".into(),
+                },
+            ],
         );
     }
 
