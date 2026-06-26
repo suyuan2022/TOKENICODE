@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { bridge, type WechatAccountInfo, type WechatStatus } from '../../lib/tauri-bridge';
+import {
+  bridge,
+  onWechatStatus,
+  type WechatAccountInfo,
+  type WechatStatus,
+} from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 
-type WechatPhase = 'loading' | 'idle' | 'requesting' | 'waiting' | 'scanned' | 'connected' | 'error';
+type WechatPhase = 'loading' | 'idle' | 'requesting' | 'waiting' | 'scanned' | 'connected' | 'sessionExpired' | 'error';
 
 export function WechatTab() {
   const t = useT();
@@ -31,6 +36,31 @@ export function WechatTab() {
   useEffect(() => {
     refreshStatus();
   }, [refreshStatus]);
+
+  useEffect(() => {
+    let disposed = false;
+    let cleanup: (() => void) | null = null;
+
+    onWechatStatus((status) => {
+      if (status.status !== 'sessionExpired') return;
+      setAccount(null);
+      setQrcodeId('');
+      setQrcodeImage('');
+      setMessage('');
+      setPhase('sessionExpired');
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        cleanup = unlisten;
+      }
+    }).catch(() => {});
+
+    return () => {
+      disposed = true;
+      cleanup?.();
+    };
+  }, []);
 
   const startLogin = useCallback(async () => {
     setPhase('requesting');
@@ -101,6 +131,11 @@ export function WechatTab() {
   }, []);
 
   const busy = phase === 'loading' || phase === 'requesting';
+  const statusTitle = phase === 'sessionExpired'
+    ? t('wechat.sessionExpired')
+    : phase === 'connected'
+      ? t('wechat.connected')
+      : t('wechat.disconnected');
 
   return (
     <div className="space-y-5">
@@ -117,7 +152,7 @@ export function WechatTab() {
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-[13px] font-medium text-text-primary">
-              {phase === 'connected' ? t('wechat.connected') : t('wechat.disconnected')}
+              {statusTitle}
             </div>
             <div className="mt-1 text-xs text-text-tertiary">
               {account ? account.userId : t('wechat.noAccount')}
@@ -168,9 +203,13 @@ export function WechatTab() {
           </div>
         )}
 
-        {phase === 'error' && message && (
-          <div className="mt-4 rounded-lg bg-red-500/10 px-3 py-2 text-[13px] text-red-500">
-            {message}
+        {(phase === 'sessionExpired' || (phase === 'error' && message)) && (
+          <div className={`mt-4 rounded-lg px-3 py-2 text-[13px] ${
+            phase === 'sessionExpired'
+              ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+              : 'bg-red-500/10 text-red-500'
+          }`}>
+            {phase === 'sessionExpired' ? t('wechat.sessionExpiredDetail') : message}
           </div>
         )}
       </div>

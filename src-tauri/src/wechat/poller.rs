@@ -8,6 +8,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
@@ -94,11 +95,21 @@ impl WechatPollingTask {
 pub struct WechatPollIteration {
     pub polled: bool,
     pub status: Option<MonitorStatus>,
+    pub status_event: Option<WechatStatusEvent>,
     pub inbound_text_count: usize,
     pub claude_effect_count: usize,
     pub wechat_effect_count: usize,
     pub desktop_user_messages: Vec<WechatDesktopUserMessage>,
     pub next_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WechatStatusEvent {
+    pub status: String,
+    pub connected: bool,
+    pub message: String,
+    pub retry_after_ms: Option<u64>,
 }
 
 pub async fn poll_once(
@@ -156,6 +167,7 @@ where
         return Ok(WechatPollIteration {
             polled: false,
             status: None,
+            status_event: None,
             inbound_text_count: 0,
             claude_effect_count: 0,
             wechat_effect_count: 0,
@@ -182,12 +194,28 @@ where
     Ok(WechatPollIteration {
         polled: true,
         status: Some(outcome.status),
+        status_event: status_event_for_poll_outcome(outcome.status, outcome.next_timeout_ms),
         inbound_text_count: outcome.inbound_text_count,
         claude_effect_count: dispatch.claude_effect_count,
         wechat_effect_count: dispatch.wechat_effect_count,
         desktop_user_messages: dispatch.desktop_user_messages,
         next_timeout_ms: outcome.next_timeout_ms,
     })
+}
+
+fn status_event_for_poll_outcome(
+    status: MonitorStatus,
+    next_timeout_ms: u64,
+) -> Option<WechatStatusEvent> {
+    match status {
+        MonitorStatus::Active => None,
+        MonitorStatus::SessionExpired => Some(WechatStatusEvent {
+            status: "sessionExpired".into(),
+            connected: false,
+            message: "WeChat session expired. Scan QR again to reconnect.".into(),
+            retry_after_ms: Some(next_timeout_ms),
+        }),
+    }
 }
 
 async fn run_poll_loop(
@@ -212,10 +240,12 @@ async fn run_poll_loop(
 
         retry_delay_ms = match iteration {
             Ok(iteration) if iteration.status == Some(MonitorStatus::SessionExpired) => {
+                emit_wechat_status_event(app.as_ref(), iteration.status_event.as_ref());
                 emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
                 iteration.next_timeout_ms
             }
             Ok(iteration) if iteration.polled => {
+                emit_wechat_status_event(app.as_ref(), iteration.status_event.as_ref());
                 emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
                 0
             }
@@ -225,6 +255,16 @@ async fn run_poll_loop(
                 ERROR_RETRY_MS
             }
         };
+    }
+}
+
+fn emit_wechat_status_event(app: Option<&AppHandle>, event: Option<&WechatStatusEvent>) {
+    let (Some(app), Some(event)) = (app, event) else {
+        return;
+    };
+
+    if let Err(err) = emit_to_frontend(app, "wechat:status", event) {
+        eprintln!("[WeChat] status emit failed: {err}");
     }
 }
 
@@ -263,6 +303,7 @@ mod tests {
                 GetUpdatesResponse, IlinkHttpRequest, MessageItem, MessageItemType, MessageType,
                 TextItem, WechatMessage,
             },
+            monitor::MonitorStatus,
             poller::{poll_once_with, poll_once_with_executors, WechatPollingTask},
             runtime::WechatRuntimeHandle,
             store::{WechatAccount, WechatStateStore},
@@ -409,6 +450,37 @@ mod tests {
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn poll_once_reports_session_expired_status_event_and_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let runtime = WechatRuntimeHandle::new(store);
+        runtime.set_desktop_session("stdin-1".into()).await;
+        let stdin_mgr = StdinManager::new();
+
+        let iteration = poll_once_with(&runtime, &stdin_mgr, 1_000, |_request| async {
+            Ok(GetUpdatesResponse {
+                ret: Some(1),
+                errcode: Some(-14),
+                errmsg: Some("session expired".into()),
+                msgs: vec![text_message(7, "user-1", "ctx-1", "hello from WeChat")],
+                get_updates_buf: Some("cursor-1".into()),
+                longpolling_timeout_ms: None,
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(iteration.status, Some(MonitorStatus::SessionExpired));
+        assert_eq!(iteration.next_timeout_ms, 3_600_000);
+        let status_event = iteration.status_event.as_ref().unwrap();
+        assert_eq!(status_event.status, "sessionExpired");
+        assert!(!status_event.connected);
+        assert_eq!(status_event.retry_after_ms, Some(3_600_000));
+        assert!(status_event.message.contains("expired"));
     }
 
     fn account() -> WechatAccount {

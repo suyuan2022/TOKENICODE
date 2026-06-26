@@ -139,6 +139,13 @@ export interface WechatStatus {
   account: WechatAccountInfo | null;
 }
 
+export interface WechatStatusEvent {
+  status: 'sessionExpired' | string;
+  connected: boolean;
+  message: string;
+  retryAfterMs?: number | null;
+}
+
 export interface WechatQrStart {
   qrcodeId: string;
   qrcodeImage: string;
@@ -629,6 +636,15 @@ export function onWechatDesktopUserMessage(
 ): Promise<UnlistenFn> {
   return listen<WechatDesktopUserMessageEvent>(
     'wechat:desktop_user_message',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatStatus(
+  callback: (status: WechatStatusEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatStatusEvent>(
+    'wechat:status',
     (event) => callback(event.payload),
   );
 }

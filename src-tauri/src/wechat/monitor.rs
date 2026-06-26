@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::wechat::api::{GetUpdatesResponse, WechatMessage};
 
 pub const DEFAULT_MONITOR_TIMEOUT_MS: u64 = 35_000;
+pub const SESSION_EXPIRED_PAUSE_MS: u64 = 60 * 60 * 1_000;
 const SESSION_EXPIRED_ERRCODE: i32 = -14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +33,7 @@ impl WechatMonitorState {
                 status: MonitorStatus::SessionExpired,
                 messages: Vec::new(),
                 next_sync_buf: None,
-                next_timeout_ms: DEFAULT_MONITOR_TIMEOUT_MS,
+                next_timeout_ms: SESSION_EXPIRED_PAUSE_MS,
             };
         }
 
@@ -127,6 +128,7 @@ mod tests {
         assert_eq!(tick.status, MonitorStatus::SessionExpired);
         assert!(tick.messages.is_empty());
         assert_eq!(tick.next_sync_buf, None);
+        assert_eq!(tick.next_timeout_ms, 3_600_000);
     }
 
     fn message(message_id: i64, from_user_id: &str, context_token: &str) -> WechatMessage {
