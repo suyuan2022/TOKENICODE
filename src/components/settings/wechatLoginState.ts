@@ -18,6 +18,14 @@ interface WechatQrPollTransition {
   redirectBaseUrl: string | null;
 }
 
+const activeQrPhases = new Set<WechatPhase>(['requesting', 'waiting', 'scanned']);
+
+export function resolveWechatStatusPhase(connected: boolean, currentPhase: WechatPhase): WechatPhase {
+  if (connected) return 'connected';
+  if (activeQrPhases.has(currentPhase)) return currentPhase;
+  return 'idle';
+}
+
 export function resolveWechatQrPollResult(result: WechatQrPoll): WechatQrPollTransition {
   if (result.connected) {
     return {

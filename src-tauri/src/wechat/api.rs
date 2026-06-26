@@ -410,8 +410,9 @@ fn base_info_value() -> Value {
 
 fn build_common_headers(route_tag: Option<&str>) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::new();
-    headers.insert("iLink-App-Id".into(), "wxeb7ec651dd0aefa9".into());
-    headers.insert("iLink-App-ClientVersion".into(), "100".into());
+    // Match Tencent's official openclaw-weixin channel metadata.
+    headers.insert("iLink-App-Id".into(), "bot".into());
+    headers.insert("iLink-App-ClientVersion".into(), "132102".into());
     if let Some(route_tag) = route_tag.filter(|value| !value.trim().is_empty()) {
         headers.insert("SKRouteTag".into(), route_tag.trim().into());
     }
@@ -648,6 +649,11 @@ mod tests {
     fn builds_auth_headers_with_random_wechat_uin_shape() {
         let headers = build_auth_headers(Some("bot-token"), Some("route-a"), 42);
 
+        assert_eq!(headers.get("iLink-App-Id"), Some(&"bot".into()));
+        assert_eq!(
+            headers.get("iLink-App-ClientVersion"),
+            Some(&"132102".into())
+        );
         assert_eq!(
             headers.get("Authorization"),
             Some(&"Bearer bot-token".into())

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveWechatQrPollResult } from '../wechatLoginState';
+import { resolveWechatQrPollResult, resolveWechatStatusPhase } from '../wechatLoginState';
 
 describe('wechat QR login state', () => {
   it('clears the stale QR image when the iLink QR expires', () => {
@@ -29,5 +29,13 @@ describe('wechat QR login state', () => {
       clearQr: false,
       redirectBaseUrl: 'https://hk.weixin.qq.com',
     });
+  });
+
+  it('does not let a late disconnected status hide an active QR login', () => {
+    expect(resolveWechatStatusPhase(false, 'requesting')).toBe('requesting');
+    expect(resolveWechatStatusPhase(false, 'waiting')).toBe('waiting');
+    expect(resolveWechatStatusPhase(false, 'scanned')).toBe('scanned');
+    expect(resolveWechatStatusPhase(false, 'connected')).toBe('idle');
+    expect(resolveWechatStatusPhase(true, 'waiting')).toBe('connected');
   });
 });

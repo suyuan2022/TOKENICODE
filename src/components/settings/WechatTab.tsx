@@ -7,7 +7,13 @@ import {
 } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { showToast } from '../shared/Toast';
-import { resolveWechatQrPollResult, type WechatPhase } from './wechatLoginState';
+import {
+  resolveWechatQrPollResult,
+  resolveWechatStatusPhase,
+  type WechatPhase,
+} from './wechatLoginState';
+
+const QR_EXPIRES_AFTER_MS = 140_000;
 
 export function WechatTab() {
   const t = useT();
@@ -16,13 +22,15 @@ export function WechatTab() {
   const [qrcodeId, setQrcodeId] = useState('');
   const [qrcodeImage, setQrcodeImage] = useState('');
   const [qrcodeUrl, setQrcodeUrl] = useState('');
+  const [qrcodeCreatedAt, setQrcodeCreatedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const [pollBaseUrl, setPollBaseUrl] = useState('');
   const [message, setMessage] = useState('');
   const pollingRef = useRef(false);
 
   const applyStatus = useCallback((status: WechatStatus) => {
     setAccount(status.account);
-    setPhase(status.connected ? 'connected' : 'idle');
+    setPhase((currentPhase) => resolveWechatStatusPhase(status.connected, currentPhase));
   }, []);
 
   const refreshStatus = useCallback(async () => {
@@ -49,6 +57,7 @@ export function WechatTab() {
       setQrcodeId('');
       setQrcodeImage('');
       setQrcodeUrl('');
+      setQrcodeCreatedAt(null);
       setPollBaseUrl('');
       setMessage('');
       setPhase('sessionExpired');
@@ -72,12 +81,14 @@ export function WechatTab() {
     setQrcodeId('');
     setQrcodeImage('');
     setQrcodeUrl('');
+    setQrcodeCreatedAt(null);
     setPollBaseUrl('');
     try {
       const qr = await bridge.wechatStartQrLogin();
       setQrcodeId(qr.qrcodeId);
       setQrcodeImage(qr.qrcodeImage);
       setQrcodeUrl(qr.qrcodeUrl);
+      setQrcodeCreatedAt(Date.now());
       setPhase('waiting');
     } catch (err) {
       setMessage(String(err));
@@ -100,6 +111,7 @@ export function WechatTab() {
         setQrcodeId('');
         setQrcodeImage('');
         setQrcodeUrl('');
+        setQrcodeCreatedAt(null);
         setPollBaseUrl('');
       }
       setPhase(next.phase);
@@ -120,6 +132,13 @@ export function WechatTab() {
     return () => window.clearInterval(timer);
   }, [phase, pollLogin, qrcodeId]);
 
+  useEffect(() => {
+    if (!qrcodeCreatedAt || phase === 'connected') return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [phase, qrcodeCreatedAt]);
+
   const disconnect = useCallback(async () => {
     setMessage('');
     try {
@@ -128,6 +147,7 @@ export function WechatTab() {
       setQrcodeId('');
       setQrcodeImage('');
       setQrcodeUrl('');
+      setQrcodeCreatedAt(null);
       setPollBaseUrl('');
       setPhase('idle');
     } catch (err) {
@@ -143,6 +163,9 @@ export function WechatTab() {
       .then(() => showToast(t('wechat.copyQrLinkDone'), 'success'))
       .catch((err) => showToast(String(err), 'error'));
   }, [qrcodeUrl, t]);
+  const secondsRemaining = qrcodeCreatedAt
+    ? Math.max(0, Math.ceil((qrcodeCreatedAt + QR_EXPIRES_AFTER_MS - now) / 1000))
+    : null;
   const statusTitle = phase === 'sessionExpired'
     ? t('wechat.sessionExpired')
     : phase === 'connected'
@@ -204,6 +227,13 @@ export function WechatTab() {
               <div className="mt-1 text-xs text-text-tertiary leading-relaxed">
                 {message || t('wechat.waitingDetail')}
               </div>
+              {secondsRemaining !== null && (
+                <div className="mt-1 text-xs text-text-tertiary">
+                  {secondsRemaining > 0
+                    ? t('wechat.qrExpiresIn').replace('{seconds}', String(secondsRemaining))
+                    : t('wechat.qrExpiredHint')}
+                </div>
+              )}
               <button
                 onClick={startLogin}
                 className="mt-3 px-2.5 py-1 text-xs font-medium rounded-md border border-border-subtle
