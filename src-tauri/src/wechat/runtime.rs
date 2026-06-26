@@ -147,6 +147,10 @@ impl WechatRuntime {
             });
         }
 
+        if self.store.load_account()?.is_some() {
+            self.turn_manager.connect();
+        }
+
         if let Some(sync_buf) = tick.next_sync_buf.as_deref() {
             self.store.save_sync_buf(sync_buf)?;
         }
@@ -1061,6 +1065,38 @@ mod tests {
                     context_token: "ctx-3".into(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn saved_account_status_command_reports_connected_after_desktop_session_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let mut runtime = WechatRuntime::new(store);
+        runtime.set_desktop_session("stdin-1".into());
+
+        let outcome = runtime
+            .process_updates_response(
+                GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(10, "user-1", "ctx-status", "/status")],
+                    get_updates_buf: None,
+                    longpolling_timeout_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome.effects,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-status".into(),
+                text: "微信远程状态：已连接\n桌面会话：已绑定\n当前任务：空闲\n排队消息：0".into(),
+            }]
         );
     }
 
