@@ -406,7 +406,14 @@ where
         } => {
             let context_token = resolve_context_token(store, to_user_id, context_token)?;
             let filtered_text = filter_wechat_markdown(text);
-            for chunk in split_wechat_text_messages(&filtered_text) {
+            let chunks = split_wechat_text_messages(&filtered_text);
+            eprintln!(
+                "[WeChat] sending text reply as {} message(s), original_chars={}, filtered_chars={}",
+                chunks.len(),
+                text.chars().count(),
+                filtered_text.chars().count()
+            );
+            for chunk in chunks {
                 let request =
                     client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
                 execute_send_message_request(store, request, &mut execute_request).await?;
