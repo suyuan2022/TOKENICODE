@@ -1381,6 +1381,9 @@ mod tests {
         assert_eq!(actual["message"]["role"], "user");
         assert!(content.contains("这是 TOKENICODE 的微信接入会话"));
         assert!(content.contains("请使用 Write 工具"));
+        assert!(content.contains("tokenicode-wechat-send-files.json"));
+        assert!(content.contains("\"send_files\""));
+        assert!(content.contains("图片路径会作为微信图片发送"));
         assert!(content.contains("TOKENICODE 会自动上传并发送到微信"));
         assert!(content.contains("不要因为不能直接操作微信而说通道不支持"));
         assert!(content.ends_with("hello from WeChat"));
