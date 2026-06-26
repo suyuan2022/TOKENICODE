@@ -1,5 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use qrcode::{render::svg, QrCode};
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
@@ -250,11 +252,53 @@ fn now_ms() -> u64 {
 }
 
 pub fn normalize_qr_image(value: &str) -> String {
-    if value.starts_with("data:") || value.starts_with("http://") || value.starts_with("https://") {
-        value.into()
-    } else {
-        format!("data:image/png;base64,{value}")
+    let value = value.trim();
+    if value.starts_with("data:image/") {
+        return value.into();
     }
+    if let Some(data_url) = raw_base64_image_data_url(value) {
+        return data_url;
+    }
+
+    qr_svg_data_url(value).unwrap_or_else(|_| value.into())
+}
+
+fn raw_base64_image_data_url(value: &str) -> Option<String> {
+    let compact: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let bytes = BASE64_STANDARD.decode(compact.as_bytes()).ok()?;
+    let media_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .take(4)
+        .eq(b"<svg".iter().copied())
+    {
+        "image/svg+xml"
+    } else {
+        return None;
+    };
+
+    Some(format!("data:{media_type};base64,{compact}"))
+}
+
+fn qr_svg_data_url(value: &str) -> Result<String, String> {
+    let code = QrCode::new(value.as_bytes()).map_err(|err| format!("build QR SVG: {err}"))?;
+    let image = code
+        .render::<svg::Color>()
+        .min_dimensions(256, 256)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    Ok(format!(
+        "data:image/svg+xml;base64,{}",
+        BASE64_STANDARD.encode(image.as_bytes())
+    ))
 }
 
 #[cfg(test)]
@@ -295,15 +339,21 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_raw_base64_qr_images_for_frontend() {
+    fn normalizes_qr_payloads_for_frontend() {
+        let generated = normalize_qr_image("weixin://scan/login?token=abc123");
+        assert!(generated.starts_with("data:image/svg+xml;base64,"));
+        assert!(!generated.contains("weixin://scan/login"));
+
+        let generated_from_url =
+            normalize_qr_image("https://liteapp.weixin.qq.com/q/abc?qrcode=qr-1&bot_type=3");
+        assert!(generated_from_url.starts_with("data:image/svg+xml;base64,"));
+        assert!(!generated_from_url.contains("liteapp.weixin.qq.com"));
+
         assert_eq!(
-            normalize_qr_image("abc123"),
-            "data:image/png;base64,abc123".to_string()
+            normalize_qr_image("iVBORw0KGgo="),
+            "data:image/png;base64,iVBORw0KGgo=".to_string()
         );
-        assert_eq!(
-            normalize_qr_image("https://example.com/qr.png"),
-            "https://example.com/qr.png".to_string()
-        );
+
         assert_eq!(
             normalize_qr_image("data:image/png;base64,abc123"),
             "data:image/png;base64,abc123".to_string()
