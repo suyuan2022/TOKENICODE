@@ -757,6 +757,13 @@ struct ProvidersFile {
 }
 
 const PARTIAL_MESSAGES_OVERRIDE_ENV: &str = "TOKENICODE_INCLUDE_PARTIAL_MESSAGES";
+const DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV: &str =
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL";
+const CLAUDE_PLUGIN_CACHE_DIR_ENV: &str = "CLAUDE_CODE_PLUGIN_CACHE_DIR";
+const CLAUDE_PLUGIN_GIT_TIMEOUT_ENV: &str = "CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS";
+const INCLUDE_MCP_SERVERS_ENV: &str = "TOKENICODE_INCLUDE_MCP_SERVERS";
+const CLAUDE_SETTING_SOURCES_ARG: &str = "--setting-sources";
+const TOKENICODE_CLAUDE_SETTING_SOURCES: &str = "local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProviderRuntimeCapabilities {
@@ -1226,6 +1233,45 @@ fn parse_bool_override(value: &str) -> Option<bool> {
     }
 }
 
+fn apply_claude_cli_runtime_defaults(env: &mut HashMap<String, String>) {
+    // TOKENICODE should not let Claude Code's official marketplace auto-install
+    // delay or block normal chat startup. Users can still override this through
+    // provider extra_env when they need that specific Claude Code behavior.
+    env.entry(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV.to_string())
+        .or_insert_with(|| "1".to_string());
+    if let Some(cache_dir) = tokenicode_claude_plugin_cache_dir() {
+        env.entry(CLAUDE_PLUGIN_CACHE_DIR_ENV.to_string())
+            .or_insert_with(|| cache_dir);
+    }
+    env.entry(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV.to_string())
+        .or_insert_with(|| "10000".to_string());
+}
+
+fn tokenicode_claude_plugin_cache_dir() -> Option<String> {
+    dirs::home_dir().map(|home| {
+        home.join(".tokenicode")
+            .join("claude-plugin-cache")
+            .to_string_lossy()
+            .to_string()
+    })
+}
+
+fn apply_claude_cli_runtime_args(args: &mut Vec<String>) {
+    // TOKENICODE owns provider env, MCP config, permissions, and UI runtime state.
+    // Inheriting user/project Claude settings can run startup hooks or enabled
+    // plugins before the GUI receives its first stream event.
+    if !args.iter().any(|arg| arg == CLAUDE_SETTING_SOURCES_ARG) {
+        args.extend([
+            CLAUDE_SETTING_SOURCES_ARG.to_string(),
+            TOKENICODE_CLAUDE_SETTING_SOURCES.to_string(),
+        ]);
+    }
+}
+
+fn should_include_mcp_servers(value: Option<&str>) -> bool {
+    value.and_then(parse_bool_override).unwrap_or(false)
+}
+
 fn redacted_env_for_log(env: &HashMap<String, String>) -> BTreeMap<String, String> {
     env.iter()
         .map(|(key, value)| {
@@ -1261,8 +1307,12 @@ fn normalize_cli_model_id(model: &str) -> String {
 #[cfg(test)]
 mod provider_capability_tests {
     use super::{
-        normalize_cli_model_id, parse_bool_override, redacted_env_for_log,
-        resolve_provider_capabilities, ApiProvider, ModelMapping, PARTIAL_MESSAGES_OVERRIDE_ENV,
+        apply_claude_cli_runtime_args, apply_claude_cli_runtime_defaults, normalize_cli_model_id,
+        parse_bool_override, redacted_env_for_log, resolve_provider_capabilities,
+        should_include_mcp_servers, ApiProvider, ModelMapping, CLAUDE_PLUGIN_CACHE_DIR_ENV,
+        CLAUDE_PLUGIN_GIT_TIMEOUT_ENV, CLAUDE_SETTING_SOURCES_ARG,
+        DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV, INCLUDE_MCP_SERVERS_ENV,
+        PARTIAL_MESSAGES_OVERRIDE_ENV, TOKENICODE_CLAUDE_SETTING_SOURCES,
     };
     use std::collections::HashMap;
 
@@ -1373,6 +1423,94 @@ mod provider_capability_tests {
         assert_eq!(parse_bool_override("false"), Some(false));
         assert_eq!(parse_bool_override("OFF"), Some(false));
         assert_eq!(parse_bool_override("maybe"), None);
+    }
+
+    #[test]
+    fn runtime_defaults_disable_official_marketplace_autoinstall() {
+        let mut env = HashMap::new();
+        apply_claude_cli_runtime_defaults(&mut env);
+        assert_eq!(
+            env.get(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV).map(String::as_str),
+            Some("10000")
+        );
+        assert!(env
+            .get(CLAUDE_PLUGIN_CACHE_DIR_ENV)
+            .is_some_and(|path| path.ends_with(".tokenicode/claude-plugin-cache")));
+    }
+
+    #[test]
+    fn runtime_defaults_do_not_override_provider_extra_env() {
+        let mut env = HashMap::from([
+            (
+                DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV.to_string(),
+                "0".to_string(),
+            ),
+            (
+                CLAUDE_PLUGIN_CACHE_DIR_ENV.to_string(),
+                "/custom/cache".to_string(),
+            ),
+            (
+                CLAUDE_PLUGIN_GIT_TIMEOUT_ENV.to_string(),
+                "2500".to_string(),
+            ),
+        ]);
+        apply_claude_cli_runtime_defaults(&mut env);
+        assert_eq!(
+            env.get(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV)
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_CACHE_DIR_ENV).map(String::as_str),
+            Some("/custom/cache")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV).map(String::as_str),
+            Some("2500")
+        );
+    }
+
+    #[test]
+    fn runtime_args_use_tokenicode_setting_sources() {
+        let mut args = vec!["--model".to_string(), "claude-opus-4-6[1m]".to_string()];
+        apply_claude_cli_runtime_args(&mut args);
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                CLAUDE_SETTING_SOURCES_ARG,
+                TOKENICODE_CLAUDE_SETTING_SOURCES
+            ]));
+    }
+
+    #[test]
+    fn runtime_args_do_not_duplicate_setting_sources() {
+        let mut args = vec![
+            CLAUDE_SETTING_SOURCES_ARG.to_string(),
+            "project,local".to_string(),
+        ];
+        apply_claude_cli_runtime_args(&mut args);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == CLAUDE_SETTING_SOURCES_ARG)
+                .count(),
+            1
+        );
+        assert_eq!(args[1], "project,local");
+    }
+
+    #[test]
+    fn mcp_servers_are_excluded_unless_explicitly_enabled() {
+        assert!(!should_include_mcp_servers(None));
+        assert!(!should_include_mcp_servers(Some("0")));
+        assert!(!should_include_mcp_servers(Some("false")));
+        assert!(!should_include_mcp_servers(Some("maybe")));
+        assert!(should_include_mcp_servers(Some("1")));
+        assert!(should_include_mcp_servers(Some("true")));
+        assert_eq!(INCLUDE_MCP_SERVERS_ENV, "TOKENICODE_INCLUDE_MCP_SERVERS");
     }
 
     #[test]
@@ -1589,13 +1727,17 @@ fn strip_thinking_from_value(value: &mut serde_json::Value) -> Option<usize> {
     }
 }
 
-/// Phase 4 §5.4 (S10): write a per-session MCP config scratch file so the
-/// CLI's `--strict-mcp-config` doesn't strip the user's configured servers.
+/// Write a per-session MCP config scratch file only when explicitly enabled.
 ///
-/// Reads `~/.claude.json`, extracts the `mcpServers` object, and writes
-/// `{"mcpServers": {...}}` into `~/.tokenicode/mcp-session-<stdin_id>.json`.
-/// Returns `None` when there are no servers to carry over (or on I/O error).
+/// TOKENICODE's default chat path uses `--strict-mcp-config` without copying
+/// global MCP servers because slow or unrelated servers can block the first
+/// desktop response. Advanced users can opt in with
+/// `TOKENICODE_INCLUDE_MCP_SERVERS=1`.
 fn build_mcp_scratch_config(stdin_id: &str) -> Option<std::path::PathBuf> {
+    if !should_include_mcp_servers(std::env::var(INCLUDE_MCP_SERVERS_ENV).ok().as_deref()) {
+        return None;
+    }
+
     let home = dirs::home_dir()?;
     let claude_json = home.join(".claude.json");
     let raw = std::fs::read_to_string(&claude_json).ok()?;
@@ -1719,13 +1861,9 @@ async fn start_claude_session(
         "--strict-mcp-config".to_string(),
     ];
 
-    // Phase 4 §5.4 (S10): build a per-session MCP scratch config file.
-    // The CLI is spawned with --strict-mcp-config to exclude global MCP
-    // servers from ~/.claude.json (they'd slow cold start by 20-30 seconds).
-    // BUT users also need their explicitly-configured MCP servers available
-    // inside the session. Solution: write the mcpServers block from
-    // ~/.claude.json into a scratch file at ~/.tokenicode/mcp-session-<id>.json
-    // and pass it via --mcp-config. Cleaned up on process exit.
+    // Build a per-session MCP scratch config only for explicit opt-in. Keeping
+    // the default empty preserves fast desktop startup and prevents unrelated
+    // global MCP servers from blocking the first stream event.
     let mcp_scratch_path = build_mcp_scratch_config(&session_id);
     if let Some(ref scratch) = mcp_scratch_path {
         args.push("--mcp-config".to_string());
@@ -1812,9 +1950,11 @@ async fn start_claude_session(
     // api.anthropic.com endpoint.
     let (mut resolved_env, inherited_keys_to_remove, provider_extra_args, provider_caps) =
         resolve_provider_env(params.provider_id.as_deref())?;
+    apply_claude_cli_runtime_defaults(&mut resolved_env);
 
-    // Append provider-specific CLI args (e.g. --setting-sources project,local)
+    // Append provider-specific CLI args, then apply TOKENICODE runtime isolation.
     args.extend(provider_extra_args);
+    apply_claude_cli_runtime_args(&mut args);
 
     // Keep partial text/thinking deltas for known-compatible providers; degrade
     // explicitly for unknown providers that may reject the partial-message path.
@@ -7844,9 +7984,7 @@ async fn generate_session_title(
         "1".to_string(),
         "--dangerously-skip-permissions".to_string(),
     ];
-    if provider_id.is_some() {
-        args.extend(["--setting-sources".to_string(), "project,local".to_string()]);
-    }
+    apply_claude_cli_runtime_args(&mut args);
 
     // Build the unified env config. Replaces ~20 lines of scattered .env /
     // .env_remove calls with a single grep-able "ClaudeEnvConfig" site.
