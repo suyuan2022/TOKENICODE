@@ -1658,19 +1658,12 @@ fn cleanup_mcp_scratch_config(stdin_id: &str) {
     }
 }
 
-fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
-}
-
 async fn dispatch_wechat_stream_event(
     runtime: &wechat::runtime::WechatRuntimeHandle,
     stdin_mgr: &StdinManager,
     event: &Value,
 ) {
-    let effects = runtime.process_stream_event(event, current_time_ms()).await;
+    let effects = runtime.process_stream_event(event, wechat::now_ms()).await;
     if effects.is_empty() {
         return;
     }

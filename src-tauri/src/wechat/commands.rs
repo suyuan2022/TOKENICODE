@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use qrcode::{render::svg, QrCode};
 use serde::Serialize;
@@ -11,6 +9,7 @@ use crate::{
         api::{IlinkApiClient, QrCodeResponse, QrStatusResponse},
         executor::{execute_wechat_effect, execute_wechat_lifecycle_effect, WechatLifecycleEffect},
         login::{parse_qr_code_response, parse_qr_status_response, WechatQrPoll},
+        now_ms,
         poller::WechatPollingTask,
         runtime::WechatRuntimeHandle,
         store::{default_wechat_state_store, WechatAccount, WechatStateStore},
@@ -261,13 +260,6 @@ async fn notify_lifecycle(effect: WechatLifecycleEffect, store: &WechatStateStor
 
 fn state_store() -> WechatStateStore {
     default_wechat_state_store()
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 pub fn normalize_qr_image(value: &str) -> String {

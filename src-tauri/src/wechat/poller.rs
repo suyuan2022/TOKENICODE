@@ -1,8 +1,4 @@
-use std::{
-    future::Future,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::{
     sync::{oneshot, Mutex},
     task::JoinHandle,
@@ -22,6 +18,7 @@ use crate::{
             WechatDesktopUserMessage,
         },
         monitor::MonitorStatus,
+        now_ms,
         runtime::WechatRuntimeHandle,
     },
 };
@@ -266,25 +263,31 @@ async fn run_poll_loop(
         };
 
         retry_delay_ms = match iteration {
-            Ok(iteration) if iteration.status == Some(MonitorStatus::SessionExpired) => {
-                emit_wechat_status_event(app.as_ref(), iteration.status_event.as_ref());
-                emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
-                emit_desktop_clear_conversations(
-                    app.as_ref(),
-                    &iteration.desktop_clear_conversations,
-                );
-                emit_desktop_stops(app.as_ref(), &iteration.desktop_stops);
-                iteration.next_timeout_ms
-            }
             Ok(iteration) if iteration.polled => {
                 emit_wechat_status_event(app.as_ref(), iteration.status_event.as_ref());
-                emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
-                emit_desktop_clear_conversations(
+                emit_each(
                     app.as_ref(),
-                    &iteration.desktop_clear_conversations,
+                    "wechat:desktop_user_message",
+                    &iteration.desktop_user_messages,
+                    "desktop user message",
                 );
-                emit_desktop_stops(app.as_ref(), &iteration.desktop_stops);
-                0
+                emit_each(
+                    app.as_ref(),
+                    "wechat:clear_desktop_conversation",
+                    &iteration.desktop_clear_conversations,
+                    "desktop clear conversation",
+                );
+                emit_each(
+                    app.as_ref(),
+                    "wechat:desktop_stop",
+                    &iteration.desktop_stops,
+                    "desktop stop",
+                );
+                if iteration.status == Some(MonitorStatus::SessionExpired) {
+                    iteration.next_timeout_ms
+                } else {
+                    0
+                }
             }
             Ok(_) => NO_ACCOUNT_RETRY_MS,
             Err(err) => {
@@ -305,50 +308,16 @@ fn emit_wechat_status_event(app: Option<&AppHandle>, event: Option<&WechatStatus
     }
 }
 
-fn emit_desktop_user_messages(app: Option<&AppHandle>, messages: &[WechatDesktopUserMessage]) {
+fn emit_each<T: Serialize>(app: Option<&AppHandle>, channel: &str, items: &[T], label: &str) {
     let Some(app) = app else {
         return;
     };
 
-    for message in messages {
-        if let Err(err) = emit_to_frontend(app, "wechat:desktop_user_message", message) {
-            eprintln!("[WeChat] desktop user message emit failed: {err}");
+    for item in items {
+        if let Err(err) = emit_to_frontend(app, channel, item) {
+            eprintln!("[WeChat] {label} emit failed: {err}");
         }
     }
-}
-
-fn emit_desktop_clear_conversations(
-    app: Option<&AppHandle>,
-    messages: &[WechatDesktopClearConversation],
-) {
-    let Some(app) = app else {
-        return;
-    };
-
-    for message in messages {
-        if let Err(err) = emit_to_frontend(app, "wechat:clear_desktop_conversation", message) {
-            eprintln!("[WeChat] desktop clear conversation emit failed: {err}");
-        }
-    }
-}
-
-fn emit_desktop_stops(app: Option<&AppHandle>, messages: &[WechatDesktopStop]) {
-    let Some(app) = app else {
-        return;
-    };
-
-    for message in messages {
-        if let Err(err) = emit_to_frontend(app, "wechat:desktop_stop", message) {
-            eprintln!("[WeChat] desktop stop emit failed: {err}");
-        }
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -9,3 +9,10 @@ pub mod poller;
 pub mod runtime;
 pub mod store;
 pub mod turn;
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}

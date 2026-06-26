@@ -141,6 +141,57 @@ function isLegacyWechatRemoteBootstrapSession(session: SessionListItem): boolean
     || preview.startsWith('微信接入专用会话初始化');
 }
 
+function applyWechatRemoteSessionProjection(
+  diskSessions: SessionListItem[],
+  existingSessions: SessionListItem[],
+  selectedSessionId: string | null,
+  previousSessionId: string | null,
+): {
+  sessions: SessionListItem[];
+  selectedSessionId: string | null;
+  previousSessionId: string | null;
+} {
+  const wechatRemoteCliResumeId = getWechatRemoteCliResumeId(existingSessions);
+  const wechatRemoteBackingSession = wechatRemoteCliResumeId
+    ? diskSessions.find((session) => session.id === wechatRemoteCliResumeId)
+    : undefined;
+  const hiddenWechatSessionIds = loadWechatRemoteHiddenSessionIds();
+  if (wechatRemoteCliResumeId) hiddenWechatSessionIds.add(wechatRemoteCliResumeId);
+
+  const visibleDiskSessions = diskSessions.filter((session) => {
+    if (isLegacyWechatRemoteBootstrapSession(session)) {
+      rememberWechatRemoteCliSessionId(session.id);
+      hiddenWechatSessionIds.add(session.id);
+      return false;
+    }
+    return !hiddenWechatSessionIds.has(session.id);
+  });
+  const drafts = existingSessions.filter(
+    (session) =>
+      session.path === ''
+      && !visibleDiskSessions.some((diskSession) => diskSession.id === session.id),
+  );
+  const merged = visibleDiskSessions.map((diskSession) => {
+    const mem = existingSessions.find((session) => session.id === diskSession.id);
+    return mem?.cliResumeId ? { ...diskSession, cliResumeId: mem.cliResumeId } : diskSession;
+  });
+  const sessions = materializeWechatRemoteSession(
+    [...drafts, ...merged],
+    wechatRemoteBackingSession,
+    wechatRemoteCliResumeId,
+  );
+
+  return {
+    sessions,
+    selectedSessionId: hiddenWechatSessionIds.has(selectedSessionId || '')
+      ? WECHAT_REMOTE_SESSION_ID
+      : selectedSessionId,
+    previousSessionId: hiddenWechatSessionIds.has(previousSessionId || '')
+      ? WECHAT_REMOTE_SESSION_ID
+      : previousSessionId,
+  };
+}
+
 interface SessionState {
   sessions: SessionListItem[];
   isLoading: boolean;
@@ -221,41 +272,17 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     if (isFirstLoad) set({ isLoading: true });
     try {
       const diskSessions = await bridge.listSessions();
-      const existing = get().sessions;
-      const wechatRemoteCliResumeId = getWechatRemoteCliResumeId(existing);
-      const wechatRemoteBackingSession = wechatRemoteCliResumeId
-        ? diskSessions.find((session) => session.id === wechatRemoteCliResumeId)
-        : undefined;
-      const hiddenWechatSessionIds = loadWechatRemoteHiddenSessionIds();
-      if (wechatRemoteCliResumeId) hiddenWechatSessionIds.add(wechatRemoteCliResumeId);
-      const visibleDiskSessions = diskSessions.filter((session) => {
-        if (isLegacyWechatRemoteBootstrapSession(session)) {
-          rememberWechatRemoteCliSessionId(session.id);
-          hiddenWechatSessionIds.add(session.id);
-          return false;
-        }
-        return !hiddenWechatSessionIds.has(session.id);
-      });
-      // Preserve draft sessions (path === '') that haven't been written to disk yet
-      const drafts = existing.filter(
-        (s) => s.path === '' && !visibleDiskSessions.some((d) => d.id === s.id),
+      const current = get();
+      const {
+        sessions,
+        selectedSessionId,
+        previousSessionId,
+      } = applyWechatRemoteSessionProjection(
+        diskSessions,
+        current.sessions,
+        current.selectedSessionId,
+        current.previousSessionId,
       );
-      // Merge: preserve in-memory cliResumeId on disk sessions
-      const merged = visibleDiskSessions.map((d) => {
-        const mem = existing.find((s) => s.id === d.id);
-        return mem?.cliResumeId ? { ...d, cliResumeId: mem.cliResumeId } : d;
-      });
-      const sessions = materializeWechatRemoteSession(
-        [...drafts, ...merged],
-        wechatRemoteBackingSession,
-        wechatRemoteCliResumeId,
-      );
-      const selectedSessionId = hiddenWechatSessionIds.has(get().selectedSessionId || '')
-        ? WECHAT_REMOTE_SESSION_ID
-        : get().selectedSessionId;
-      const previousSessionId = hiddenWechatSessionIds.has(get().previousSessionId || '')
-        ? WECHAT_REMOTE_SESSION_ID
-        : get().previousSessionId;
       if (selectedSessionId === WECHAT_REMOTE_SESSION_ID) {
         saveLastSessionId(WECHAT_REMOTE_SESSION_ID);
       }

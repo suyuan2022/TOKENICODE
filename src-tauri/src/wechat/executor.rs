@@ -3,11 +3,7 @@ use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex as StdMutex},
 };
-use std::{
-    future::Future,
-    path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{future::Future, path::Path, time::Duration};
 
 use crate::{commands::StdinManager, protocol::ControlRequest};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -29,6 +25,7 @@ use super::{
         decrypt_aes_128_ecb_pkcs7, encrypt_aes_128_ecb_pkcs7, parse_cdn_aes_key,
         WechatCdnDownloadRequest, WechatCdnUploadRequest,
     },
+    now_ms,
     store::WechatStateStore,
     turn::WechatTurnEffect,
 };
@@ -1222,13 +1219,6 @@ fn lower_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
