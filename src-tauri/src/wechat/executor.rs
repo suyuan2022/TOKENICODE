@@ -406,7 +406,7 @@ where
         } => {
             let context_token = resolve_context_token(store, to_user_id, context_token)?;
             let filtered_text = filter_wechat_markdown(text);
-            for chunk in split_wechat_text_chunks(&filtered_text) {
+            for chunk in split_wechat_text_messages(&filtered_text) {
                 let request =
                     client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
                 execute_send_message_request(store, request, &mut execute_request).await?;
@@ -1128,6 +1128,74 @@ fn split_wechat_text_chunks(text: &str) -> Vec<String> {
     chunks
 }
 
+fn split_wechat_text_messages(text: &str) -> Vec<String> {
+    split_wechat_line_units(text)
+        .into_iter()
+        .flat_map(|unit| split_wechat_text_chunks(&unit))
+        .filter(|chunk| !chunk.trim().is_empty())
+        .collect()
+}
+
+fn split_wechat_line_units(text: &str) -> Vec<String> {
+    let mut units = Vec::new();
+    let mut current = String::new();
+    let mut in_code_fence = false;
+    let mut in_table = false;
+
+    for raw_line in text.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() && !in_code_fence {
+            push_wechat_line_unit(&mut units, &mut current);
+            in_table = false;
+            continue;
+        }
+
+        let is_code_fence = trimmed.starts_with("```");
+        if in_code_fence || is_code_fence {
+            append_wechat_line(&mut current, line);
+            if is_code_fence {
+                in_code_fence = !in_code_fence;
+            }
+            continue;
+        }
+
+        let is_table_line = looks_like_markdown_table_line(trimmed);
+        let is_continuation = !current.is_empty() && line.starts_with([' ', '\t']);
+        if in_table && !is_table_line {
+            push_wechat_line_unit(&mut units, &mut current);
+        } else if !current.is_empty() && !is_continuation && !is_table_line {
+            push_wechat_line_unit(&mut units, &mut current);
+        }
+
+        append_wechat_line(&mut current, line);
+        in_table = is_table_line;
+    }
+
+    push_wechat_line_unit(&mut units, &mut current);
+    units
+}
+
+fn push_wechat_line_unit(units: &mut Vec<String>, current: &mut String) {
+    if current.trim().is_empty() {
+        current.clear();
+        return;
+    }
+    units.push(std::mem::take(current));
+}
+
+fn append_wechat_line(current: &mut String, line: &str) {
+    if !current.is_empty() {
+        current.push('\n');
+    }
+    current.push_str(line);
+}
+
+fn looks_like_markdown_table_line(line: &str) -> bool {
+    line.starts_with('|') && line.ends_with('|') && line.matches('|').count() >= 2
+}
+
 fn preferred_split_boundary(text: &str, hard_split: usize) -> Option<usize> {
     let candidate = &text[..hard_split];
     candidate
@@ -1838,9 +1906,69 @@ mod tests {
 
         assert!(handled);
         let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let texts: Vec<&str> = requests
+            .iter()
+            .map(|request| {
+                request.body["msg"]["item_list"][0]["text_item"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
         assert_eq!(
-            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
-            "标题\n引用\n**bold** 中文 删除 \n```ts\nconst x = \"~~keep~~\";\n```\n"
+            texts,
+            vec![
+                "标题",
+                "引用",
+                "**bold** 中文 删除 \n```ts\nconst x = \"~~keep~~\";\n```",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_wechat_text_effect_splits_claude_line_breaks_into_wechat_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::SendWeChatText {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+                text: "嗯，这个得看你们几个人、怎么用。\n\n先说结论：如果团队不超过 5-6 个人，我倾向 NAS。\n但坚果云赢在不用管。\n```ts\nconst size = \"50G\";\nconsole.log(size);\n```\n下一步看文件大小。".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        let texts: Vec<&str> = requests
+            .iter()
+            .map(|request| {
+                request.body["msg"]["item_list"][0]["text_item"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "嗯，这个得看你们几个人、怎么用。",
+                "先说结论：如果团队不超过 5-6 个人，我倾向 NAS。",
+                "但坚果云赢在不用管。\n```ts\nconst size = \"50G\";\nconsole.log(size);\n```",
+                "下一步看文件大小。",
+            ]
         );
     }
 
@@ -2393,7 +2521,7 @@ mod tests {
         assert_eq!(requests[1].body["msg"]["context_token"], "ctx-1");
         assert_eq!(
             requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
-            format!("{first_line}\n")
+            first_line
         );
         assert_eq!(
             requests[1].body["msg"]["item_list"][0]["text_item"]["text"],
