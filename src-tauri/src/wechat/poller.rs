@@ -409,16 +409,12 @@ mod tests {
 
         let line = lines.next_line().await.unwrap().unwrap();
         let actual: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(
-            actual,
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": "hello from WeChat",
-                },
-            })
-        );
+        let content = actual["message"]["content"].as_str().unwrap();
+        assert_eq!(actual["type"], "user");
+        assert_eq!(actual["message"]["role"], "user");
+        assert!(content.contains("这是 TOKENICODE 的微信接入会话"));
+        assert!(content.contains("请使用 Write 工具"));
+        assert!(content.ends_with("hello from WeChat"));
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;

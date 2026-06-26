@@ -85,6 +85,11 @@ pub enum WechatLifecycleEffect {
     NotifyStop,
 }
 
+const WECHAT_REMOTE_CLAUDE_INSTRUCTION: &str = "\
+这是 TOKENICODE 的微信接入会话。用户在微信里等待回复。你可以正常回复文本，TOKENICODE 会转发到微信。\
+需要把文件发给微信用户时，请使用 Write 工具把要发送的文件写到当前工作区；Write 成功后 TOKENICODE 会自动上传并发送到微信。\
+不要因为不能直接操作微信而说通道不支持，也不要用 Bash 重定向或 cp 作为要发送文件的最终生成动作。";
+
 pub async fn execute_claude_effect(
     stdin_mgr: &StdinManager,
     effect: &WechatTurnEffect,
@@ -98,7 +103,7 @@ pub async fn execute_claude_effect(
                 "type": "user",
                 "message": {
                     "role": "user",
-                    "content": text,
+                    "content": wechat_remote_user_content_for_claude(text),
                 },
             });
             stdin_mgr
@@ -323,7 +328,7 @@ where
         "type": "user",
         "message": {
             "role": "user",
-            "content": content,
+            "content": wechat_remote_user_content_for_claude(&content),
         },
     });
     stdin_mgr
@@ -932,6 +937,10 @@ fn media_prompt_for_claude(media: &InboundWechatMedia, saved_path: &Path) -> Str
     )
 }
 
+fn wechat_remote_user_content_for_claude(user_content: &str) -> String {
+    format!("{WECHAT_REMOTE_CLAUDE_INSTRUCTION}\n\n用户消息：\n{user_content}")
+}
+
 fn desktop_user_message_for_text_effect(
     effect: &WechatTurnEffect,
 ) -> Option<WechatDesktopUserMessage> {
@@ -1240,7 +1249,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn send_to_claude_effect_writes_user_ndjson_to_existing_stdin_manager() {
+    async fn send_to_claude_effect_instructs_claude_how_to_send_wechat_files() {
         let stdin_mgr = StdinManager::new();
         let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
 
@@ -1256,16 +1265,14 @@ mod tests {
 
         let line = lines.next_line().await.unwrap().unwrap();
         let actual: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(
-            actual,
-            json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": "hello from WeChat",
-                },
-            })
-        );
+        let content = actual["message"]["content"].as_str().unwrap();
+        assert_eq!(actual["type"], "user");
+        assert_eq!(actual["message"]["role"], "user");
+        assert!(content.contains("这是 TOKENICODE 的微信接入会话"));
+        assert!(content.contains("请使用 Write 工具"));
+        assert!(content.contains("TOKENICODE 会自动上传并发送到微信"));
+        assert!(content.contains("不要因为不能直接操作微信而说通道不支持"));
+        assert!(content.ends_with("hello from WeChat"));
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;
@@ -1425,7 +1432,8 @@ mod tests {
         let line = lines.next_line().await.unwrap().unwrap();
         let actual: serde_json::Value = serde_json::from_str(&line).unwrap();
         let content = actual["message"]["content"].as_str().unwrap();
-        assert!(content.starts_with("微信发来的图片"));
+        assert!(content.contains("这是 TOKENICODE 的微信接入会话"));
+        assert!(content.contains("微信发来的图片"));
         let saved_path = content
             .split("[Attached files]\n")
             .nth(1)
