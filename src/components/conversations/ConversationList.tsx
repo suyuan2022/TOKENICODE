@@ -16,6 +16,7 @@ import { useGroupStore } from '../../stores/groupStore';
 import { initGroupPersistence } from '../../stores/groupPersistence';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { teardownSession, waitForStdinCleared } from '../../lib/sessionLifecycle';
+import { isWechatRemoteSessionId } from '../../lib/wechat-session';
 
 // --- Path utilities ---
 
@@ -108,6 +109,8 @@ export function ConversationList() {
   const isContentSearching = useSessionStore((s) => s.isContentSearching);
   const searchSessionContent = useSessionStore((s) => s.searchSessionContent);
   const clearContentSearch = useSessionStore((s) => s.clearContentSearch);
+  const ensureWechatRemoteSession = useSessionStore((s) => s.ensureWechatRemoteSession);
+  const workingDirectory = useSettingsStore((s) => s.workingDirectory);
 
   // Context menus
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -209,6 +212,17 @@ export function ConversationList() {
     const interval = setInterval(fetchSessions, 30000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    const selectedSession = sessions.find((session) => session.id === selectedId);
+    const fallbackSession = sessions.find((session) => !isWechatRemoteSessionId(session.id));
+    const projectPath = workingDirectory
+      || selectedSession?.project
+      || fallbackSession?.project
+      || '';
+    if (!projectPath) return;
+    ensureWechatRemoteSession(projectPath);
+  }, [ensureWechatRemoteSession, selectedId, sessions.length, workingDirectory]);
 
   // Listen for sessions:changed event for instant refresh
   useEffect(() => {
@@ -346,6 +360,12 @@ export function ConversationList() {
     // Draft sessions
     if (!sessionPath) {
       useChatStore.getState().ensureTab(sessionId);
+      if (isWechatRemoteSessionId(sessionId)) {
+        if (projectOrDir) {
+          useSettingsStore.getState().setWorkingDirectory(resolveProjectPath(projectOrDir));
+        }
+        return;
+      }
       useChatStore.getState().resetTab(sessionId);
       useAgentStore.getState().clearAgents();
       return;
@@ -406,6 +426,7 @@ export function ConversationList() {
 
   // --- Delete handlers ---
   const executeDelete = useCallback(async (sessionId: string, sessionPath: string) => {
+    if (isWechatRemoteSessionId(sessionId)) return;
     try {
       // Kill running process before deleting (S8 fix — prevent residual processes)
       const tab = useChatStore.getState().getTab(sessionId);
@@ -482,6 +503,7 @@ export function ConversationList() {
   const handleContextMenu = useCallback((e: React.MouseEvent, session: SessionListItem) => {
     e.preventDefault();
     e.stopPropagation();
+    if (isWechatRemoteSessionId(session.id)) return;
     setContextMenu({ x: e.clientX, y: e.clientY, session });
   }, []);
 
@@ -661,6 +683,7 @@ export function ConversationList() {
   }, [selectedIds, executeDelete, fetchSessions]);
 
   const handleRename = useCallback((sessionId: string, newName: string) => {
+    if (isWechatRemoteSessionId(sessionId)) return;
     setCustomPreview(sessionId, newName);
   }, [setCustomPreview]);
 

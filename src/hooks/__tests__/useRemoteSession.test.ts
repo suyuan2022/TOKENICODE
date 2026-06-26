@@ -7,12 +7,12 @@ import {
   syncRemotePollingRoute,
 } from '../useRemoteSession';
 import type { ChatMessage } from '../../stores/chatStore';
+import { WECHAT_REMOTE_SESSION_ID } from '../../lib/wechat-session';
 
 describe('resolveRemoteDesktopSessionId', () => {
-  it('uses the active tab stdinId and clears the route when no active process exists', () => {
-    expect(resolveRemoteDesktopSessionId('tab-1', 'stdin-1')).toBe('stdin-1');
-    expect(resolveRemoteDesktopSessionId('tab-1', undefined)).toBeNull();
-    expect(resolveRemoteDesktopSessionId(null, 'stdin-1')).toBeNull();
+  it('uses only the fixed WeChat session stdin route', () => {
+    expect(resolveRemoteDesktopSessionId('stdin-wechat')).toBe('stdin-wechat');
+    expect(resolveRemoteDesktopSessionId(undefined)).toBeNull();
   });
 });
 
@@ -24,11 +24,11 @@ describe('syncRemotePollingRoute', () => {
     expect(calls).toEqual(['start:stdin-1']);
   });
 
-  it('stops polling before clearing the desktop route', async () => {
+  it('clears the desktop route but keeps polling for WeChat commands', async () => {
     const calls: string[] = [];
     await syncRemotePollingRoute(null, fakeBridge(calls));
 
-    expect(calls).toEqual(['stop', 'set:null']);
+    expect(calls).toEqual(['set:null', 'start:']);
   });
 });
 
@@ -51,6 +51,7 @@ describe('applyRemoteDesktopUserMessage', () => {
       {
         getTabForStdin: (stdinId) => (stdinId === 'stdin-1' ? 'tab-1' : undefined),
         addMessage: (_tabId, message) => messages.push(message),
+        touchWechatRemoteSession: () => {},
         newMessageId: () => 'remote-msg-1',
         now: () => 123,
       },
@@ -86,6 +87,7 @@ describe('applyRemoteDesktopUserMessage', () => {
       {
         getTabForStdin: () => undefined,
         addMessage: (_tabId, message) => messages.push(message),
+        touchWechatRemoteSession: () => {},
         newMessageId: () => 'remote-msg-1',
         now: () => 123,
       },
@@ -93,6 +95,28 @@ describe('applyRemoteDesktopUserMessage', () => {
 
     expect(handled).toBe(false);
     expect(messages).toEqual([]);
+  });
+
+  it('refreshes the fixed WeChat session preview when the message lands there', () => {
+    const touches: Array<{ preview: string; modifiedAt: number }> = [];
+
+    const handled = applyRemoteDesktopUserMessage(
+      {
+        desktopSessionId: 'stdin-wechat',
+        content: '微信发来的图片',
+      },
+      {
+        getTabForStdin: (stdinId) =>
+          stdinId === 'stdin-wechat' ? WECHAT_REMOTE_SESSION_ID : undefined,
+        addMessage: () => {},
+        touchWechatRemoteSession: (preview, modifiedAt) => touches.push({ preview, modifiedAt }),
+        newMessageId: () => 'remote-msg-1',
+        now: () => 456,
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(touches).toEqual([{ preview: '微信发来的图片', modifiedAt: 456 }]);
   });
 });
 

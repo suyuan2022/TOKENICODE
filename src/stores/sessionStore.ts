@@ -1,6 +1,11 @@
 import { create } from 'zustand';
 import { bridge, SessionListItem, ContentSearchResult } from '../lib/tauri-bridge';
 import { useGroupStore } from './groupStore';
+import {
+  WECHAT_REMOTE_SESSION_ID,
+  isWechatRemoteSessionId,
+  upsertWechatRemoteSession,
+} from '../lib/wechat-session';
 
 // --- Orphan drain callback ---
 // useStreamProcessor exports drainOrphanBuffer(), but sessionStore can't import
@@ -79,6 +84,10 @@ interface SessionState {
   setSelectedSession: (id: string | null) => void;
   /** Insert a temporary "draft" session at the top of the list */
   addDraftSession: (id: string, projectPath: string) => void;
+  /** Ensure the fixed WeChat remote session is present in the local session list. */
+  ensureWechatRemoteSession: (projectPath: string) => void;
+  /** Update the fixed WeChat remote session preview/time after remote activity. */
+  touchWechatRemoteSession: (preview: string, modifiedAt: number) => void;
   /** Update an existing draft session's project path (e.g. after folder selection) */
   updateDraftProject: (id: string, projectPath: string) => void;
   /** Set a custom display name for a session */
@@ -173,6 +182,22 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       sessions: [draft, ...state.sessions],
       selectedSessionId: id,
     };
+  }),
+
+  ensureWechatRemoteSession: (projectPath) => set((state) => ({
+    sessions: upsertWechatRemoteSession(state.sessions, projectPath),
+  })),
+
+  touchWechatRemoteSession: (preview, modifiedAt) => set((state) => {
+    const existing = state.sessions.find((session) => isWechatRemoteSessionId(session.id));
+    const projectPath = existing?.project || state.sessions[0]?.project || '';
+    const sessions = upsertWechatRemoteSession(state.sessions, projectPath, modifiedAt)
+      .map((session) => (
+        session.id === WECHAT_REMOTE_SESSION_ID
+          ? { ...session, preview: preview || session.preview, modifiedAt }
+          : session
+      ));
+    return { sessions };
   }),
 
   updateDraftProject: (id, projectPath) => set((state) => ({

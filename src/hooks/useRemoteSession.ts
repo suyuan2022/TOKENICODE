@@ -6,6 +6,7 @@ import {
 } from '../lib/tauri-bridge';
 import { generateMessageId, useChatStore, type ChatMessage } from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
+import { WECHAT_REMOTE_SESSION_ID } from '../lib/wechat-session';
 
 export type RemoteSessionBridge = Pick<
   typeof bridge,
@@ -13,10 +14,9 @@ export type RemoteSessionBridge = Pick<
 >;
 
 export function resolveRemoteDesktopSessionId(
-  selectedSessionId: string | null,
-  stdinId: string | undefined,
+  wechatSessionStdinId: string | undefined,
 ): string | null {
-  return selectedSessionId && stdinId ? stdinId : null;
+  return wechatSessionStdinId || null;
 }
 
 export async function syncRemotePollingRoute(
@@ -24,8 +24,8 @@ export async function syncRemotePollingRoute(
   remoteBridge: RemoteSessionBridge = bridge,
 ) {
   if (!route) {
-    await remoteBridge.wechatStopPolling();
     await remoteBridge.wechatSetDesktopSession(null);
+    await remoteBridge.wechatStartPolling('');
     return;
   }
 
@@ -35,6 +35,7 @@ export async function syncRemotePollingRoute(
 export interface RemoteDesktopUserMessageDeps {
   getTabForStdin: (stdinId: string) => string | undefined;
   addMessage: (tabId: string, message: ChatMessage) => void;
+  touchWechatRemoteSession: (preview: string, modifiedAt: number) => void;
   newMessageId: () => string;
   now: () => number;
 }
@@ -44,30 +45,35 @@ export function applyRemoteDesktopUserMessage(
   deps: RemoteDesktopUserMessageDeps = {
     getTabForStdin: (stdinId) => useSessionStore.getState().getTabForStdin(stdinId),
     addMessage: (tabId, chatMessage) => useChatStore.getState().addMessage(tabId, chatMessage),
+    touchWechatRemoteSession: (preview, modifiedAt) =>
+      useSessionStore.getState().touchWechatRemoteSession(preview, modifiedAt),
     newMessageId: generateMessageId,
     now: Date.now,
   },
 ): boolean {
   const tabId = deps.getTabForStdin(message.desktopSessionId);
   if (!tabId) return false;
+  const timestamp = deps.now();
 
   deps.addMessage(tabId, {
     id: deps.newMessageId(),
     role: 'user',
     type: 'text',
     content: message.content,
-    timestamp: deps.now(),
+    timestamp,
     attachments: message.attachments?.length ? message.attachments : undefined,
   });
+  if (tabId === WECHAT_REMOTE_SESSION_ID) {
+    deps.touchWechatRemoteSession(message.content, timestamp);
+  }
   return true;
 }
 
 export function useRemoteSession() {
-  const selectedSessionId = useSessionStore((state) => state.selectedSessionId);
   const activeStdinId = useChatStore((state) =>
-    selectedSessionId ? state.tabs.get(selectedSessionId)?.sessionMeta.stdinId : undefined,
+    state.tabs.get(WECHAT_REMOTE_SESSION_ID)?.sessionMeta.stdinId,
   );
-  const route = resolveRemoteDesktopSessionId(selectedSessionId, activeStdinId);
+  const route = resolveRemoteDesktopSessionId(activeStdinId);
   const publishedRouteRef = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {

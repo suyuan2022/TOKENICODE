@@ -8,6 +8,8 @@ const STALE_QUEUE_NOTICE: &str = "这条消息排队超过 60 秒，请重新发
 const STOP_CONFIRM_NOTICE: &str = "已停止当前任务，并清空排队消息。";
 const STOP_IDLE_NOTICE: &str = "当前没有正在运行的任务。";
 const HELP_NOTICE: &str = "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n\n权限请求时，回复 approve/deny 或 同意/拒绝。";
+const NO_DESKTOP_SESSION_NOTICE: &str =
+    "微信已连接，但还没有绑定 TOKENICODE 的「微信接入」专用窗口。请先在桌面左侧打开「微信接入」并启动一次会话。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BasicRemoteCommand {
@@ -168,6 +170,14 @@ impl WechatTurnManager {
                 return effects;
             }
         }
+        if self.desktop_session_id.is_none() {
+            effects.push(WechatTurnEffect::SendWeChatText {
+                to_user_id: message.from_user_id,
+                context_token: message.context_token,
+                text: NO_DESKTOP_SESSION_NOTICE.into(),
+            });
+            return effects;
+        }
         self.queue.push_back(InboundWechatTurn::Text(message));
         effects.extend(self.start_next_turn());
         effects
@@ -175,6 +185,14 @@ impl WechatTurnManager {
 
     pub fn receive_media(&mut self, media: InboundWechatMedia) -> Vec<WechatTurnEffect> {
         let mut effects = self.discard_stale(media.received_at_ms);
+        if self.desktop_session_id.is_none() {
+            effects.push(WechatTurnEffect::SendWeChatText {
+                to_user_id: media.from_user_id,
+                context_token: media.context_token,
+                text: NO_DESKTOP_SESSION_NOTICE.into(),
+            });
+            return effects;
+        }
         self.queue.push_back(InboundWechatTurn::Media(media));
         effects.extend(self.start_next_turn());
         effects
@@ -478,6 +496,25 @@ mod tests {
             ],
         );
         assert_eq!(manager.active_turn_message_id(), Some("msg-1"));
+        assert_eq!(manager.queued_len(), 0);
+    }
+
+    #[test]
+    fn unbound_text_gets_notice_instead_of_entering_current_desktop_session() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+
+        let effects = manager.receive_text(text_message("msg-1", "hello", 0));
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user@im.wechat".into(),
+                context_token: "ctx-msg-1".into(),
+                text: NO_DESKTOP_SESSION_NOTICE.into(),
+            }],
+        );
+        assert_eq!(manager.active_turn_message_id(), None);
         assert_eq!(manager.queued_len(), 0);
     }
 
