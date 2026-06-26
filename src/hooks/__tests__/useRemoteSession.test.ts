@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  applyRemoteClearDesktopConversation,
   applyRemoteDesktopUserMessage,
   resolveRemoteDesktopSessionId,
   type RemoteSessionBridge,
@@ -24,17 +25,20 @@ describe('syncRemotePollingRoute', () => {
     expect(calls).toEqual(['start:stdin-1']);
   });
 
-  it('clears the desktop route but keeps polling for WeChat commands', async () => {
+  it('keeps the last desktop route when the fixed window route is temporarily unavailable', async () => {
     const calls: string[] = [];
     await syncRemotePollingRoute(null, fakeBridge(calls));
 
-    expect(calls).toEqual(['set:null', 'start:']);
+    expect(calls).toEqual(['start:']);
   });
 });
 
 describe('applyRemoteDesktopUserMessage', () => {
   it('appends a WeChat user message to the tab that owns the stdin route', () => {
     const messages: ChatMessage[] = [];
+    const statuses: string[] = [];
+    const activities: string[] = [];
+    const metas: Array<Record<string, unknown>> = [];
 
     const handled = applyRemoteDesktopUserMessage(
       {
@@ -51,6 +55,9 @@ describe('applyRemoteDesktopUserMessage', () => {
       {
         getTabForStdin: (stdinId) => (stdinId === 'stdin-1' ? 'tab-1' : undefined),
         addMessage: (_tabId, message) => messages.push(message),
+        setSessionStatus: (_tabId, status) => statuses.push(status),
+        setActivityStatus: (_tabId, status) => activities.push(status.phase),
+        setSessionMeta: (_tabId, meta) => metas.push(meta),
         touchWechatRemoteSession: () => {},
         newMessageId: () => 'remote-msg-1',
         now: () => 123,
@@ -74,6 +81,17 @@ describe('applyRemoteDesktopUserMessage', () => {
         ],
       },
     ]);
+    expect(statuses).toEqual(['running']);
+    expect(activities).toEqual(['thinking']);
+    expect(metas).toEqual([
+      {
+        turnStartTime: 123,
+        lastProgressAt: 123,
+        apiRetry: undefined,
+        inputTokens: 0,
+        outputTokens: 0,
+      },
+    ]);
   });
 
   it('ignores remote user messages for unknown stdin routes', () => {
@@ -87,6 +105,9 @@ describe('applyRemoteDesktopUserMessage', () => {
       {
         getTabForStdin: () => undefined,
         addMessage: (_tabId, message) => messages.push(message),
+        setSessionStatus: () => {},
+        setActivityStatus: () => {},
+        setSessionMeta: () => {},
         touchWechatRemoteSession: () => {},
         newMessageId: () => 'remote-msg-1',
         now: () => 123,
@@ -109,6 +130,9 @@ describe('applyRemoteDesktopUserMessage', () => {
         getTabForStdin: (stdinId) =>
           stdinId === 'stdin-wechat' ? WECHAT_REMOTE_SESSION_ID : undefined,
         addMessage: () => {},
+        setSessionStatus: () => {},
+        setActivityStatus: () => {},
+        setSessionMeta: () => {},
         touchWechatRemoteSession: (preview, modifiedAt) => touches.push({ preview, modifiedAt }),
         newMessageId: () => 'remote-msg-1',
         now: () => 456,
@@ -117,6 +141,41 @@ describe('applyRemoteDesktopUserMessage', () => {
 
     expect(handled).toBe(true);
     expect(touches).toEqual([{ preview: '微信发来的图片', modifiedAt: 456 }]);
+  });
+});
+
+describe('applyRemoteClearDesktopConversation', () => {
+  it('clears the tab that owns the WeChat stdin route without dropping the route', () => {
+    const cleared: string[] = [];
+
+    const handled = applyRemoteClearDesktopConversation(
+      { desktopSessionId: 'stdin-wechat' },
+      {
+        getTabForStdin: (stdinId) =>
+          stdinId === 'stdin-wechat' ? WECHAT_REMOTE_SESSION_ID : undefined,
+        clearMessages: (tabId) => cleared.push(tabId),
+        touchWechatRemoteSession: () => {},
+      },
+    );
+
+    expect(handled).toBe(true);
+    expect(cleared).toEqual([WECHAT_REMOTE_SESSION_ID]);
+  });
+
+  it('ignores clear events for unknown stdin routes', () => {
+    const cleared: string[] = [];
+
+    const handled = applyRemoteClearDesktopConversation(
+      { desktopSessionId: 'missing-stdin' },
+      {
+        getTabForStdin: () => undefined,
+        clearMessages: (tabId) => cleared.push(tabId),
+        touchWechatRemoteSession: () => {},
+      },
+    );
+
+    expect(handled).toBe(false);
+    expect(cleared).toEqual([]);
   });
 });
 

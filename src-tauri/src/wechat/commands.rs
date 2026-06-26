@@ -181,7 +181,9 @@ pub async fn wechat_start_polling(
     polling_task: State<'_, WechatPollingTask>,
     stdin_mgr: State<'_, StdinManager>,
 ) -> Result<(), String> {
-    set_desktop_session(runtime.inner(), Some(session_id)).await;
+    if !session_id.trim().is_empty() {
+        set_desktop_session(runtime.inner(), Some(session_id)).await;
+    }
     if start_polling_task(
         runtime.inner(),
         polling_task.inner(),

@@ -17,7 +17,9 @@ use crate::{
     events::emit_to_frontend,
     wechat::{
         api::{GetUpdatesResponse, IlinkApiClient, IlinkHttpRequest},
-        executor::{execute_turn_effects_with, WechatDesktopUserMessage},
+        executor::{
+            execute_turn_effects_with, WechatDesktopClearConversation, WechatDesktopUserMessage,
+        },
         monitor::MonitorStatus,
         runtime::WechatRuntimeHandle,
     },
@@ -100,6 +102,7 @@ pub struct WechatPollIteration {
     pub claude_effect_count: usize,
     pub wechat_effect_count: usize,
     pub desktop_user_messages: Vec<WechatDesktopUserMessage>,
+    pub desktop_clear_conversations: Vec<WechatDesktopClearConversation>,
     pub next_timeout_ms: u64,
 }
 
@@ -172,6 +175,7 @@ where
             claude_effect_count: 0,
             wechat_effect_count: 0,
             desktop_user_messages: Vec::new(),
+            desktop_clear_conversations: Vec::new(),
             next_timeout_ms: NO_ACCOUNT_RETRY_MS,
         });
     };
@@ -199,6 +203,7 @@ where
         claude_effect_count: dispatch.claude_effect_count,
         wechat_effect_count: dispatch.wechat_effect_count,
         desktop_user_messages: dispatch.desktop_user_messages,
+        desktop_clear_conversations: dispatch.desktop_clear_conversations,
         next_timeout_ms: outcome.next_timeout_ms,
     })
 }
@@ -242,11 +247,19 @@ async fn run_poll_loop(
             Ok(iteration) if iteration.status == Some(MonitorStatus::SessionExpired) => {
                 emit_wechat_status_event(app.as_ref(), iteration.status_event.as_ref());
                 emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
+                emit_desktop_clear_conversations(
+                    app.as_ref(),
+                    &iteration.desktop_clear_conversations,
+                );
                 iteration.next_timeout_ms
             }
             Ok(iteration) if iteration.polled => {
                 emit_wechat_status_event(app.as_ref(), iteration.status_event.as_ref());
                 emit_desktop_user_messages(app.as_ref(), &iteration.desktop_user_messages);
+                emit_desktop_clear_conversations(
+                    app.as_ref(),
+                    &iteration.desktop_clear_conversations,
+                );
                 0
             }
             Ok(_) => NO_ACCOUNT_RETRY_MS,
@@ -276,6 +289,21 @@ fn emit_desktop_user_messages(app: Option<&AppHandle>, messages: &[WechatDesktop
     for message in messages {
         if let Err(err) = emit_to_frontend(app, "wechat:desktop_user_message", message) {
             eprintln!("[WeChat] desktop user message emit failed: {err}");
+        }
+    }
+}
+
+fn emit_desktop_clear_conversations(
+    app: Option<&AppHandle>,
+    messages: &[WechatDesktopClearConversation],
+) {
+    let Some(app) = app else {
+        return;
+    };
+
+    for message in messages {
+        if let Err(err) = emit_to_frontend(app, "wechat:clear_desktop_conversation", message) {
+            eprintln!("[WeChat] desktop clear conversation emit failed: {err}");
         }
     }
 }

@@ -49,6 +49,7 @@ pub struct WechatEffectDispatch {
     pub claude_effect_count: usize,
     pub wechat_effect_count: usize,
     pub desktop_user_messages: Vec<WechatDesktopUserMessage>,
+    pub desktop_clear_conversations: Vec<WechatDesktopClearConversation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,6 +66,12 @@ pub struct WechatDesktopAttachment {
     pub name: String,
     pub path: String,
     pub is_image: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WechatDesktopClearConversation {
+    pub desktop_session_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +99,13 @@ pub async fn execute_claude_effect(
             stdin_mgr
                 .send(desktop_session_id, &payload.to_string())
                 .await?;
+            Ok(true)
+        }
+        WechatTurnEffect::SendClaudeSlashCommand {
+            desktop_session_id,
+            command,
+        } => {
+            stdin_mgr.send(desktop_session_id, command).await?;
             Ok(true)
         }
         WechatTurnEffect::RespondPermission {
@@ -223,6 +237,9 @@ where
     let mut dispatch = WechatEffectDispatch::default();
     for effect in effects {
         let mut desktop_user_message = desktop_user_message_for_text_effect(effect);
+        if let Some(clear) = desktop_clear_conversation_for_effect(effect) {
+            dispatch.desktop_clear_conversations.push(clear);
+        }
         let mut handled_claude = execute_claude_effect(stdin_mgr, effect).await?;
         if !handled_claude {
             if let Some(message) =
@@ -908,6 +925,18 @@ fn desktop_user_message_for_text_effect(
     })
 }
 
+fn desktop_clear_conversation_for_effect(
+    effect: &WechatTurnEffect,
+) -> Option<WechatDesktopClearConversation> {
+    let WechatTurnEffect::ClearDesktopConversation { desktop_session_id } = effect else {
+        return None;
+    };
+
+    Some(WechatDesktopClearConversation {
+        desktop_session_id: desktop_session_id.clone(),
+    })
+}
+
 fn media_display_text(media: &InboundWechatMedia) -> String {
     let label = match media.kind {
         InboundWechatMediaKind::Image => "微信发来的图片",
@@ -1211,6 +1240,56 @@ mod tests {
 
         stdin_mgr.remove("stdin-1").await;
         let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn slash_command_effect_writes_raw_command_to_existing_stdin_manager() {
+        let stdin_mgr = StdinManager::new();
+        let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
+
+        let handled = execute_claude_effect(
+            &stdin_mgr,
+            &WechatTurnEffect::SendClaudeSlashCommand {
+                desktop_session_id: "stdin-1".into(),
+                command: "/clear".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(handled);
+        assert_eq!(line, "/clear");
+
+        stdin_mgr.remove("stdin-1").await;
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn clear_desktop_conversation_effect_is_reported_to_frontend_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        let stdin_mgr = StdinManager::new();
+
+        let dispatch = execute_turn_effects_with(
+            &stdin_mgr,
+            &store,
+            &[WechatTurnEffect::ClearDesktopConversation {
+                desktop_session_id: "stdin-1".into(),
+            }],
+            |_request| async { Ok(json!({ "ret": 0 })) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatch.claude_effect_count, 0);
+        assert_eq!(dispatch.wechat_effect_count, 0);
+        assert_eq!(
+            dispatch.desktop_clear_conversations,
+            vec![WechatDesktopClearConversation {
+                desktop_session_id: "stdin-1".into(),
+            }]
+        );
     }
 
     #[tokio::test]

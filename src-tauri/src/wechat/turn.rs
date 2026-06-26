@@ -7,7 +7,9 @@ const STALE_QUEUE_AFTER_MS: u64 = 60_000;
 const STALE_QUEUE_NOTICE: &str = "这条消息排队超过 60 秒，请重新发送。";
 const STOP_CONFIRM_NOTICE: &str = "已停止当前任务，并清空排队消息。";
 const STOP_IDLE_NOTICE: &str = "当前没有正在运行的任务。";
-const HELP_NOTICE: &str = "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n\n权限请求时，回复 approve/deny 或 同意/拒绝。";
+const CLEAR_CONTEXT_NOTICE: &str = "已清空当前「微信接入」上下文。";
+const CLEAR_WHILE_RUNNING_NOTICE: &str = "当前任务正在运行，请先发送 /stop，再发送 /clear。";
+const HELP_NOTICE: &str = "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n/clear 或 /new 清空当前「微信接入」上下文\n\n权限请求时，回复 approve/deny 或 同意/拒绝。";
 const NO_DESKTOP_SESSION_NOTICE: &str =
     "微信已连接，但还没有绑定 TOKENICODE 的「微信接入」专用窗口。请先在桌面左侧打开「微信接入」并启动一次会话。";
 
@@ -15,6 +17,7 @@ const NO_DESKTOP_SESSION_NOTICE: &str =
 enum BasicRemoteCommand {
     Help,
     Status,
+    ClearContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,13 @@ pub enum WechatTurnEffect {
     SendToClaude {
         desktop_session_id: String,
         text: String,
+    },
+    SendClaudeSlashCommand {
+        desktop_session_id: String,
+        command: String,
+    },
+    ClearDesktopConversation {
+        desktop_session_id: String,
     },
     DownloadMediaToClaude {
         desktop_session_id: String,
@@ -348,6 +358,9 @@ impl WechatTurnManager {
         let text = match command {
             BasicRemoteCommand::Help => HELP_NOTICE.into(),
             BasicRemoteCommand::Status => self.status_notice(),
+            BasicRemoteCommand::ClearContext => {
+                return self.clear_current_context(message);
+            }
         };
 
         vec![WechatTurnEffect::SendWeChatText {
@@ -355,6 +368,39 @@ impl WechatTurnManager {
             context_token: message.context_token,
             text,
         }]
+    }
+
+    fn clear_current_context(&self, message: InboundWechatText) -> Vec<WechatTurnEffect> {
+        if self.active_turn.is_some() || !self.queue.is_empty() || self.pending_permission.is_some()
+        {
+            return vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: message.from_user_id,
+                context_token: message.context_token,
+                text: CLEAR_WHILE_RUNNING_NOTICE.into(),
+            }];
+        }
+        let Some(desktop_session_id) = self.desktop_session_id.clone() else {
+            return vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: message.from_user_id,
+                context_token: message.context_token,
+                text: NO_DESKTOP_SESSION_NOTICE.into(),
+            }];
+        };
+
+        vec![
+            WechatTurnEffect::ClearDesktopConversation {
+                desktop_session_id: desktop_session_id.clone(),
+            },
+            WechatTurnEffect::SendClaudeSlashCommand {
+                desktop_session_id,
+                command: "/clear".into(),
+            },
+            WechatTurnEffect::SendWeChatText {
+                to_user_id: message.from_user_id,
+                context_token: message.context_token,
+                text: CLEAR_CONTEXT_NOTICE.into(),
+            },
+        ]
     }
 
     fn status_notice(&self) -> String {
@@ -445,6 +491,9 @@ fn parse_basic_remote_command(text: &str) -> Option<BasicRemoteCommand> {
     match text.trim().to_ascii_lowercase().as_str() {
         "/help" | "help" | "帮助" | "幫助" => Some(BasicRemoteCommand::Help),
         "/status" | "status" | "状态" | "狀態" => Some(BasicRemoteCommand::Status),
+        "/clear" | "clear" | "/new" | "new" | "清空" | "清除上下文" | "新会话" => {
+            Some(BasicRemoteCommand::ClearContext)
+        }
         _ => None,
     }
 }
@@ -755,7 +804,7 @@ mod tests {
             vec![WechatTurnEffect::SendWeChatText {
                 to_user_id: "user@im.wechat".into(),
                 context_token: "ctx-msg-1".into(),
-                text: "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n\n权限请求时，回复 approve/deny 或 同意/拒绝。"
+                text: "可用命令：\n/help 查看帮助\n/status 查看微信远程状态\n/stop 停止当前任务并清空排队消息\n/clear 或 /new 清空当前「微信接入」上下文\n\n权限请求时，回复 approve/deny 或 同意/拒绝。"
                     .into(),
             }],
         );
@@ -791,6 +840,79 @@ mod tests {
         assert_eq!(manager.active_turn_message_id(), Some("msg-1"));
         assert_eq!(manager.queued_len(), 1);
         assert_eq!(manager.pending_permission_request_id(), Some("perm-1"));
+    }
+
+    #[test]
+    fn clear_command_clears_desktop_context_without_starting_a_turn() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+        manager.set_desktop_session("stdin-1".into());
+
+        let effects = manager.receive_text(text_message("msg-1", "/clear", 0));
+
+        assert_eq!(
+            effects,
+            vec![
+                WechatTurnEffect::ClearDesktopConversation {
+                    desktop_session_id: "stdin-1".into(),
+                },
+                WechatTurnEffect::SendClaudeSlashCommand {
+                    desktop_session_id: "stdin-1".into(),
+                    command: "/clear".into(),
+                },
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user@im.wechat".into(),
+                    context_token: "ctx-msg-1".into(),
+                    text: "已清空当前「微信接入」上下文。".into(),
+                },
+            ],
+        );
+        assert_eq!(manager.active_turn_message_id(), None);
+        assert_eq!(manager.queued_len(), 0);
+    }
+
+    #[test]
+    fn new_command_uses_clear_context_behavior() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+        manager.set_desktop_session("stdin-1".into());
+
+        let effects = manager.receive_text(text_message("msg-1", "/new", 0));
+
+        assert_eq!(
+            effects,
+            vec![
+                WechatTurnEffect::ClearDesktopConversation {
+                    desktop_session_id: "stdin-1".into(),
+                },
+                WechatTurnEffect::SendClaudeSlashCommand {
+                    desktop_session_id: "stdin-1".into(),
+                    command: "/clear".into(),
+                },
+                WechatTurnEffect::SendWeChatText {
+                    to_user_id: "user@im.wechat".into(),
+                    context_token: "ctx-msg-1".into(),
+                    text: "已清空当前「微信接入」上下文。".into(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn clear_command_requires_a_bound_desktop_session() {
+        let mut manager = WechatTurnManager::default();
+        manager.connect();
+
+        let effects = manager.receive_text(text_message("msg-1", "/clear", 0));
+
+        assert_eq!(
+            effects,
+            vec![WechatTurnEffect::SendWeChatText {
+                to_user_id: "user@im.wechat".into(),
+                context_token: "ctx-msg-1".into(),
+                text: NO_DESKTOP_SESSION_NOTICE.into(),
+            }],
+        );
     }
 
     #[test]

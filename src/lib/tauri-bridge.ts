@@ -172,6 +172,10 @@ export interface WechatDesktopUserMessageEvent {
   attachments?: WechatDesktopAttachment[];
 }
 
+export interface WechatDesktopClearConversationEvent {
+  desktopSessionId: string;
+}
+
 export interface StepResult {
   ok: boolean;
   message: string;
@@ -639,6 +643,15 @@ export function onWechatDesktopUserMessage(
 ): Promise<UnlistenFn> {
   return listen<WechatDesktopUserMessageEvent>(
     'wechat:desktop_user_message',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopClearConversation(
+  callback: (message: WechatDesktopClearConversationEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopClearConversationEvent>(
+    'wechat:clear_desktop_conversation',
     (event) => callback(event.payload),
   );
 }
