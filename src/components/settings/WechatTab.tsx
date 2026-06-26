@@ -170,13 +170,13 @@ export function WechatTab() {
         </div>
 
         {qrcodeImage && phase !== 'connected' && (
-          <div className="mt-4 flex items-center gap-4">
+          <div className="mt-4 flex items-start gap-5">
             <img
               src={qrcodeImage}
               alt={t('wechat.qrAlt')}
-              className="w-44 h-44 rounded-lg border border-border-subtle bg-white p-2"
+              className="h-56 w-56 shrink-0 rounded-lg border border-border-subtle bg-white p-3 shadow-sm [image-rendering:pixelated]"
             />
-            <div className="min-w-0">
+            <div className="min-w-0 pt-2">
               <div className="text-[13px] font-medium text-text-primary">
                 {phase === 'scanned' ? t('wechat.scanned') : t('wechat.waiting')}
               </div>
