@@ -1,3 +1,8 @@
+#[cfg(not(test))]
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, Mutex as StdMutex},
+};
 use std::{
     future::Future,
     path::Path,
@@ -10,6 +15,8 @@ use rand::RngCore;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
 use serde_json::Value;
+#[cfg(not(test))]
+use tokio::task::JoinHandle;
 
 use super::{
     api::{
@@ -29,6 +36,13 @@ use super::{
 const MAX_WECHAT_TEXT_CHARS: usize = 3_800;
 const MAX_WECHAT_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const SEND_CIRCUIT_OPEN_MS: u64 = 30_000;
+const TYPING_TICKET_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+#[cfg(not(test))]
+const TYPING_KEEPALIVE_INTERVAL_MS: u64 = 5_000;
+
+#[cfg(not(test))]
+static TYPING_KEEPALIVE_TASKS: LazyLock<StdMutex<HashMap<String, JoinHandle<()>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WechatEffectDispatch {
@@ -373,8 +387,11 @@ where
             to_user_id,
             context_token,
         } => {
+            let keepalive_key = typing_keepalive_key(&account.account_id, to_user_id);
             execute_typing_effect(
                 &client,
+                store,
+                &keepalive_key,
                 to_user_id,
                 context_token,
                 TypingStatus::Start,
@@ -386,8 +403,11 @@ where
             to_user_id,
             context_token,
         } => {
+            let keepalive_key = typing_keepalive_key(&account.account_id, to_user_id);
             execute_typing_effect(
                 &client,
+                store,
+                &keepalive_key,
                 to_user_id,
                 context_token,
                 TypingStatus::Stop,
@@ -620,6 +640,8 @@ fn trip_send_circuit(store: &WechatStateStore) -> Result<(), String> {
 
 async fn execute_typing_effect<F, Fut>(
     client: &IlinkApiClient,
+    store: &WechatStateStore,
+    keepalive_key: &str,
     to_user_id: &str,
     context_token: &str,
     status: TypingStatus,
@@ -629,35 +651,177 @@ where
     F: FnMut(IlinkHttpRequest) -> Fut,
     Fut: Future<Output = Result<Value, String>>,
 {
+    if status == TypingStatus::Stop {
+        stop_typing_keepalive(keepalive_key);
+    }
+
+    let Some(ticket) =
+        resolve_typing_ticket(client, store, to_user_id, context_token, execute_request).await
+    else {
+        return Ok(true);
+    };
+
+    let sent = send_typing_best_effort(client, to_user_id, &ticket, status, execute_request).await;
+    if status == TypingStatus::Start && sent {
+        start_typing_keepalive(
+            keepalive_key.to_string(),
+            client.clone(),
+            to_user_id.to_string(),
+            ticket,
+        );
+    }
+    Ok(true)
+}
+
+async fn resolve_typing_ticket<F, Fut>(
+    client: &IlinkApiClient,
+    store: &WechatStateStore,
+    to_user_id: &str,
+    context_token: &str,
+    execute_request: &mut F,
+) -> Option<String>
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    match store.load_typing_ticket(to_user_id) {
+        Ok(Some(cached))
+            if !cached.ticket.trim().is_empty()
+                && now_ms().saturating_sub(cached.fetched_at_ms) < TYPING_TICKET_TTL_MS =>
+        {
+            return Some(cached.ticket.trim().to_string());
+        }
+        Ok(_) => {}
+        Err(err) => eprintln!("[WeChat] load typing ticket cache failed: {err}"),
+    }
+
     let config_request = client.get_config_request(to_user_id, Some(context_token));
     let config_value = match execute_request(config_request).await {
         Ok(value) => value,
         Err(err) => {
             eprintln!("[WeChat] getconfig for typing failed: {err}");
-            return Ok(true);
+            return None;
         }
     };
     let config: GetConfigResponse = match parse_response(config_value) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("[WeChat] parse getconfig for typing failed: {err}");
-            return Ok(true);
+            return None;
         }
     };
-    let Some(ticket) = config
+    if config.ret.unwrap_or_default() != 0 {
+        return None;
+    }
+    let ticket = config
         .typing_ticket
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .filter(|_| config.ret.unwrap_or_default() == 0)
-    else {
-        return Ok(true);
-    };
+        .filter(|value| !value.is_empty())?;
 
-    let typing_request = client.send_typing_request(to_user_id, &ticket, status);
-    if let Err(err) = execute_request(typing_request).await {
-        eprintln!("[WeChat] sendtyping failed: {err}");
+    if let Err(err) = store.save_typing_ticket(to_user_id, &ticket, now_ms()) {
+        eprintln!("[WeChat] save typing ticket cache failed: {err}");
     }
-    Ok(true)
+    Some(ticket)
+}
+
+async fn send_typing_best_effort<F, Fut>(
+    client: &IlinkApiClient,
+    to_user_id: &str,
+    ticket: &str,
+    status: TypingStatus,
+    execute_request: &mut F,
+) -> bool
+where
+    F: FnMut(IlinkHttpRequest) -> Fut,
+    Fut: Future<Output = Result<Value, String>>,
+{
+    let typing_request = client.send_typing_request(to_user_id, ticket, status);
+    match execute_request(typing_request).await {
+        Ok(value) => {
+            let ret = value.get("ret").and_then(Value::as_i64).unwrap_or_default();
+            if ret != 0 {
+                let errmsg = value
+                    .get("errmsg")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                eprintln!("[WeChat] sendtyping returned ret={ret} errmsg={errmsg}");
+                return false;
+            }
+            true
+        }
+        Err(err) => {
+            eprintln!("[WeChat] sendtyping failed: {err}");
+            false
+        }
+    }
+}
+
+fn typing_keepalive_key(account_id: &str, to_user_id: &str) -> String {
+    format!("{account_id}:{to_user_id}")
+}
+
+#[cfg(not(test))]
+fn start_typing_keepalive(key: String, client: IlinkApiClient, to_user_id: String, ticket: String) {
+    stop_typing_keepalive(&key);
+    let handle = tokio::spawn(async move {
+        run_typing_keepalive_loop(TYPING_KEEPALIVE_INTERVAL_MS, || {
+            let client = client.clone();
+            let request = client.send_typing_request(&to_user_id, &ticket, TypingStatus::Start);
+            async move {
+                let value = client
+                    .execute_json::<Value>(request)
+                    .await
+                    .map_err(|err| format!("sendtyping keepalive failed: {err}"))?;
+                let ret = value.get("ret").and_then(Value::as_i64).unwrap_or_default();
+                if ret == 0 {
+                    Ok(())
+                } else {
+                    let errmsg = value
+                        .get("errmsg")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    Err(format!(
+                        "sendtyping keepalive returned ret={ret} errmsg={errmsg}"
+                    ))
+                }
+            }
+        })
+        .await;
+    });
+    TYPING_KEEPALIVE_TASKS.lock().unwrap().insert(key, handle);
+}
+
+#[cfg(test)]
+fn start_typing_keepalive(
+    _key: String,
+    _client: IlinkApiClient,
+    _to_user_id: String,
+    _ticket: String,
+) {
+}
+
+#[cfg(not(test))]
+fn stop_typing_keepalive(key: &str) {
+    if let Some(handle) = TYPING_KEEPALIVE_TASKS.lock().unwrap().remove(key) {
+        handle.abort();
+    }
+}
+
+#[cfg(test)]
+fn stop_typing_keepalive(_key: &str) {}
+
+async fn run_typing_keepalive_loop<F, Fut>(interval_ms: u64, mut send_start: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    loop {
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        if let Err(err) = send_start().await {
+            eprintln!("[WeChat] {err}");
+            return;
+        }
+    }
 }
 
 fn parse_response<T: DeserializeOwned>(value: Value) -> Result<T, String> {
@@ -1956,6 +2120,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typing_effect_reuses_cached_ticket_without_getconfig() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        store
+            .save_typing_ticket("user-1", "cached-ticket", now_ms())
+            .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::StartTyping {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Ok(json!({ "ret": 0 }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
+        );
+        assert_eq!(requests[0].body["typing_ticket"], "cached-ticket");
+        assert_eq!(requests[0].body["status"], 1);
+    }
+
+    #[tokio::test]
+    async fn typing_effect_refreshes_expired_cached_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WechatStateStore::new(dir.path().to_path_buf());
+        store.save_account(&account()).unwrap();
+        store
+            .save_typing_ticket("user-1", "stale-ticket", 1)
+            .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let handled = execute_wechat_effect_with(
+            &WechatTurnEffect::StartTyping {
+                to_user_id: "user-1".into(),
+                context_token: "ctx-1".into(),
+            },
+            &store,
+            move |request| {
+                let captured = captured.clone();
+                async move {
+                    let mut requests = captured.lock().unwrap();
+                    requests.push(request);
+                    if requests.len() == 1 {
+                        Ok(json!({ "ret": 0, "typing_ticket": "fresh-ticket" }))
+                    } else {
+                        Ok(json!({ "ret": 0 }))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(handled);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/getconfig"
+        );
+        assert_eq!(
+            requests[1].url,
+            "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
+        );
+        assert_eq!(requests[1].body["typing_ticket"], "fresh-ticket");
+        drop(requests);
+        assert_eq!(
+            store.load_typing_ticket("user-1").unwrap().unwrap().ticket,
+            "fresh-ticket"
+        );
+    }
+
+    #[tokio::test]
     async fn typing_effect_treats_config_failure_as_handled() {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
@@ -1973,6 +2228,28 @@ mod tests {
         .unwrap();
 
         assert!(handled);
+    }
+
+    #[tokio::test]
+    async fn typing_keepalive_loop_repeats_until_send_fails() {
+        let sends = Arc::new(Mutex::new(0usize));
+        let captured = sends.clone();
+
+        run_typing_keepalive_loop(1, move || {
+            let captured = captured.clone();
+            async move {
+                let mut sends = captured.lock().unwrap();
+                *sends += 1;
+                if *sends >= 3 {
+                    Err("stop keepalive".into())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(*sends.lock().unwrap(), 3);
     }
 
     async fn spawn_echo_session(

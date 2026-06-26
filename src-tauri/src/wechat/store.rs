@@ -25,6 +25,12 @@ pub struct WechatStateStore {
     dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WechatTypingTicket {
+    pub ticket: String,
+    pub fetched_at_ms: u64,
+}
+
 impl WechatStateStore {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
@@ -39,7 +45,8 @@ impl WechatStateStore {
     }
 
     pub fn clear_account(&self) -> StoreResult<()> {
-        remove_if_exists(&self.account_path())
+        remove_if_exists(&self.account_path())?;
+        self.clear_typing_tickets()
     }
 
     pub fn save_sync_buf(&self, sync_buf: &str) -> StoreResult<()> {
@@ -84,6 +91,31 @@ impl WechatStateStore {
         remove_if_exists(&self.send_circuit_path())
     }
 
+    pub fn save_typing_ticket(
+        &self,
+        user_id: &str,
+        ticket: &str,
+        fetched_at_ms: u64,
+    ) -> StoreResult<()> {
+        let mut tickets = self.load_typing_tickets()?;
+        tickets.insert(
+            user_id.into(),
+            WechatTypingTicket {
+                ticket: ticket.into(),
+                fetched_at_ms,
+            },
+        );
+        write_json(&self.typing_tickets_path(), &tickets)
+    }
+
+    pub fn load_typing_ticket(&self, user_id: &str) -> StoreResult<Option<WechatTypingTicket>> {
+        Ok(self.load_typing_tickets()?.get(user_id).cloned())
+    }
+
+    pub fn clear_typing_tickets(&self) -> StoreResult<()> {
+        remove_if_exists(&self.typing_tickets_path())
+    }
+
     pub fn save_inbound_media(
         &self,
         media: &InboundWechatMedia,
@@ -101,6 +133,10 @@ impl WechatStateStore {
         Ok(read_json(&self.context_tokens_path())?.unwrap_or_default())
     }
 
+    fn load_typing_tickets(&self) -> StoreResult<BTreeMap<String, WechatTypingTicket>> {
+        Ok(read_json(&self.typing_tickets_path())?.unwrap_or_default())
+    }
+
     fn account_path(&self) -> PathBuf {
         self.dir.join("account.json")
     }
@@ -115,6 +151,10 @@ impl WechatStateStore {
 
     fn send_circuit_path(&self) -> PathBuf {
         self.dir.join("send_circuit_until_ms")
+    }
+
+    fn typing_tickets_path(&self) -> PathBuf {
+        self.dir.join("typing_tickets.json")
     }
 }
 
@@ -221,6 +261,9 @@ mod tests {
         store.save_account(&account).unwrap();
         store.save_sync_buf("cursor-1").unwrap();
         store.save_context_token("user-1", "ctx-1").unwrap();
+        store
+            .save_typing_ticket("user-1", "typing-ticket-1", 123)
+            .unwrap();
 
         let reloaded = WechatStateStore::new(dir.path().to_path_buf());
         assert_eq!(reloaded.load_account().unwrap(), Some(account));
@@ -228,6 +271,13 @@ mod tests {
         assert_eq!(
             reloaded.load_context_token("user-1").unwrap(),
             Some("ctx-1".into())
+        );
+        assert_eq!(
+            reloaded.load_typing_ticket("user-1").unwrap(),
+            Some(WechatTypingTicket {
+                ticket: "typing-ticket-1".into(),
+                fetched_at_ms: 123,
+            })
         );
     }
 
@@ -246,6 +296,9 @@ mod tests {
             .unwrap();
         store.save_sync_buf("cursor-1").unwrap();
         store.save_context_token("user-1", "ctx-1").unwrap();
+        store
+            .save_typing_ticket("user-1", "typing-ticket-1", 123)
+            .unwrap();
 
         store.clear_account().unwrap();
 
@@ -255,6 +308,7 @@ mod tests {
             store.load_context_token("user-1").unwrap(),
             Some("ctx-1".into())
         );
+        assert_eq!(store.load_typing_ticket("user-1").unwrap(), None);
     }
 
     #[test]
