@@ -2,6 +2,7 @@ import type { SessionListItem } from './tauri-bridge';
 
 export const WECHAT_REMOTE_SESSION_ID = 'wechat_remote_session';
 export const WECHAT_REMOTE_SESSION_TITLE = '微信接入';
+export const WECHAT_CONNECTED_EVENT = 'tokenicode:wechat-connected';
 
 export function isWechatRemoteSessionId(id: string | null | undefined): boolean {
   return id === WECHAT_REMOTE_SESSION_ID;

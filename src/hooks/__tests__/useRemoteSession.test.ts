@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyRemoteClearDesktopConversation,
   applyRemoteDesktopUserMessage,
+  ensureWechatRemoteSession,
   resolveRemoteDesktopSessionId,
   type RemoteSessionBridge,
   syncRemotePollingRoute,
@@ -30,6 +31,59 @@ describe('syncRemotePollingRoute', () => {
     await syncRemotePollingRoute(null, fakeBridge(calls));
 
     expect(calls).toEqual(['start:']);
+  });
+});
+
+describe('ensureWechatRemoteSession', () => {
+  it('reuses an existing fixed WeChat stdin route', async () => {
+    const spawnCalls: unknown[] = [];
+
+    const stdinId = await ensureWechatRemoteSession({
+      ...fakeBootstrapDeps(spawnCalls),
+      getExistingStdinId: () => 'stdin-existing',
+    });
+
+    expect(stdinId).toBe('stdin-existing');
+    expect(spawnCalls).toEqual([]);
+  });
+
+  it('pre-warms the fixed WeChat session and publishes the polling route', async () => {
+    const spawnCalls: any[] = [];
+    const pollingRoutes: string[] = [];
+    const ensuredTabs: string[] = [];
+    const metas: Array<{ tabId: string; meta: Record<string, unknown> }> = [];
+    const touches: Array<{ preview: string; modifiedAt: number }> = [];
+
+    const stdinId = await ensureWechatRemoteSession({
+      ...fakeBootstrapDeps(spawnCalls),
+      ensureTab: (tabId) => ensuredTabs.push(tabId),
+      setSessionMeta: (tabId, meta) => metas.push({ tabId, meta }),
+      touchWechatRemoteSession: (preview, modifiedAt) => touches.push({ preview, modifiedAt }),
+      startPolling: async (route) => {
+        pollingRoutes.push(route);
+      },
+      now: () => 1234,
+    });
+
+    expect(stdinId).toBe('stdin-wechat-auto');
+    expect(ensuredTabs).toEqual([WECHAT_REMOTE_SESSION_ID]);
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]).toMatchObject({
+      tabId: WECHAT_REMOTE_SESSION_ID,
+      stdinId: 'stdin-wechat-auto',
+      cwdSnapshot: '/repo',
+      sessionModeSnapshot: 'bypass',
+      sessionParams: {
+        prompt: '',
+        cwd: '/repo',
+        session_id: 'stdin-wechat-auto',
+        permission_mode: 'bypassPermissions',
+      },
+      setRunning: false,
+    });
+    expect(pollingRoutes).toEqual(['stdin-wechat-auto']);
+    expect(touches).toEqual([{ preview: '微信接入', modifiedAt: 1234 }]);
+    expect(metas.some((entry) => entry.meta.stdinReady === false)).toBe(true);
   });
 });
 
@@ -200,5 +254,40 @@ function fakeBridge(calls: string[]): RemoteSessionBridge {
     wechatStopPolling: async () => {
       calls.push('stop');
     },
+  };
+}
+
+function fakeBootstrapDeps(spawnCalls: unknown[]) {
+  return {
+    getWorkingDirectory: () => '/repo',
+    getExistingStdinId: () => undefined,
+    getSettings: () => ({
+      selectedModel: 'claude-opus-4-6',
+      thinkingLevel: 'medium',
+      sessionMode: 'bypass',
+    }) as any,
+    getProviderId: () => 'provider-1',
+    getCliResumeId: () => null,
+    ensureTab: () => {},
+    setSessionMeta: () => {},
+    touchWechatRemoteSession: () => {},
+    spawn: async (params: any) => {
+      spawnCalls.push(params);
+      return {
+        stdinId: params.stdinId,
+        sessionInfo: {
+          stdin_id: params.stdinId,
+          cli_session_id: 'cli-session-1',
+          pid: 1,
+          cli_path: 'claude',
+        },
+        unlisten: () => {},
+      };
+    },
+    startPolling: async () => {},
+    makeStdinId: () => 'stdin-wechat-auto',
+    onStream: () => {},
+    onStderr: () => {},
+    now: () => 1,
   };
 }

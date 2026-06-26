@@ -7,6 +7,7 @@ import {
 } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { showToast } from '../shared/Toast';
+import { WECHAT_CONNECTED_EVENT } from '../../lib/wechat-session';
 import {
   resolveWechatQrPollResult,
   resolveWechatStatusPhase,
@@ -31,6 +32,9 @@ export function WechatTab() {
   const applyStatus = useCallback((status: WechatStatus) => {
     setAccount(status.account);
     setPhase((currentPhase) => resolveWechatStatusPhase(status.connected, currentPhase));
+    if (status.connected) {
+      window.dispatchEvent(new Event(WECHAT_CONNECTED_EVENT));
+    }
   }, []);
 
   const refreshStatus = useCallback(async () => {

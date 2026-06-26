@@ -15,7 +15,15 @@ import {
   type SessionStatus,
 } from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
-import { WECHAT_REMOTE_SESSION_ID } from '../lib/wechat-session';
+import {
+  WECHAT_CONNECTED_EVENT,
+  WECHAT_REMOTE_SESSION_ID,
+  WECHAT_REMOTE_SESSION_TITLE,
+} from '../lib/wechat-session';
+import { useSettingsStore, mapSessionModeToPermissionMode } from '../stores/settingsStore';
+import { useProviderStore } from '../stores/providerStore';
+import { envFingerprint, resolveModelForProvider, spawnConfigHash } from '../lib/api-provider';
+import { spawnSession } from '../lib/sessionLifecycle';
 
 export type RemoteSessionBridge = Pick<
   typeof bridge,
@@ -38,6 +46,128 @@ export async function syncRemotePollingRoute(
   }
 
   await remoteBridge.wechatStartPolling(route);
+}
+
+function forwardClaudeStreamToGlobalHandler(message: any) {
+  const handler = (window as any).__claudeStreamHandler;
+  if (handler) {
+    const queue: any[] | undefined = (window as any).__claudeStreamQueue;
+    if (queue?.length) {
+      const pending = queue.splice(0);
+      for (const queued of pending) handler(queued);
+    }
+    handler(message);
+    return;
+  }
+
+  if (!(window as any).__claudeStreamQueue) {
+    (window as any).__claudeStreamQueue = [];
+  }
+  (window as any).__claudeStreamQueue.push(message);
+}
+
+type WechatRemoteSpawnSession = typeof spawnSession;
+
+export interface EnsureWechatRemoteSessionDeps {
+  getWorkingDirectory: () => string | undefined;
+  getExistingStdinId: () => string | undefined;
+  getSettings: () => ReturnType<typeof useSettingsStore.getState>;
+  getProviderId: () => string;
+  getCliResumeId: () => string | null | undefined;
+  ensureTab: (tabId: string) => void;
+  setSessionMeta: (tabId: string, meta: Partial<SessionMeta>) => void;
+  touchWechatRemoteSession: (preview: string, modifiedAt: number) => void;
+  spawn: WechatRemoteSpawnSession;
+  startPolling: (stdinId: string) => Promise<void>;
+  makeStdinId: () => string;
+  onStream: (message: any) => void;
+  onStderr: (line: string, stdinId: string) => void;
+  now: () => number;
+}
+
+export async function ensureWechatRemoteSession(
+  deps: EnsureWechatRemoteSessionDeps = {
+    getWorkingDirectory: () => useSettingsStore.getState().workingDirectory,
+    getExistingStdinId: () =>
+      useChatStore.getState().tabs.get(WECHAT_REMOTE_SESSION_ID)?.sessionMeta.stdinId,
+    getSettings: () => useSettingsStore.getState(),
+    getProviderId: () => useProviderStore.getState().activeProviderId || '',
+    getCliResumeId: () =>
+      useSessionStore.getState().sessions.find((session) => session.id === WECHAT_REMOTE_SESSION_ID)
+        ?.cliResumeId,
+    ensureTab: (tabId) => useChatStore.getState().ensureTab(tabId),
+    setSessionMeta: (tabId, meta) => useChatStore.getState().setSessionMeta(tabId, meta),
+    touchWechatRemoteSession: (preview, modifiedAt) =>
+      useSessionStore.getState().touchWechatRemoteSession(preview, modifiedAt),
+    spawn: spawnSession,
+    startPolling: (stdinId) => bridge.wechatStartPolling(stdinId),
+    makeStdinId: () => `desk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    onStream: forwardClaudeStreamToGlobalHandler,
+    onStderr: (line) => console.warn('[WeChat] remote session stderr:', line),
+    now: Date.now,
+  },
+): Promise<string | null> {
+  const existingStdinId = deps.getExistingStdinId();
+  if (existingStdinId) return existingStdinId;
+
+  const cwd = deps.getWorkingDirectory()?.trim();
+  if (!cwd) return null;
+
+  const settings = deps.getSettings();
+  const providerId = deps.getProviderId();
+  const model = resolveModelForProvider(settings.selectedModel);
+  const permissionMode = mapSessionModeToPermissionMode(settings.sessionMode);
+  const stdinId = deps.makeStdinId();
+  const preEnvFingerprint = envFingerprint();
+  const preSpawnConfigHash = spawnConfigHash();
+
+  deps.ensureTab(WECHAT_REMOTE_SESSION_ID);
+  deps.setSessionMeta(WECHAT_REMOTE_SESSION_ID, {
+    stdinReady: false,
+    pendingReadyMessage: undefined,
+  });
+
+  const spawnResult = await deps.spawn({
+    tabId: WECHAT_REMOTE_SESSION_ID,
+    stdinId,
+    cwdSnapshot: cwd,
+    configSnapshot: {
+      model,
+      providerId,
+      thinkingLevel: settings.thinkingLevel,
+      permissionMode,
+    },
+    sessionModeSnapshot: settings.sessionMode,
+    sessionParams: {
+      prompt: '',
+      cwd,
+      model,
+      session_id: stdinId,
+      resume_session_id: deps.getCliResumeId() || undefined,
+      thinking_level: settings.thinkingLevel,
+      session_mode: (settings.sessionMode === 'ask' || settings.sessionMode === 'plan')
+        ? settings.sessionMode
+        : undefined,
+      provider_id: providerId || undefined,
+      permission_mode: permissionMode,
+    },
+    onStream: deps.onStream,
+    onStderr: (line: string) => deps.onStderr(line, stdinId),
+    setRunning: false,
+  });
+
+  deps.setSessionMeta(WECHAT_REMOTE_SESSION_ID, {
+    sessionId: spawnResult.sessionInfo.cli_session_id ?? undefined,
+    envFingerprint: preEnvFingerprint,
+    spawnedModel: model,
+    stdinReady: false,
+    pendingReadyMessage: undefined,
+    spawnConfigHash: preSpawnConfigHash,
+  });
+  deps.touchWechatRemoteSession(WECHAT_REMOTE_SESSION_TITLE, deps.now());
+  await deps.startPolling(spawnResult.sessionInfo.stdin_id);
+
+  return spawnResult.sessionInfo.stdin_id;
 }
 
 export interface RemoteDesktopUserMessageDeps {
@@ -135,8 +265,10 @@ export function useRemoteSession() {
   const activeStdinId = useChatStore((state) =>
     state.tabs.get(WECHAT_REMOTE_SESSION_ID)?.sessionMeta.stdinId,
   );
+  const workingDirectory = useSettingsStore((state) => state.workingDirectory);
   const route = resolveRemoteDesktopSessionId(activeStdinId);
   const publishedRouteRef = useRef<string | null | undefined>(undefined);
+  const bootstrapRef = useRef<Promise<string | null> | null>(null);
 
   useEffect(() => {
     if (publishedRouteRef.current === route) return;
@@ -154,6 +286,40 @@ export function useRemoteSession() {
       }
     };
   }, [route]);
+
+  useEffect(() => {
+    if (activeStdinId || !workingDirectory) return;
+    let disposed = false;
+
+    const ensureIfConnected = () => {
+      if (bootstrapRef.current) return;
+      bridge.wechatGetStatus()
+        .then((status) => {
+          if (disposed || !status.connected) return;
+          if (useChatStore.getState().tabs.get(WECHAT_REMOTE_SESSION_ID)?.sessionMeta.stdinId) {
+            return;
+          }
+          bootstrapRef.current = ensureWechatRemoteSession()
+            .catch((err) => {
+              console.warn('[WeChat] failed to prepare fixed remote session', err);
+              return null;
+            })
+            .finally(() => {
+              bootstrapRef.current = null;
+            });
+        })
+        .catch((err) => {
+          console.warn('[WeChat] failed to check connected status before remote bootstrap', err);
+        });
+    };
+
+    ensureIfConnected();
+    window.addEventListener(WECHAT_CONNECTED_EVENT, ensureIfConnected);
+    return () => {
+      disposed = true;
+      window.removeEventListener(WECHAT_CONNECTED_EVENT, ensureIfConnected);
+    };
+  }, [activeStdinId, workingDirectory]);
 
   useEffect(() => {
     let disposed = false;
