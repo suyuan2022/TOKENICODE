@@ -149,6 +149,7 @@ export interface WechatStatusEvent {
 export interface WechatQrStart {
   qrcodeId: string;
   qrcodeImage: string;
+  qrcodeUrl: string;
 }
 
 export interface WechatQrPoll {

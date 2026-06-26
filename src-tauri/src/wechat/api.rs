@@ -53,8 +53,9 @@ impl IlinkApiClient {
     }
 
     pub fn qr_code_request(&self) -> IlinkHttpRequest {
-        self.get_request(
+        self.post_request(
             "ilink/bot/get_bot_qrcode?bot_type=3",
+            json!({ "local_token_list": [] }),
             DEFAULT_CONFIG_TIMEOUT_MS,
         )
     }
@@ -688,12 +689,17 @@ mod tests {
         let qr = client.qr_code_request();
         let poll = client.qr_status_request("qr id/needs escaping", None);
 
-        assert_eq!(qr.method, IlinkHttpMethod::Get);
+        assert_eq!(qr.method, IlinkHttpMethod::Post);
         assert_eq!(
             qr.url,
             "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3"
         );
         assert!(qr.headers.get("Authorization").is_none());
+        assert_eq!(
+            qr.headers.get("AuthorizationType"),
+            Some(&"ilink_bot_token".into())
+        );
+        assert_eq!(qr.body["local_token_list"], serde_json::json!([]));
         assert_eq!(poll.method, IlinkHttpMethod::Get);
         assert_eq!(
             poll.url,

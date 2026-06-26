@@ -6,6 +6,7 @@ import {
   type WechatStatus,
 } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
+import { showToast } from '../shared/Toast';
 import { resolveWechatQrPollResult, type WechatPhase } from './wechatLoginState';
 
 export function WechatTab() {
@@ -14,6 +15,7 @@ export function WechatTab() {
   const [account, setAccount] = useState<WechatAccountInfo | null>(null);
   const [qrcodeId, setQrcodeId] = useState('');
   const [qrcodeImage, setQrcodeImage] = useState('');
+  const [qrcodeUrl, setQrcodeUrl] = useState('');
   const [pollBaseUrl, setPollBaseUrl] = useState('');
   const [message, setMessage] = useState('');
   const pollingRef = useRef(false);
@@ -46,6 +48,7 @@ export function WechatTab() {
       setAccount(null);
       setQrcodeId('');
       setQrcodeImage('');
+      setQrcodeUrl('');
       setPollBaseUrl('');
       setMessage('');
       setPhase('sessionExpired');
@@ -68,11 +71,13 @@ export function WechatTab() {
     setMessage('');
     setQrcodeId('');
     setQrcodeImage('');
+    setQrcodeUrl('');
     setPollBaseUrl('');
     try {
       const qr = await bridge.wechatStartQrLogin();
       setQrcodeId(qr.qrcodeId);
       setQrcodeImage(qr.qrcodeImage);
+      setQrcodeUrl(qr.qrcodeUrl);
       setPhase('waiting');
     } catch (err) {
       setMessage(String(err));
@@ -94,6 +99,7 @@ export function WechatTab() {
       if (next.clearQr) {
         setQrcodeId('');
         setQrcodeImage('');
+        setQrcodeUrl('');
         setPollBaseUrl('');
       }
       setPhase(next.phase);
@@ -121,6 +127,7 @@ export function WechatTab() {
       setAccount(null);
       setQrcodeId('');
       setQrcodeImage('');
+      setQrcodeUrl('');
       setPollBaseUrl('');
       setPhase('idle');
     } catch (err) {
@@ -130,6 +137,12 @@ export function WechatTab() {
   }, []);
 
   const busy = phase === 'loading' || phase === 'requesting';
+  const copyQrLink = useCallback(() => {
+    if (!qrcodeUrl) return;
+    navigator.clipboard.writeText(qrcodeUrl)
+      .then(() => showToast(t('wechat.copyQrLinkDone'), 'success'))
+      .catch((err) => showToast(String(err), 'error'));
+  }, [qrcodeUrl, t]);
   const statusTitle = phase === 'sessionExpired'
     ? t('wechat.sessionExpired')
     : phase === 'connected'
@@ -182,7 +195,7 @@ export function WechatTab() {
             <img
               src={qrcodeImage}
               alt={t('wechat.qrAlt')}
-              className="h-56 w-56 shrink-0 rounded-lg border border-border-subtle bg-white p-3 shadow-sm [image-rendering:pixelated]"
+              className="h-96 w-96 shrink-0 rounded-lg border border-border-subtle bg-white p-4 shadow-sm [image-rendering:pixelated]"
             />
             <div className="min-w-0 pt-2">
               <div className="text-[13px] font-medium text-text-primary">
@@ -198,6 +211,15 @@ export function WechatTab() {
               >
                 {t('wechat.refreshQr')}
               </button>
+              {qrcodeUrl && (
+                <button
+                  onClick={copyQrLink}
+                  className="ml-2 mt-3 px-2.5 py-1 text-xs font-medium rounded-md border border-border-subtle
+                    text-text-muted hover:bg-bg-tertiary hover:text-text-primary transition-smooth"
+                >
+                  {t('wechat.copyQrLink')}
+                </button>
+              )}
             </div>
           </div>
         )}

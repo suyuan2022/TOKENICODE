@@ -47,6 +47,7 @@ pub struct WechatStatusResponse {
 pub struct WechatQrStartResponse {
     pub qrcode_id: String,
     pub qrcode_image: String,
+    pub qrcode_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +94,7 @@ pub async fn wechat_start_qr_login() -> Result<WechatQrStartResponse, String> {
     Ok(WechatQrStartResponse {
         qrcode_id: parsed.qrcode_id,
         qrcode_image: normalize_qr_image(&parsed.qrcode_image),
+        qrcode_url: parsed.qrcode_image,
     })
 }
 
@@ -303,7 +305,8 @@ fn qr_svg_data_url(value: &str) -> Result<String, String> {
     let code = QrCode::new(value.as_bytes()).map_err(|err| format!("build QR SVG: {err}"))?;
     let image = code
         .render::<svg::Color>()
-        .min_dimensions(256, 256)
+        .quiet_zone(true)
+        .min_dimensions(400, 400)
         .dark_color(svg::Color("#000000"))
         .light_color(svg::Color("#ffffff"))
         .build();

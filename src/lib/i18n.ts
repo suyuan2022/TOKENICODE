@@ -391,6 +391,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'wechat.scanned': '已扫码，等待确认',
     'wechat.waitingDetail': '请在微信中扫码并确认绑定。',
     'wechat.refreshQr': '刷新二维码',
+    'wechat.copyQrLink': '复制链接',
+    'wechat.copyQrLinkDone': '登录链接已复制',
     'wechat.qrAlt': '微信登录二维码',
 
     // Provider
@@ -1136,6 +1138,8 @@ const messages: Record<Locale, Record<string, string>> = {
     'wechat.scanned': 'Scanned, waiting for confirmation',
     'wechat.waitingDetail': 'Scan and confirm the binding in WeChat.',
     'wechat.refreshQr': 'Refresh QR',
+    'wechat.copyQrLink': 'Copy link',
+    'wechat.copyQrLinkDone': 'Login link copied',
     'wechat.qrAlt': 'WeChat login QR code',
 
     // Provider
