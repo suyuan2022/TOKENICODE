@@ -156,6 +156,7 @@ export interface WechatQrPoll {
   connected: boolean;
   message?: string | null;
   account?: WechatAccountInfo | null;
+  redirectBaseUrl?: string | null;
 }
 
 export interface WechatDesktopAttachment {
@@ -460,10 +461,11 @@ export const bridge = {
   wechatStartQrLogin: () =>
     invoke<WechatQrStart>('wechat_start_qr_login'),
 
-  wechatPollQrLogin: (qrcodeId: string, verifyCode?: string) =>
+  wechatPollQrLogin: (qrcodeId: string, verifyCode?: string, baseUrl?: string) =>
     invoke<WechatQrPoll>('wechat_poll_qr_login', {
       qrcodeId,
       verifyCode: verifyCode || null,
+      baseUrl: baseUrl || null,
     }),
 
   wechatDisconnect: () =>

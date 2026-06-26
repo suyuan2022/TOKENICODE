@@ -56,6 +56,7 @@ pub struct WechatQrPollResponse {
     pub connected: bool,
     pub message: Option<String>,
     pub account: Option<WechatAccountInfo>,
+    pub redirect_base_url: Option<String>,
 }
 
 #[tauri::command]
@@ -100,11 +101,15 @@ pub async fn wechat_poll_qr_login(
     app: AppHandle,
     qrcode_id: String,
     verify_code: Option<String>,
+    base_url: Option<String>,
     runtime: State<'_, WechatRuntimeHandle>,
     polling_task: State<'_, WechatPollingTask>,
     stdin_mgr: State<'_, StdinManager>,
 ) -> Result<WechatQrPollResponse, String> {
-    let client = IlinkApiClient::new(None);
+    let client = match base_url.filter(|value| !value.trim().is_empty()) {
+        Some(base_url) => IlinkApiClient::with_base_url(None, base_url),
+        None => IlinkApiClient::new(None),
+    };
     let response: QrStatusResponse = client
         .execute_json(client.qr_status_request(&qrcode_id, verify_code.as_deref()))
         .await?;
@@ -125,19 +130,26 @@ pub async fn wechat_poll_qr_login(
                 connected: true,
                 message: None,
                 account: Some(WechatAccountInfo::from(account)),
+                redirect_base_url: None,
             })
         }
-        WechatQrPoll::Pending { status, message } => Ok(WechatQrPollResponse {
+        WechatQrPoll::Pending {
+            status,
+            message,
+            redirect_base_url,
+        } => Ok(WechatQrPollResponse {
             status,
             connected: false,
             message,
             account: None,
+            redirect_base_url,
         }),
         WechatQrPoll::Failed { status, message } => Ok(WechatQrPollResponse {
             status,
             connected: false,
             message: Some(message),
             account: None,
+            redirect_base_url: None,
         }),
     }
 }

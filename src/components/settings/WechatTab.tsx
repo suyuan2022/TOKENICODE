@@ -14,6 +14,7 @@ export function WechatTab() {
   const [account, setAccount] = useState<WechatAccountInfo | null>(null);
   const [qrcodeId, setQrcodeId] = useState('');
   const [qrcodeImage, setQrcodeImage] = useState('');
+  const [pollBaseUrl, setPollBaseUrl] = useState('');
   const [message, setMessage] = useState('');
   const pollingRef = useRef(false);
 
@@ -45,6 +46,7 @@ export function WechatTab() {
       setAccount(null);
       setQrcodeId('');
       setQrcodeImage('');
+      setPollBaseUrl('');
       setMessage('');
       setPhase('sessionExpired');
     }).then((unlisten) => {
@@ -66,6 +68,7 @@ export function WechatTab() {
     setMessage('');
     setQrcodeId('');
     setQrcodeImage('');
+    setPollBaseUrl('');
     try {
       const qr = await bridge.wechatStartQrLogin();
       setQrcodeId(qr.qrcodeId);
@@ -81,13 +84,17 @@ export function WechatTab() {
     if (!qrcodeId || pollingRef.current) return;
     pollingRef.current = true;
     try {
-      const result = await bridge.wechatPollQrLogin(qrcodeId);
+      const result = await bridge.wechatPollQrLogin(qrcodeId, undefined, pollBaseUrl || undefined);
       const next = resolveWechatQrPollResult(result);
       setAccount(next.account);
       setMessage(next.message);
+      if (next.redirectBaseUrl) {
+        setPollBaseUrl(next.redirectBaseUrl);
+      }
       if (next.clearQr) {
         setQrcodeId('');
         setQrcodeImage('');
+        setPollBaseUrl('');
       }
       setPhase(next.phase);
     } catch (err) {
@@ -96,7 +103,7 @@ export function WechatTab() {
     } finally {
       pollingRef.current = false;
     }
-  }, [qrcodeId]);
+  }, [pollBaseUrl, qrcodeId]);
 
   useEffect(() => {
     if (!qrcodeId || (phase !== 'waiting' && phase !== 'scanned')) return;
@@ -114,6 +121,7 @@ export function WechatTab() {
       setAccount(null);
       setQrcodeId('');
       setQrcodeImage('');
+      setPollBaseUrl('');
       setPhase('idle');
     } catch (err) {
       setMessage(String(err));

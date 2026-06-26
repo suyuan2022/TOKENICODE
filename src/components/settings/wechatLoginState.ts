@@ -15,6 +15,7 @@ interface WechatQrPollTransition {
   account: WechatAccountInfo | null;
   message: string;
   clearQr: boolean;
+  redirectBaseUrl: string | null;
 }
 
 export function resolveWechatQrPollResult(result: WechatQrPoll): WechatQrPollTransition {
@@ -24,6 +25,7 @@ export function resolveWechatQrPollResult(result: WechatQrPoll): WechatQrPollTra
       account: result.account ?? null,
       message: '',
       clearQr: true,
+      redirectBaseUrl: null,
     };
   }
 
@@ -34,6 +36,7 @@ export function resolveWechatQrPollResult(result: WechatQrPoll): WechatQrPollTra
       account: null,
       message,
       clearQr: false,
+      redirectBaseUrl: result.redirectBaseUrl ?? null,
     };
   }
 
@@ -43,6 +46,7 @@ export function resolveWechatQrPollResult(result: WechatQrPoll): WechatQrPollTra
       account: null,
       message,
       clearQr: false,
+      redirectBaseUrl: null,
     };
   }
 
@@ -51,5 +55,6 @@ export function resolveWechatQrPollResult(result: WechatQrPoll): WechatQrPollTra
     account: null,
     message: message || result.status,
     clearQr: true,
+    redirectBaseUrl: null,
   };
 }

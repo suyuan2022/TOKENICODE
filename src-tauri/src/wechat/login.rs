@@ -14,6 +14,7 @@ pub enum WechatQrPoll {
     Pending {
         status: String,
         message: Option<String>,
+        redirect_base_url: Option<String>,
     },
     Connected {
         account: WechatAccount,
@@ -61,12 +62,19 @@ pub fn parse_qr_status_response(
                 created_at_ms: now_ms,
             },
         }),
-        "wait" | "scaned" | "need_verifycode" | "scaned_but_redirect" => {
+        "scaned_but_redirect" => {
+            let redirect_base_url = redirect_base_url_from_host(response.redirect_host.as_deref());
             Ok(WechatQrPoll::Pending {
                 status,
                 message: response.retmsg.or(response.redirect_host),
+                redirect_base_url,
             })
         }
+        "wait" | "scaned" | "need_verifycode" => Ok(WechatQrPoll::Pending {
+            status,
+            message: response.retmsg,
+            redirect_base_url: None,
+        }),
         "expired" => Ok(WechatQrPoll::Failed {
             status,
             message: response.retmsg.unwrap_or_else(|| "QR code expired".into()),
@@ -94,6 +102,30 @@ fn required(value: Option<String>, field: &str) -> Result<String, String> {
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("confirmed iLink QR status missing {field}"))
+}
+
+fn redirect_base_url_from_host(redirect_host: Option<&str>) -> Option<String> {
+    let host = redirect_host?.trim().trim_end_matches('/');
+    if host.is_empty() {
+        return None;
+    }
+
+    let without_scheme = host
+        .strip_prefix("https://")
+        .or_else(|| host.strip_prefix("http://"))
+        .unwrap_or(host);
+    let candidate = format!("https://{without_scheme}");
+    let url = reqwest::Url::parse(&candidate).ok()?;
+    let host = url.host_str()?;
+    let allowed = host == "weixin.qq.com"
+        || host.ends_with(".weixin.qq.com")
+        || host == "wechat.com"
+        || host.ends_with(".wechat.com");
+    if allowed {
+        Some(format!("https://{host}"))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +211,7 @@ mod tests {
             WechatQrPoll::Pending {
                 status: "wait".into(),
                 message: None,
+                redirect_base_url: None,
             }
         );
 
@@ -200,6 +233,32 @@ mod tests {
             WechatQrPoll::Pending {
                 status: "scaned".into(),
                 message: Some("scanned".into()),
+                redirect_base_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn scaned_redirect_exposes_next_polling_base_url() {
+        assert_eq!(
+            parse_qr_status_response(
+                QrStatusResponse {
+                    ret: Some(0),
+                    status: Some("scaned_but_redirect".into()),
+                    retmsg: None,
+                    bot_token: None,
+                    ilink_bot_id: None,
+                    baseurl: None,
+                    ilink_user_id: None,
+                    redirect_host: Some("hk.weixin.qq.com".into()),
+                },
+                123,
+            )
+            .unwrap(),
+            WechatQrPoll::Pending {
+                status: "scaned_but_redirect".into(),
+                message: Some("hk.weixin.qq.com".into()),
+                redirect_base_url: Some("https://hk.weixin.qq.com".into()),
             }
         );
     }

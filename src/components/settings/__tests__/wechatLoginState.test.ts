@@ -12,6 +12,7 @@ describe('wechat QR login state', () => {
       account: null,
       message: 'QR code expired',
       clearQr: true,
+      redirectBaseUrl: null,
     });
   });
 
@@ -20,11 +21,13 @@ describe('wechat QR login state', () => {
       status: 'scaned_but_redirect',
       connected: false,
       message: 'redirecting',
+      redirectBaseUrl: 'https://hk.weixin.qq.com',
     })).toEqual({
       phase: 'scanned',
       account: null,
       message: 'redirecting',
       clearQr: false,
+      redirectBaseUrl: 'https://hk.weixin.qq.com',
     });
   });
 });
