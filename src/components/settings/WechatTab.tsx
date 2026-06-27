@@ -373,9 +373,12 @@ export function WechatTab() {
               splitOutboundTextByLineBreaks ? 'bg-accent' : 'bg-bg-tertiary'
             }`}
           >
+            {/* left-0 anchors the thumb to the track's left edge. Without it the
+                absolute thumb falls back to the button's centered static position
+                (UA button text-align:center), drifting right and overflowing when "on". */}
             <span
-              className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
-                splitOutboundTextByLineBreaks ? 'translate-x-5' : 'translate-x-0.5'
+              className={`absolute left-0 top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                splitOutboundTextByLineBreaks ? 'translate-x-[22px]' : 'translate-x-0.5'
               }`}
             />
           </button>
@@ -383,55 +386,75 @@ export function WechatTab() {
       </div>
 
       <div className="rounded-lg border border-border-subtle bg-bg-secondary/40 p-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <div className="text-[13px] font-medium text-text-primary">
-              {t('wechat.workspaceBinding')}
-            </div>
-            <div className="mt-1 text-xs text-text-tertiary leading-relaxed">
-              {effectiveWorkspacePath
-                ? t('wechat.workspaceBindingDetail').replace(
-                  '{workspace}',
-                  compactWorkspacePath(effectiveWorkspacePath),
-                )
-                : t('wechat.workspaceBindingEmpty')}
-            </div>
+        <div className="min-w-0">
+          <div className="text-[13px] font-medium text-text-primary">
+            {t('wechat.workspaceBinding')}
           </div>
-          {workingDirectory && (
-            <button
-              onClick={() => bindWorkspace(workingDirectory)}
-              className="shrink-0 px-3 py-1.5 text-[13px] font-medium rounded-lg border border-border-subtle
-                text-text-muted hover:bg-bg-tertiary hover:text-text-primary transition-smooth"
-            >
-              {t('wechat.bindCurrentWorkspace')}
-            </button>
-          )}
+          <div className="mt-1 text-xs text-text-tertiary leading-relaxed">
+            {effectiveWorkspacePath
+              ? t('wechat.workspaceBindingDetail').replace(
+                '{workspace}',
+                compactWorkspacePath(effectiveWorkspacePath),
+              )
+              : t('wechat.workspaceBindingEmpty')}
+          </div>
         </div>
 
-        <div className="mt-3 flex items-center gap-2">
-          <select
-            value={wechatWorkspacePath}
-            onChange={(event) => bindWorkspace(event.target.value)}
-            className="min-w-0 flex-1 rounded-lg border border-border-subtle bg-bg-primary px-3 py-2
-              text-[13px] text-text-primary outline-none focus:border-accent"
-          >
-            <option value="">
-              {t('wechat.followCurrentWorkspace')}
-            </option>
-            {workspaceOptions.map((path) => (
-              <option key={path} value={path}>
-                {workspaceLabel(path)} · {compactWorkspacePath(path)}
-              </option>
-            ))}
-          </select>
+        {/* Two clear modes: follow the desktop app's current project, or pin to a fixed one.
+            Empty wechatWorkspacePath = follow; a non-empty path = fixed. */}
+        <div className="mt-3 inline-flex rounded-lg border border-border-subtle overflow-hidden">
           <button
-            onClick={chooseWorkspace}
-            className="px-3 py-2 text-[13px] font-medium rounded-lg border border-border-subtle
-              text-text-muted hover:bg-bg-tertiary hover:text-text-primary transition-smooth"
+            type="button"
+            onClick={() => bindWorkspace('')}
+            className={`py-1.5 px-3 text-[13px] font-medium transition-smooth
+              border-r border-border-subtle whitespace-nowrap
+              ${!wechatWorkspacePath
+                ? 'bg-accent/10 text-accent'
+                : 'text-text-muted hover:bg-bg-secondary'
+              }`}
           >
-            {t('wechat.chooseWorkspace')}
+            {t('wechat.followCurrentWorkspace')}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (!wechatWorkspacePath) {
+                bindWorkspace(workingDirectory || workspaceOptions[0] || '');
+              }
+            }}
+            className={`py-1.5 px-3 text-[13px] font-medium transition-smooth whitespace-nowrap
+              ${wechatWorkspacePath
+                ? 'bg-accent/10 text-accent'
+                : 'text-text-muted hover:bg-bg-secondary'
+              }`}
+          >
+            {t('wechat.workspaceFixedMode')}
           </button>
         </div>
+
+        {wechatWorkspacePath && (
+          <div className="mt-3 flex items-center gap-2">
+            <select
+              value={wechatWorkspacePath}
+              onChange={(event) => bindWorkspace(event.target.value)}
+              className="min-w-0 flex-1 rounded-lg border border-border-subtle bg-bg-primary px-3 py-2
+                text-[13px] text-text-primary outline-none focus:border-accent"
+            >
+              {workspaceOptions.map((path) => (
+                <option key={path} value={path}>
+                  {workspaceLabel(path)} · {compactWorkspacePath(path)}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={chooseWorkspace}
+              className="px-3 py-2 text-[13px] font-medium rounded-lg border border-border-subtle
+                text-text-muted hover:bg-bg-tertiary hover:text-text-primary transition-smooth"
+            >
+              {t('wechat.chooseWorkspace')}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
