@@ -762,8 +762,6 @@ const DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV: &str =
 const CLAUDE_PLUGIN_CACHE_DIR_ENV: &str = "CLAUDE_CODE_PLUGIN_CACHE_DIR";
 const CLAUDE_PLUGIN_GIT_TIMEOUT_ENV: &str = "CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS";
 const INCLUDE_MCP_SERVERS_ENV: &str = "TOKENICODE_INCLUDE_MCP_SERVERS";
-const CLAUDE_SETTING_SOURCES_ARG: &str = "--setting-sources";
-const TOKENICODE_CLAUDE_SETTING_SOURCES: &str = "local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProviderRuntimeCapabilities {
@@ -1256,18 +1254,6 @@ fn tokenicode_claude_plugin_cache_dir() -> Option<String> {
     })
 }
 
-fn apply_claude_cli_runtime_args(args: &mut Vec<String>) {
-    // TOKENICODE owns provider env, MCP config, permissions, and UI runtime state.
-    // Inheriting user/project Claude settings can run startup hooks or enabled
-    // plugins before the GUI receives its first stream event.
-    if !args.iter().any(|arg| arg == CLAUDE_SETTING_SOURCES_ARG) {
-        args.extend([
-            CLAUDE_SETTING_SOURCES_ARG.to_string(),
-            TOKENICODE_CLAUDE_SETTING_SOURCES.to_string(),
-        ]);
-    }
-}
-
 fn should_include_mcp_servers(value: Option<&str>) -> bool {
     value.and_then(parse_bool_override).unwrap_or(false)
 }
@@ -1307,12 +1293,11 @@ fn normalize_cli_model_id(model: &str) -> String {
 #[cfg(test)]
 mod provider_capability_tests {
     use super::{
-        apply_claude_cli_runtime_args, apply_claude_cli_runtime_defaults, normalize_cli_model_id,
-        parse_bool_override, redacted_env_for_log, resolve_provider_capabilities,
-        should_include_mcp_servers, ApiProvider, ModelMapping, CLAUDE_PLUGIN_CACHE_DIR_ENV,
-        CLAUDE_PLUGIN_GIT_TIMEOUT_ENV, CLAUDE_SETTING_SOURCES_ARG,
+        apply_claude_cli_runtime_defaults, normalize_cli_model_id, parse_bool_override,
+        redacted_env_for_log, resolve_provider_capabilities, should_include_mcp_servers,
+        ApiProvider, ModelMapping, CLAUDE_PLUGIN_CACHE_DIR_ENV, CLAUDE_PLUGIN_GIT_TIMEOUT_ENV,
         DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV, INCLUDE_MCP_SERVERS_ENV,
-        PARTIAL_MESSAGES_OVERRIDE_ENV, TOKENICODE_CLAUDE_SETTING_SOURCES,
+        PARTIAL_MESSAGES_OVERRIDE_ENV,
     };
     use std::collections::HashMap;
 
@@ -1473,33 +1458,6 @@ mod provider_capability_tests {
             env.get(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV).map(String::as_str),
             Some("2500")
         );
-    }
-
-    #[test]
-    fn runtime_args_use_tokenicode_setting_sources() {
-        let mut args = vec!["--model".to_string(), "claude-opus-4-6[1m]".to_string()];
-        apply_claude_cli_runtime_args(&mut args);
-        assert!(args.windows(2).any(|pair| pair
-            == [
-                CLAUDE_SETTING_SOURCES_ARG,
-                TOKENICODE_CLAUDE_SETTING_SOURCES
-            ]));
-    }
-
-    #[test]
-    fn runtime_args_do_not_duplicate_setting_sources() {
-        let mut args = vec![
-            CLAUDE_SETTING_SOURCES_ARG.to_string(),
-            "project,local".to_string(),
-        ];
-        apply_claude_cli_runtime_args(&mut args);
-        assert_eq!(
-            args.iter()
-                .filter(|arg| arg.as_str() == CLAUDE_SETTING_SOURCES_ARG)
-                .count(),
-            1
-        );
-        assert_eq!(args[1], "project,local");
     }
 
     #[test]
@@ -1952,9 +1910,14 @@ async fn start_claude_session(
         resolve_provider_env(params.provider_id.as_deref())?;
     apply_claude_cli_runtime_defaults(&mut resolved_env);
 
-    // Append provider-specific CLI args, then apply TOKENICODE runtime isolation.
+    // Append provider-specific CLI args. Do NOT force a blanket
+    // `--setting-sources local` here: in the Claude CLI that flag also gates
+    // CLAUDE.md memory loading, so forcing "local" drops the user
+    // (~/.claude/CLAUDE.md) and parent-workspace CLAUDE.md that the desktop
+    // session is expected to honor (only the cwd's own CLAUDE.md survives).
+    // Startup-hook isolation is handled separately via runtime env defaults and
+    // MCP opt-out; providers may still inject their own --setting-sources.
     args.extend(provider_extra_args);
-    apply_claude_cli_runtime_args(&mut args);
 
     // Keep partial text/thinking deltas for known-compatible providers; degrade
     // explicitly for unknown providers that may reject the partial-message path.
@@ -7984,7 +7947,11 @@ async fn generate_session_title(
         "1".to_string(),
         "--dangerously-skip-permissions".to_string(),
     ];
-    apply_claude_cli_runtime_args(&mut args);
+    // Title generation is a throwaway one-shot; for third-party providers limit
+    // setting sources to avoid pulling user settings into the helper call.
+    if provider_id.is_some() {
+        args.extend(["--setting-sources".to_string(), "project,local".to_string()]);
+    }
 
     // Build the unified env config. Replaces ~20 lines of scattered .env /
     // .env_remove calls with a single grep-able "ClaudeEnvConfig" site.
