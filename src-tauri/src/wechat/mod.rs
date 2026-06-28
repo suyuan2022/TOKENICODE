@@ -8,6 +8,7 @@ pub mod monitor;
 pub mod poller;
 pub mod runtime;
 pub mod store;
+pub mod text;
 pub mod turn;
 
 pub(crate) fn now_ms() -> u64 {
