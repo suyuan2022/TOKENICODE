@@ -3,6 +3,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::{atomic::{AtomicU64, Ordering}, Arc},
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -23,6 +24,9 @@ pub struct WechatAccount {
 #[derive(Debug, Clone)]
 pub struct WechatStateStore {
     dir: PathBuf,
+    /// Circuit breaker: if `now_ms < value`, outbound sends are blocked.
+    /// 0 means circuit is closed (normal). Shared across clones via Arc.
+    send_circuit_open_until_ms: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +51,10 @@ impl Default for WechatPreferences {
 
 impl WechatStateStore {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            send_circuit_open_until_ms: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn save_account(&self, account: &WechatAccount) -> StoreResult<()> {
@@ -86,23 +93,20 @@ impl WechatStateStore {
     }
 
     pub fn save_send_circuit_open_until(&self, open_until_ms: u64) -> StoreResult<()> {
-        write_text(&self.send_circuit_path(), &open_until_ms.to_string())
+        self.send_circuit_open_until_ms.store(open_until_ms, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn load_send_circuit_open_until(&self) -> StoreResult<Option<u64>> {
-        match fs::read_to_string(self.send_circuit_path()) {
-            Ok(value) => value
-                .trim()
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|err| format!("parse send circuit: {err}")),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(format!("read send circuit: {err}")),
+        match self.send_circuit_open_until_ms.load(Ordering::Relaxed) {
+            0 => Ok(None),
+            ms => Ok(Some(ms)),
         }
     }
 
     pub fn clear_send_circuit(&self) -> StoreResult<()> {
-        remove_if_exists(&self.send_circuit_path())
+        self.send_circuit_open_until_ms.store(0, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn save_typing_ticket(
@@ -171,9 +175,6 @@ impl WechatStateStore {
         self.dir.join("context_tokens.json")
     }
 
-    fn send_circuit_path(&self) -> PathBuf {
-        self.dir.join("send_circuit_until_ms")
-    }
 
     fn typing_tickets_path(&self) -> PathBuf {
         self.dir.join("typing_tickets.json")
