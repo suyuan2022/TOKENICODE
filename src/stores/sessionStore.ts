@@ -5,6 +5,13 @@ import {
   WECHAT_REMOTE_SESSION_ID,
   isWechatRemoteSessionId,
   upsertWechatRemoteSession,
+  loadWechatRemoteHiddenSessionIds,
+  rememberWechatRemoteCliSessionId,
+  saveWechatRemoteCliResumeId,
+  getWechatRemoteCliResumeId,
+  restoreWechatRemoteCliResumeId,
+  materializeWechatRemoteSession,
+  isLegacyWechatRemoteBootstrapSession,
 } from '../lib/wechat-session';
 
 // --- Orphan drain callback ---
@@ -22,9 +29,6 @@ export function setOrphanDrainCallback(cb: (stdinId: string, tabId: string) => v
 const CUSTOM_PREVIEWS_KEY = 'tokenicode_custom_previews';
 const LAST_SESSION_KEY = 'tokenicode_last_session';
 const STDIN_TO_TAB_KEY = 'tokenicode_stdinToTab';
-const WECHAT_REMOTE_CLI_RESUME_KEY = 'tokenicode_wechat_remote_cli_resume_id';
-const WECHAT_REMOTE_HIDDEN_SESSIONS_KEY = 'tokenicode_wechat_remote_hidden_session_ids';
-
 function loadCustomPreviewsSync(): Record<string, string> {
   try {
     return JSON.parse(localStorage.getItem(CUSTOM_PREVIEWS_KEY) || '{}');
@@ -61,84 +65,6 @@ function loadStdinToTabSync(): Record<string, string> {
 
 function saveStdinToTab(map: Record<string, string>) {
   sessionStorage.setItem(STDIN_TO_TAB_KEY, JSON.stringify(map));
-}
-
-function loadWechatRemoteCliResumeId(): string | null {
-  return localStorage.getItem(WECHAT_REMOTE_CLI_RESUME_KEY);
-}
-
-function loadWechatRemoteHiddenSessionIds(): Set<string> {
-  try {
-    const raw = JSON.parse(localStorage.getItem(WECHAT_REMOTE_HIDDEN_SESSIONS_KEY) || '[]');
-    return new Set(Array.isArray(raw) ? raw.filter((value) => typeof value === 'string') : []);
-  } catch {
-    return new Set();
-  }
-}
-
-function rememberWechatRemoteCliSessionId(id: string | null | undefined) {
-  if (!id || id.startsWith('desk_')) return;
-  const hidden = loadWechatRemoteHiddenSessionIds();
-  hidden.add(id);
-  localStorage.setItem(WECHAT_REMOTE_HIDDEN_SESSIONS_KEY, JSON.stringify([...hidden]));
-}
-
-function saveWechatRemoteCliResumeId(id: string | null) {
-  if (id) {
-    localStorage.setItem(WECHAT_REMOTE_CLI_RESUME_KEY, id);
-    rememberWechatRemoteCliSessionId(id);
-  } else {
-    localStorage.removeItem(WECHAT_REMOTE_CLI_RESUME_KEY);
-  }
-}
-
-function getWechatRemoteCliResumeId(sessions: SessionListItem[]): string | null {
-  return sessions.find((session) => isWechatRemoteSessionId(session.id))?.cliResumeId
-    ?? loadWechatRemoteCliResumeId();
-}
-
-function restoreWechatRemoteCliResumeId(
-  sessions: SessionListItem[],
-  cliResumeId: string | null,
-): SessionListItem[] {
-  if (!cliResumeId) return sessions;
-  return sessions.map((session) =>
-    isWechatRemoteSessionId(session.id) && !session.cliResumeId
-      ? { ...session, cliResumeId }
-      : session,
-  );
-}
-
-function materializeWechatRemoteSession(
-  sessions: SessionListItem[],
-  backingSession: SessionListItem | undefined,
-  cliResumeId: string | null,
-): SessionListItem[] {
-  if (!backingSession || !cliResumeId) {
-    return restoreWechatRemoteCliResumeId(sessions, cliResumeId);
-  }
-
-  const sessionsWithRemote = sessions.some((session) => isWechatRemoteSessionId(session.id))
-    ? sessions
-    : upsertWechatRemoteSession(sessions, backingSession.project, backingSession.modifiedAt);
-
-  return sessionsWithRemote.map((session) => {
-    if (!isWechatRemoteSessionId(session.id)) return session;
-    return {
-      ...session,
-      path: backingSession.path,
-      project: session.project || backingSession.project,
-      projectDir: session.projectDir || backingSession.projectDir,
-      modifiedAt: Math.max(session.modifiedAt || 0, backingSession.modifiedAt || 0),
-      cliResumeId,
-    };
-  });
-}
-
-function isLegacyWechatRemoteBootstrapSession(session: SessionListItem): boolean {
-  const preview = session.preview.trim();
-  return preview.startsWith('微信接入初始化，请只回复')
-    || preview.startsWith('微信接入专用会话初始化');
 }
 
 function applyWechatRemoteSessionProjection(
