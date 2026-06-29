@@ -1,8 +1,7 @@
 #[cfg(not(test))]
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex as StdMutex},
-};
+use std::{collections::HashMap, sync::LazyLock};
+#[cfg(not(test))]
+use parking_lot::Mutex as StdMutex;
 use std::{future::Future, path::Path, time::Duration};
 
 use crate::{commands::StdinManager, protocol::ControlRequest};
@@ -958,7 +957,7 @@ fn start_typing_keepalive(key: String, client: IlinkApiClient, to_user_id: Strin
         })
         .await;
     });
-    TYPING_KEEPALIVE_TASKS.lock().unwrap().insert(key, handle);
+    TYPING_KEEPALIVE_TASKS.lock().insert(key, handle);
 }
 
 #[cfg(test)]
@@ -972,7 +971,7 @@ fn start_typing_keepalive(
 
 #[cfg(not(test))]
 fn stop_typing_keepalive(key: &str) {
-    if let Some(handle) = TYPING_KEEPALIVE_TASKS.lock().unwrap().remove(key) {
+    if let Some(handle) = TYPING_KEEPALIVE_TASKS.lock().remove(key) {
         handle.abort();
     }
 }
@@ -1158,7 +1157,8 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use std::process::Stdio;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::{Child, Command};
     use tokio::time::{timeout, Duration};
@@ -1282,7 +1282,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1298,7 +1298,7 @@ mod tests {
                 desktop_session_id: "stale-stdin".into(),
             }]
         );
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1339,7 +1339,7 @@ mod tests {
                 let captured = captured.clone();
                 let encrypted = encrypted.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(encrypted)
                 }
             },
@@ -1350,7 +1350,7 @@ mod tests {
         assert_eq!(dispatch.claude_effect_count, 1);
         assert_eq!(dispatch.wechat_effect_count, 0);
         assert_eq!(
-            captured_downloads.lock().unwrap()[0].url,
+            captured_downloads.lock()[0].url,
             "https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=cdn%3Dquery"
         );
 
@@ -1551,7 +1551,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1560,7 +1560,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(
@@ -1602,7 +1602,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1611,7 +1611,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].body["msg"]["to_user_id"], "user-1");
         assert_eq!(requests[0].body["msg"]["context_token"], "ctx-latest");
@@ -1639,7 +1639,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1648,7 +1648,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 3);
         let texts: Vec<&str> = requests
             .iter()
@@ -1686,7 +1686,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1695,7 +1695,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         let texts: Vec<&str> = requests
             .iter()
             .map(|request| {
@@ -1738,7 +1738,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1747,7 +1747,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
@@ -1773,7 +1773,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": -2, "errmsg": "frequency limited" }))
                 }
             },
@@ -1794,7 +1794,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1803,7 +1803,7 @@ mod tests {
         .unwrap_err();
 
         assert!(second_error.contains("circuit breaker open"));
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1824,7 +1824,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": -2, "errmsg": "unknown error" }))
                 }
             },
@@ -1845,7 +1845,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1854,7 +1854,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(requests.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1876,7 +1876,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -1885,7 +1885,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(requests.lock().len(), 1);
         assert_eq!(store.load_send_circuit_open_until().unwrap(), None);
     }
 
@@ -1915,14 +1915,14 @@ mod tests {
             move |request| {
                 let captured_requests = captured_requests.clone();
                 async move {
-                    captured_requests.lock().unwrap().push(request);
+                    captured_requests.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
             move |request| {
                 let captured_uploads = captured_uploads.clone();
                 async move {
-                    captured_uploads.lock().unwrap().push(request);
+                    captured_uploads.lock().push(request);
                     Ok("download-param".to_string())
                 }
             },
@@ -1931,8 +1931,8 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("circuit breaker open"));
-        assert!(requests.lock().unwrap().is_empty());
-        assert!(uploads.lock().unwrap().is_empty());
+        assert!(requests.lock().is_empty());
+        assert!(uploads.lock().is_empty());
     }
 
     #[tokio::test]
@@ -1960,7 +1960,7 @@ mod tests {
             move |request| {
                 let captured_requests = captured_requests.clone();
                 async move {
-                    let mut requests = captured_requests.lock().unwrap();
+                    let mut requests = captured_requests.lock();
                     let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
                     requests.push(request);
                     if is_upload_request {
@@ -1974,7 +1974,7 @@ mod tests {
             move |request| {
                 let captured_uploads = captured_uploads.clone();
                 async move {
-                    captured_uploads.lock().unwrap().push(request);
+                    captured_uploads.lock().push(request);
                     Ok("download-param".to_string())
                 }
             },
@@ -1983,7 +1983,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(dispatch.wechat_effect_count, 1);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
 
         let upload_url_request = &requests[0];
@@ -2005,7 +2005,7 @@ mod tests {
         let aeskey = upload_url_request.body["aeskey"].as_str().unwrap();
         assert_eq!(aeskey.len(), 32);
 
-        let uploads = uploads.lock().unwrap();
+        let uploads = uploads.lock();
         assert_eq!(uploads.len(), 1);
         assert_eq!(
             uploads[0].url,
@@ -2065,7 +2065,7 @@ mod tests {
             move |request| {
                 let captured_requests = captured_requests.clone();
                 async move {
-                    let mut requests = captured_requests.lock().unwrap();
+                    let mut requests = captured_requests.lock();
                     let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
                     requests.push(request);
                     if is_upload_request {
@@ -2082,7 +2082,7 @@ mod tests {
             move |request| {
                 let captured_uploads = captured_uploads.clone();
                 async move {
-                    captured_uploads.lock().unwrap().push(request);
+                    captured_uploads.lock().push(request);
                     Ok("download-param".to_string())
                 }
             },
@@ -2091,11 +2091,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(dispatch.wechat_effect_count, 1);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].body["media_type"], 3);
         assert_eq!(requests[0].body["rawsize"], plaintext.len() as u64);
-        let uploads = uploads.lock().unwrap();
+        let uploads = uploads.lock();
         assert_eq!(uploads.len(), 1);
         assert_eq!(
             uploads[0].url,
@@ -2162,7 +2162,7 @@ mod tests {
             move |request| {
                 let captured_requests = captured_requests.clone();
                 async move {
-                    let mut requests = captured_requests.lock().unwrap();
+                    let mut requests = captured_requests.lock();
                     let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
                     requests.push(request);
                     if is_upload_request {
@@ -2176,7 +2176,7 @@ mod tests {
             move |request| {
                 let captured_uploads = captured_uploads.clone();
                 async move {
-                    captured_uploads.lock().unwrap().push(request);
+                    captured_uploads.lock().push(request);
                     Ok("download-param".to_string())
                 }
             },
@@ -2185,7 +2185,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(dispatch.wechat_effect_count, 1);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].body["media_type"], 1);
         assert_eq!(requests[1].body["msg"]["item_list"][0]["type"], 2);
@@ -2195,7 +2195,7 @@ mod tests {
             requests[3].body["msg"]["item_list"][0]["file_item"]["file_name"],
             "report.txt"
         );
-        assert_eq!(uploads.lock().unwrap().len(), 2);
+        assert_eq!(uploads.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -2212,7 +2212,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -2221,7 +2221,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(
@@ -2289,7 +2289,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -2298,7 +2298,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].body["msg"]["context_token"], "ctx-1");
         assert_eq!(requests[1].body["msg"]["context_token"], "ctx-1");
@@ -2329,7 +2329,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    let mut requests = captured.lock().unwrap();
+                    let mut requests = captured.lock();
                     requests.push(request);
                     if requests.len() == 1 {
                         Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
@@ -2343,7 +2343,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].url,
@@ -2377,7 +2377,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    let mut requests = captured.lock().unwrap();
+                    let mut requests = captured.lock();
                     requests.push(request);
                     if requests.len() == 1 {
                         Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
@@ -2391,7 +2391,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].url,
@@ -2426,7 +2426,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    captured.lock().unwrap().push(request);
+                    captured.lock().push(request);
                     Ok(json!({ "ret": 0 }))
                 }
             },
@@ -2435,7 +2435,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].url,
@@ -2465,7 +2465,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    let mut requests = captured.lock().unwrap();
+                    let mut requests = captured.lock();
                     requests.push(request);
                     if requests.len() == 1 {
                         Ok(json!({ "ret": 0, "typing_ticket": "fresh-ticket" }))
@@ -2479,7 +2479,7 @@ mod tests {
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].url,
@@ -2525,7 +2525,7 @@ mod tests {
         run_typing_keepalive_loop(1, move || {
             let captured = captured.clone();
             async move {
-                let mut sends = captured.lock().unwrap();
+                let mut sends = captured.lock();
                 *sends += 1;
                 if *sends >= 3 {
                     Err("stop keepalive".into())
@@ -2536,7 +2536,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(*sends.lock().unwrap(), 3);
+        assert_eq!(*sends.lock(), 3);
     }
 
     async fn spawn_echo_session(

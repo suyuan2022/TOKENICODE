@@ -323,7 +323,8 @@ fn emit_each<T: Serialize>(app: Option<&AppHandle>, channel: &str, items: &[T], 
 #[cfg(test)]
 mod tests {
     use std::process::Stdio;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex as StdMutex;
     use std::time::Duration;
 
     use serde_json::json;
@@ -453,7 +454,7 @@ mod tests {
             move |request| {
                 let captured = captured.clone();
                 async move {
-                    let mut requests = captured.lock().unwrap();
+                    let mut requests = captured.lock();
                     requests.push(request);
                     if requests.len() == 1 {
                         Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
@@ -471,7 +472,7 @@ mod tests {
         let line = lines.next_line().await.unwrap().unwrap();
         assert!(line.contains("hello from WeChat"));
 
-        let outbound_requests = outbound_requests.lock().unwrap();
+        let outbound_requests = outbound_requests.lock();
         assert_eq!(outbound_requests.len(), 2);
         assert_eq!(
             outbound_requests[0].url,
@@ -556,7 +557,7 @@ mod tests {
         let dispatch = execute_turn_effects_with(&stdin_mgr, &store, &effects, move |request| {
             let captured = captured.clone();
             async move {
-                captured.lock().unwrap().push(request);
+                captured.lock().push(request);
                 Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
             }
         })
@@ -566,7 +567,6 @@ mod tests {
         assert_eq!(dispatch.wechat_effect_count, 3);
         let send_texts: Vec<String> = outbound_requests
             .lock()
-            .unwrap()
             .iter()
             .filter(|request| request.url.ends_with("/ilink/bot/sendmessage"))
             .filter_map(|request| {
