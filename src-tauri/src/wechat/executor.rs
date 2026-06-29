@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use crate::{commands::StdinManager, protocol::ControlRequest};
 #[cfg(test)]
@@ -12,6 +12,7 @@ use super::{
         classify_send_response, IlinkApiClient, IlinkHttpRequest, SendMessageResponse,
         SendResponseClass, TypingStatus,
     },
+    effect_io::{LiveIo, WechatEffectIo},
     file_send::execute_wechat_file_effect,
     inbound::{InboundWechatMedia, InboundWechatMediaKind},
     media::{
@@ -156,82 +157,15 @@ pub async fn execute_turn_effects(
     store: &WechatStateStore,
     effects: &[WechatTurnEffect],
 ) -> Result<WechatEffectDispatch, String> {
-    execute_turn_effects_with_media_and_upload(
-        stdin_mgr,
-        store,
-        effects,
-        |request| async move {
-            IlinkApiClient::new(None)
-                .execute_json::<Value>(request)
-                .await
-        },
-        download_cdn_media_bytes,
-        upload_cdn_media_bytes,
-    )
-    .await
+    execute_turn_effects_with(stdin_mgr, store, effects, &mut LiveIo).await
 }
 
-pub async fn execute_turn_effects_with<F, Fut>(
+pub(crate) async fn execute_turn_effects_with(
     stdin_mgr: &StdinManager,
     store: &WechatStateStore,
     effects: &[WechatTurnEffect],
-    execute_wechat_request: F,
-) -> Result<WechatEffectDispatch, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
-    execute_turn_effects_with_media_and_upload(
-        stdin_mgr,
-        store,
-        effects,
-        execute_wechat_request,
-        download_cdn_media_bytes,
-        upload_cdn_media_bytes,
-    )
-    .await
-}
-
-pub async fn execute_turn_effects_with_media<F, Fut, G, Gut>(
-    stdin_mgr: &StdinManager,
-    store: &WechatStateStore,
-    effects: &[WechatTurnEffect],
-    mut execute_wechat_request: F,
-    mut download_media: G,
-) -> Result<WechatEffectDispatch, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-    G: FnMut(WechatCdnDownloadRequest) -> Gut,
-    Gut: Future<Output = Result<Vec<u8>, String>>,
-{
-    execute_turn_effects_with_media_and_upload(
-        stdin_mgr,
-        store,
-        effects,
-        &mut execute_wechat_request,
-        &mut download_media,
-        upload_cdn_media_bytes,
-    )
-    .await
-}
-
-pub async fn execute_turn_effects_with_media_and_upload<F, Fut, G, Gut, H, Hut>(
-    stdin_mgr: &StdinManager,
-    store: &WechatStateStore,
-    effects: &[WechatTurnEffect],
-    mut execute_wechat_request: F,
-    mut download_media: G,
-    mut upload_media: H,
-) -> Result<WechatEffectDispatch, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-    G: FnMut(WechatCdnDownloadRequest) -> Gut,
-    Gut: Future<Output = Result<Vec<u8>, String>>,
-    H: FnMut(WechatCdnUploadRequest) -> Hut,
-    Hut: Future<Output = Result<String, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<WechatEffectDispatch, String> {
     let mut dispatch = WechatEffectDispatch::default();
     for effect in effects {
         let mut desktop_user_message = desktop_user_message_for_text_effect(effect);
@@ -253,7 +187,7 @@ where
         };
         if !handled_claude {
             if let Some(message) =
-                execute_claude_media_effect_with(stdin_mgr, store, effect, &mut download_media)
+                execute_claude_media_effect_with(stdin_mgr, store, effect, io)
                     .await?
             {
                 handled_claude = true;
@@ -266,11 +200,10 @@ where
                 dispatch.desktop_user_messages.push(message);
             }
         }
-        if execute_wechat_effect_with_upload(
+        if execute_wechat_effect_with(
             effect,
             store,
-            &mut execute_wechat_request,
-            &mut upload_media,
+            io,
         )
         .await?
         {
@@ -288,16 +221,12 @@ fn is_stale_clear_slash_effect(effect: &WechatTurnEffect) -> bool {
     )
 }
 
-pub async fn execute_claude_media_effect_with<F, Fut>(
+pub(crate) async fn execute_claude_media_effect_with(
     stdin_mgr: &StdinManager,
     store: &WechatStateStore,
     effect: &WechatTurnEffect,
-    mut download_media: F,
-) -> Result<Option<WechatDesktopUserMessage>, String>
-where
-    F: FnMut(WechatCdnDownloadRequest) -> Fut,
-    Fut: Future<Output = Result<Vec<u8>, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<Option<WechatDesktopUserMessage>, String> {
     let WechatTurnEffect::DownloadMediaToClaude {
         desktop_session_id,
         media,
@@ -307,7 +236,7 @@ where
     };
 
     let request = build_cdn_download_request(&media.cdn)?;
-    let encrypted = download_media(request).await?;
+    let encrypted = io.download_media(request).await?;
     let aes_key = parse_cdn_aes_key(&media.cdn.aes_key)?;
     let decrypted = decrypt_aes_128_ecb_pkcs7(&encrypted, &aes_key)?;
     let saved_path = store.save_inbound_media(media, &decrypted)?;
@@ -340,43 +269,14 @@ pub async fn execute_wechat_effect(
     effect: &WechatTurnEffect,
     store: &WechatStateStore,
 ) -> Result<bool, String> {
-    execute_wechat_effect_with_upload(
-        effect,
-        store,
-        |request| async move {
-            IlinkApiClient::new(None)
-                .execute_json::<Value>(request)
-                .await
-        },
-        upload_cdn_media_bytes,
-    )
-    .await
+    execute_wechat_effect_with(effect, store, &mut LiveIo).await
 }
 
-pub async fn execute_wechat_effect_with<F, Fut>(
+pub(crate) async fn execute_wechat_effect_with(
     effect: &WechatTurnEffect,
     store: &WechatStateStore,
-    execute_request: F,
-) -> Result<bool, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
-    execute_wechat_effect_with_upload(effect, store, execute_request, upload_cdn_media_bytes).await
-}
-
-pub async fn execute_wechat_effect_with_upload<F, Fut, H, Hut>(
-    effect: &WechatTurnEffect,
-    store: &WechatStateStore,
-    mut execute_request: F,
-    mut upload_media: H,
-) -> Result<bool, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-    H: FnMut(WechatCdnUploadRequest) -> Hut,
-    Hut: Future<Output = Result<String, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<bool, String> {
     let Some(account) = store.load_account()? else {
         return Ok(false);
     };
@@ -405,7 +305,7 @@ where
             for chunk in chunks {
                 let request =
                     client.send_text_request(to_user_id, &context_token, &chunk, &new_client_id());
-                execute_send_message_request(store, request, &mut execute_request).await?;
+                execute_send_message_request(store, request, io).await?;
             }
             Ok(true)
         }
@@ -424,8 +324,7 @@ where
                 &context_token,
                 path,
                 caption.as_deref(),
-                &mut execute_request,
-                &mut upload_media,
+                io,
             )
             .await?;
             Ok(true)
@@ -442,7 +341,7 @@ where
                 to_user_id,
                 context_token,
                 TypingStatus::Start,
-                &mut execute_request,
+                io,
             )
             .await
         }
@@ -458,7 +357,7 @@ where
                 to_user_id,
                 context_token,
                 TypingStatus::Stop,
-                &mut execute_request,
+                io,
             )
             .await
         }
@@ -470,23 +369,14 @@ pub async fn execute_wechat_lifecycle_effect(
     effect: WechatLifecycleEffect,
     store: &WechatStateStore,
 ) -> Result<bool, String> {
-    execute_wechat_lifecycle_effect_with(effect, store, |request| async move {
-        IlinkApiClient::new(None)
-            .execute_json::<Value>(request)
-            .await
-    })
-    .await
+    execute_wechat_lifecycle_effect_with(effect, store, &mut LiveIo).await
 }
 
-pub async fn execute_wechat_lifecycle_effect_with<F, Fut>(
+pub(crate) async fn execute_wechat_lifecycle_effect_with(
     effect: WechatLifecycleEffect,
     store: &WechatStateStore,
-    mut execute_request: F,
-) -> Result<bool, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<bool, String> {
     let Some(account) = store.load_account()? else {
         return Ok(false);
     };
@@ -496,7 +386,7 @@ where
         WechatLifecycleEffect::NotifyStop => client.notify_stop_request(),
     };
 
-    match execute_request(request).await {
+    match io.execute_request(request).await {
         Ok(response) => {
             if let Some(ret) = response.get("ret").and_then(Value::as_i64) {
                 if ret != 0 {
@@ -530,17 +420,13 @@ fn resolve_context_token(
         .ok_or_else(|| format!("WeChat context_token missing for user {to_user_id}"))
 }
 
-pub(super) async fn execute_send_message_request<F, Fut>(
+pub(super) async fn execute_send_message_request(
     store: &WechatStateStore,
     request: IlinkHttpRequest,
-    execute_request: &mut F,
-) -> Result<(), String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<(), String> {
     ensure_send_circuit_closed(store)?;
-    let response: SendMessageResponse = parse_response(execute_request(request).await?)?;
+    let response: SendMessageResponse = parse_response(io.execute_request(request).await?)?;
     match classify_send_response(&response) {
         SendResponseClass::Ok => Ok(()),
         SendResponseClass::RateLimited => {
@@ -713,17 +599,15 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use std::process::Stdio;
-    use std::sync::Arc;
-    use parking_lot::Mutex;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::{Child, Command};
     use tokio::time::{timeout, Duration};
 
     use crate::wechat::{
         api::wechat_channel_version,
+        effect_io::FakeIo,
         file_send::WECHAT_SEND_MANIFEST_BASENAME,
         inbound::{InboundWechatCdnMedia, InboundWechatMedia, InboundWechatMediaKind},
-        media::{WechatCdnDownloadRequest, WechatCdnUploadRequest},
         store::{WechatAccount, WechatStateStore},
     };
 
@@ -795,7 +679,7 @@ mod tests {
             &[WechatTurnEffect::ClearDesktopConversation {
                 desktop_session_id: "stdin-1".into(),
             }],
-            |_request| async { Ok(json!({ "ret": 0 })) },
+            &mut FakeIo::new(),
         )
         .await
         .unwrap();
@@ -816,8 +700,7 @@ mod tests {
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
         let stdin_mgr = StdinManager::new();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let dispatch = execute_turn_effects_with(
             &stdin_mgr,
@@ -836,13 +719,7 @@ mod tests {
                     text: "cleared".into(),
                 },
             ],
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
@@ -855,7 +732,7 @@ mod tests {
                 desktop_session_id: "stale-stdin".into(),
             }]
         );
-        assert_eq!(requests.lock().len(), 1);
+        assert_eq!(io.requests.len(), 1);
     }
 
     #[tokio::test]
@@ -864,13 +741,13 @@ mod tests {
         let store = WechatStateStore::new(dir.path().to_path_buf());
         let stdin_mgr = StdinManager::new();
         let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
-        let captured_downloads = Arc::new(Mutex::new(Vec::<WechatCdnDownloadRequest>::new()));
         let encrypted = BASE64_STANDARD
             .decode("xhoD0c7E8emien3r349dx0yFRk8xSm9+WOSTOn8Wjn4=")
             .unwrap();
-        let captured = captured_downloads.clone();
 
-        let dispatch = execute_turn_effects_with_media(
+        let mut io = FakeIo::new().on_download(move |_| Ok(encrypted.clone()));
+
+        let dispatch = execute_turn_effects_with(
             &stdin_mgr,
             &store,
             &[WechatTurnEffect::DownloadMediaToClaude {
@@ -891,15 +768,7 @@ mod tests {
                     },
                 },
             }],
-            |_request| async { Ok(json!({ "ret": 0 })) },
-            move |request| {
-                let captured = captured.clone();
-                let encrypted = encrypted.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(encrypted)
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
@@ -907,7 +776,7 @@ mod tests {
         assert_eq!(dispatch.claude_effect_count, 1);
         assert_eq!(dispatch.wechat_effect_count, 0);
         assert_eq!(
-            captured_downloads.lock()[0].url,
+            io.downloads[0].url,
             "https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=cdn%3Dquery"
         );
 
@@ -1066,7 +935,7 @@ mod tests {
             &[WechatTurnEffect::InterruptClaude {
                 desktop_session_id: "stdin-1".into(),
             }],
-            |_request| async { Ok(json!({ "ret": 0 })) },
+            &mut FakeIo::new(),
         )
         .await
         .unwrap();
@@ -1095,8 +964,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
@@ -1105,21 +973,14 @@ mod tests {
                 text: "hello from Claude".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
+        assert_eq!(io.requests.len(), 1);
+        let request = &io.requests[0];
         assert_eq!(
             request.url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendmessage"
@@ -1146,8 +1007,7 @@ mod tests {
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
         store.save_context_token("user-1", "ctx-latest").unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
@@ -1156,24 +1016,17 @@ mod tests {
                 text: "async follow-up".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].body["msg"]["to_user_id"], "user-1");
-        assert_eq!(requests[0].body["msg"]["context_token"], "ctx-latest");
+        assert_eq!(io.requests.len(), 1);
+        assert_eq!(io.requests[0].body["msg"]["to_user_id"], "user-1");
+        assert_eq!(io.requests[0].body["msg"]["context_token"], "ctx-latest");
         assert_eq!(
-            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
+            io.requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
             "async follow-up"
         );
     }
@@ -1183,8 +1036,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
@@ -1193,21 +1045,14 @@ mod tests {
                 text: "##### 标题\n> 引用\n**bold** *中文* ~~删除~~ ![alt](https://x.test/a.png)\n```ts\nconst x = \"~~keep~~\";\n```\n".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 3);
-        let texts: Vec<&str> = requests
+        assert_eq!(io.requests.len(), 3);
+        let texts: Vec<&str> = io.requests
             .iter()
             .map(|request| {
                 request.body["msg"]["item_list"][0]["text_item"]["text"]
@@ -1230,8 +1075,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
@@ -1240,20 +1084,13 @@ mod tests {
                 text: "嗯，这个得看你们几个人、怎么用。\n\n先说结论：如果团队不超过 5-6 个人，我倾向 NAS。\n但坚果云赢在不用管。\n```ts\nconst size = \"50G\";\nconsole.log(size);\n```\n下一步看文件大小。".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        let texts: Vec<&str> = requests
+        let texts: Vec<&str> = io.requests
             .iter()
             .map(|request| {
                 request.body["msg"]["item_list"][0]["text_item"]["text"]
@@ -1282,8 +1119,7 @@ mod tests {
                 split_outbound_text_by_line_breaks: false,
             })
             .unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
@@ -1292,22 +1128,15 @@ mod tests {
                 text: "第一段\n第二段\n第三段".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(io.requests.len(), 1);
         assert_eq!(
-            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
+            io.requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
             "第一段\n第二段\n第三段"
         );
     }
@@ -1317,9 +1146,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
 
+        let mut io = FakeIo::new()
+            .on_request(|_| Ok(json!({ "ret": -2, "errmsg": "frequency limited" })));
         let first_error = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
                 to_user_id: "user-1".into(),
@@ -1327,20 +1156,15 @@ mod tests {
                 text: "first".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": -2, "errmsg": "frequency limited" }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap_err();
 
         assert!(first_error.contains("rate limited"));
+        assert_eq!(io.requests.len(), 1);
 
-        let captured = requests.clone();
+        let mut io2 = FakeIo::new();
         let second_error = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
                 to_user_id: "user-1".into(),
@@ -1348,19 +1172,13 @@ mod tests {
                 text: "second".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io2,
         )
         .await
         .unwrap_err();
 
         assert!(second_error.contains("circuit breaker open"));
-        assert_eq!(requests.lock().len(), 1);
+        assert!(io2.requests.is_empty());
     }
 
     #[tokio::test]
@@ -1368,9 +1186,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
 
+        let mut io = FakeIo::new()
+            .on_request(|_| Ok(json!({ "ret": -2, "errmsg": "unknown error" })));
         let first_error = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
                 to_user_id: "user-1".into(),
@@ -1378,20 +1196,14 @@ mod tests {
                 text: "first".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": -2, "errmsg": "unknown error" }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap_err();
 
         assert!(first_error.contains("stale session"));
 
-        let captured = requests.clone();
+        let mut io2 = FakeIo::new();
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
                 to_user_id: "user-1".into(),
@@ -1399,19 +1211,13 @@ mod tests {
                 text: "second".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io2,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        assert_eq!(requests.lock().len(), 2);
+        assert_eq!(io.requests.len() + io2.requests.len(), 2);
     }
 
     #[tokio::test]
@@ -1420,8 +1226,7 @@ mod tests {
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
         store.save_send_circuit_open_until(1).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatText {
@@ -1430,19 +1235,13 @@ mod tests {
                 text: "after cooldown".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        assert_eq!(requests.lock().len(), 1);
+        assert_eq!(io.requests.len(), 1);
         assert_eq!(store.load_send_circuit_open_until().unwrap(), None);
     }
 
@@ -1456,12 +1255,10 @@ mod tests {
             .unwrap();
         let file_path = dir.path().join("generated.png");
         std::fs::write(&file_path, b"hello generated image").unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let uploads = Arc::new(Mutex::new(Vec::<WechatCdnUploadRequest>::new()));
-        let captured_requests = requests.clone();
-        let captured_uploads = uploads.clone();
 
-        let error = execute_wechat_effect_with_upload(
+        let mut io = FakeIo::new()
+            .on_upload(|_| Ok("download-param".to_string()));
+        let error = execute_wechat_effect_with(
             &WechatTurnEffect::SendWeChatFile {
                 to_user_id: "user-1".into(),
                 context_token: "ctx-1".into(),
@@ -1469,27 +1266,14 @@ mod tests {
                 caption: None,
             },
             &store,
-            move |request| {
-                let captured_requests = captured_requests.clone();
-                async move {
-                    captured_requests.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
-            move |request| {
-                let captured_uploads = captured_uploads.clone();
-                async move {
-                    captured_uploads.lock().push(request);
-                    Ok("download-param".to_string())
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap_err();
 
         assert!(error.contains("circuit breaker open"));
-        assert!(requests.lock().is_empty());
-        assert!(uploads.lock().is_empty());
+        assert!(io.requests.is_empty());
+        assert!(io.uploads.is_empty());
     }
 
     #[tokio::test]
@@ -1499,13 +1283,19 @@ mod tests {
         store.save_account(&account()).unwrap();
         let file_path = dir.path().join("generated.png");
         std::fs::write(&file_path, b"hello generated image").unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let uploads = Arc::new(Mutex::new(Vec::<WechatCdnUploadRequest>::new()));
-        let captured_requests = requests.clone();
-        let captured_uploads = uploads.clone();
         let stdin_mgr = StdinManager::new();
 
-        let dispatch = execute_turn_effects_with_media_and_upload(
+        let mut io = FakeIo::new()
+            .on_request(|req| {
+                if req.url.ends_with("/ilink/bot/getuploadurl") {
+                    Ok(json!({ "ret": 0, "upload_param": "upload=param" }))
+                } else {
+                    Ok(json!({ "ret": 0 }))
+                }
+            })
+            .on_upload(|_| Ok("download-param".to_string()));
+
+        let dispatch = execute_turn_effects_with(
             &stdin_mgr,
             &store,
             &[WechatTurnEffect::SendWeChatFile {
@@ -1514,36 +1304,15 @@ mod tests {
                 path: file_path.display().to_string(),
                 caption: None,
             }],
-            move |request| {
-                let captured_requests = captured_requests.clone();
-                async move {
-                    let mut requests = captured_requests.lock();
-                    let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
-                    requests.push(request);
-                    if is_upload_request {
-                        Ok(json!({ "ret": 0, "upload_param": "upload=param" }))
-                    } else {
-                        Ok(json!({ "ret": 0 }))
-                    }
-                }
-            },
-            |_request| async { unreachable!("image upload should not download media") },
-            move |request| {
-                let captured_uploads = captured_uploads.clone();
-                async move {
-                    captured_uploads.lock().push(request);
-                    Ok("download-param".to_string())
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert_eq!(dispatch.wechat_effect_count, 1);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(io.requests.len(), 2);
 
-        let upload_url_request = &requests[0];
+        let upload_url_request = &io.requests[0];
         assert_eq!(
             upload_url_request.url,
             "https://ilinkai.weixin.qq.com/ilink/bot/getuploadurl"
@@ -1562,18 +1331,17 @@ mod tests {
         let aeskey = upload_url_request.body["aeskey"].as_str().unwrap();
         assert_eq!(aeskey.len(), 32);
 
-        let uploads = uploads.lock();
-        assert_eq!(uploads.len(), 1);
+        assert_eq!(io.uploads.len(), 1);
         assert_eq!(
-            uploads[0].url,
+            io.uploads[0].url,
             format!(
                 "https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=upload%3Dparam&filekey={filekey}"
             )
         );
-        assert_eq!(uploads[0].encrypted_body.len(), 32);
-        assert_ne!(uploads[0].encrypted_body, b"hello generated image");
+        assert_eq!(io.uploads[0].encrypted_body.len(), 32);
+        assert_ne!(io.uploads[0].encrypted_body, b"hello generated image");
 
-        let send_message_request = &requests[1];
+        let send_message_request = &io.requests[1];
         assert_eq!(
             send_message_request.url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendmessage"
@@ -1604,13 +1372,22 @@ mod tests {
         let file_path = dir.path().join("report.txt");
         let plaintext = b"hello generated document";
         std::fs::write(&file_path, plaintext).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let uploads = Arc::new(Mutex::new(Vec::<WechatCdnUploadRequest>::new()));
-        let captured_requests = requests.clone();
-        let captured_uploads = uploads.clone();
         let stdin_mgr = StdinManager::new();
 
-        let dispatch = execute_turn_effects_with_media_and_upload(
+        let mut io = FakeIo::new()
+            .on_request(|req| {
+                if req.url.ends_with("/ilink/bot/getuploadurl") {
+                    Ok(json!({
+                        "ret": 0,
+                        "upload_full_url": "https://novac2c.cdn.weixin.qq.com/c2c/full-upload"
+                    }))
+                } else {
+                    Ok(json!({ "ret": 0 }))
+                }
+            })
+            .on_upload(|_| Ok("download-param".to_string()));
+
+        let dispatch = execute_turn_effects_with(
             &stdin_mgr,
             &store,
             &[WechatTurnEffect::SendWeChatFile {
@@ -1619,48 +1396,23 @@ mod tests {
                 path: file_path.display().to_string(),
                 caption: Some("##### 附件\n*中文*".into()),
             }],
-            move |request| {
-                let captured_requests = captured_requests.clone();
-                async move {
-                    let mut requests = captured_requests.lock();
-                    let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
-                    requests.push(request);
-                    if is_upload_request {
-                        Ok(json!({
-                            "ret": 0,
-                            "upload_full_url": "https://novac2c.cdn.weixin.qq.com/c2c/full-upload"
-                        }))
-                    } else {
-                        Ok(json!({ "ret": 0 }))
-                    }
-                }
-            },
-            |_request| async { unreachable!("file upload should not download media") },
-            move |request| {
-                let captured_uploads = captured_uploads.clone();
-                async move {
-                    captured_uploads.lock().push(request);
-                    Ok("download-param".to_string())
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert_eq!(dispatch.wechat_effect_count, 1);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].body["media_type"], 3);
-        assert_eq!(requests[0].body["rawsize"], plaintext.len() as u64);
-        let uploads = uploads.lock();
-        assert_eq!(uploads.len(), 1);
+        assert_eq!(io.requests.len(), 2);
+        assert_eq!(io.requests[0].body["media_type"], 3);
+        assert_eq!(io.requests[0].body["rawsize"], plaintext.len() as u64);
+        assert_eq!(io.uploads.len(), 1);
         assert_eq!(
-            uploads[0].url,
+            io.uploads[0].url,
             "https://novac2c.cdn.weixin.qq.com/c2c/full-upload"
         );
-        assert_ne!(uploads[0].encrypted_body, plaintext);
+        assert_ne!(io.uploads[0].encrypted_body, plaintext);
 
-        let send_message_request = &requests[1];
+        let send_message_request = &io.requests[1];
         assert_eq!(send_message_request.body["msg"]["item_list"][0]["type"], 1);
         assert_eq!(
             send_message_request.body["msg"]["item_list"][0]["text_item"]["text"],
@@ -1701,13 +1453,19 @@ mod tests {
             ),
         )
         .unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let uploads = Arc::new(Mutex::new(Vec::<WechatCdnUploadRequest>::new()));
-        let captured_requests = requests.clone();
-        let captured_uploads = uploads.clone();
         let stdin_mgr = StdinManager::new();
 
-        let dispatch = execute_turn_effects_with_media_and_upload(
+        let mut io = FakeIo::new()
+            .on_request(|req| {
+                if req.url.ends_with("/ilink/bot/getuploadurl") {
+                    Ok(json!({ "ret": 0, "upload_param": "upload=param" }))
+                } else {
+                    Ok(json!({ "ret": 0 }))
+                }
+            })
+            .on_upload(|_| Ok("download-param".to_string()));
+
+        let dispatch = execute_turn_effects_with(
             &stdin_mgr,
             &store,
             &[WechatTurnEffect::SendWeChatFile {
@@ -1716,43 +1474,22 @@ mod tests {
                 path: manifest_path.display().to_string(),
                 caption: None,
             }],
-            move |request| {
-                let captured_requests = captured_requests.clone();
-                async move {
-                    let mut requests = captured_requests.lock();
-                    let is_upload_request = request.url.ends_with("/ilink/bot/getuploadurl");
-                    requests.push(request);
-                    if is_upload_request {
-                        Ok(json!({ "ret": 0, "upload_param": "upload=param" }))
-                    } else {
-                        Ok(json!({ "ret": 0 }))
-                    }
-                }
-            },
-            |_request| async { unreachable!("manifest upload should not download media") },
-            move |request| {
-                let captured_uploads = captured_uploads.clone();
-                async move {
-                    captured_uploads.lock().push(request);
-                    Ok("download-param".to_string())
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert_eq!(dispatch.wechat_effect_count, 1);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0].body["media_type"], 1);
-        assert_eq!(requests[1].body["msg"]["item_list"][0]["type"], 2);
-        assert_eq!(requests[2].body["media_type"], 3);
-        assert_eq!(requests[3].body["msg"]["item_list"][0]["type"], 4);
+        assert_eq!(io.requests.len(), 4);
+        assert_eq!(io.requests[0].body["media_type"], 1);
+        assert_eq!(io.requests[1].body["msg"]["item_list"][0]["type"], 2);
+        assert_eq!(io.requests[2].body["media_type"], 3);
+        assert_eq!(io.requests[3].body["msg"]["item_list"][0]["type"], 4);
         assert_eq!(
-            requests[3].body["msg"]["item_list"][0]["file_item"]["file_name"],
+            io.requests[3].body["msg"]["item_list"][0]["file_item"]["file_name"],
             "report.txt"
         );
-        assert_eq!(uploads.lock().len(), 2);
+        assert_eq!(io.uploads.len(), 2);
     }
 
     #[tokio::test]
@@ -1760,27 +1497,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_lifecycle_effect_with(
             WechatLifecycleEffect::NotifyStart,
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
+        assert_eq!(io.requests.len(), 1);
+        let request = &io.requests[0];
         assert_eq!(
             request.url,
             "https://ilinkai.weixin.qq.com/ilink/bot/msg/notifystart"
@@ -1801,7 +1530,7 @@ mod tests {
         let handled = execute_wechat_lifecycle_effect_with(
             WechatLifecycleEffect::NotifyStop,
             &store,
-            |_request| async { Err("network down".into()) },
+            &mut FakeIo::new().on_request(|_| Err("network down".into())),
         )
         .await
         .unwrap();
@@ -1818,7 +1547,7 @@ mod tests {
         let handled = execute_wechat_lifecycle_effect_with(
             WechatLifecycleEffect::NotifyStop,
             &store,
-            |_request| async { Ok(json!({ "ret": -1, "errmsg": "unsupported" })) },
+            &mut FakeIo::new().on_request(|_| Ok(json!({ "ret": -1, "errmsg": "unsupported" }))),
         )
         .await
         .unwrap();
@@ -1831,8 +1560,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
         let first_line = "好".repeat(3_790);
         let second_line = "界".repeat(20);
 
@@ -1843,28 +1571,21 @@ mod tests {
                 text: format!("{first_line}\n{second_line}"),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].body["msg"]["context_token"], "ctx-1");
-        assert_eq!(requests[1].body["msg"]["context_token"], "ctx-1");
+        assert_eq!(io.requests.len(), 2);
+        assert_eq!(io.requests[0].body["msg"]["context_token"], "ctx-1");
+        assert_eq!(io.requests[1].body["msg"]["context_token"], "ctx-1");
         assert_eq!(
-            requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
+            io.requests[0].body["msg"]["item_list"][0]["text_item"]["text"],
             first_line
         );
         assert_eq!(
-            requests[1].body["msg"]["item_list"][0]["text_item"]["text"],
+            io.requests[1].body["msg"]["item_list"][0]["text_item"]["text"],
             second_line
         );
     }
@@ -1874,8 +1595,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut call_count = 0usize;
+        let mut io = FakeIo::new().on_request(move |_| {
+            call_count += 1;
+            if call_count == 1 {
+                Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
+            } else {
+                Ok(json!({ "ret": 0 }))
+            }
+        });
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::StartTyping {
@@ -1883,38 +1611,26 @@ mod tests {
                 context_token: "ctx-1".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    let mut requests = captured.lock();
-                    requests.push(request);
-                    if requests.len() == 1 {
-                        Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
-                    } else {
-                        Ok(json!({ "ret": 0 }))
-                    }
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(io.requests.len(), 2);
         assert_eq!(
-            requests[0].url,
+            io.requests[0].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/getconfig"
         );
-        assert_eq!(requests[0].body["ilink_user_id"], "user-1");
-        assert_eq!(requests[0].body["context_token"], "ctx-1");
+        assert_eq!(io.requests[0].body["ilink_user_id"], "user-1");
+        assert_eq!(io.requests[0].body["context_token"], "ctx-1");
         assert_eq!(
-            requests[1].url,
+            io.requests[1].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
         );
-        assert_eq!(requests[1].body["ilink_user_id"], "user-1");
-        assert_eq!(requests[1].body["typing_ticket"], "ticket-1");
-        assert_eq!(requests[1].body["status"], 1);
+        assert_eq!(io.requests[1].body["ilink_user_id"], "user-1");
+        assert_eq!(io.requests[1].body["typing_ticket"], "ticket-1");
+        assert_eq!(io.requests[1].body["status"], 1);
     }
 
     #[tokio::test]
@@ -1922,8 +1638,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = WechatStateStore::new(dir.path().to_path_buf());
         store.save_account(&account()).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut call_count = 0usize;
+        let mut io = FakeIo::new().on_request(move |_| {
+            call_count += 1;
+            if call_count == 1 {
+                Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
+            } else {
+                Ok(json!({ "ret": 0 }))
+            }
+        });
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::StopTyping {
@@ -1931,36 +1654,24 @@ mod tests {
                 context_token: "ctx-1".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    let mut requests = captured.lock();
-                    requests.push(request);
-                    if requests.len() == 1 {
-                        Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
-                    } else {
-                        Ok(json!({ "ret": 0 }))
-                    }
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(io.requests.len(), 2);
         assert_eq!(
-            requests[0].url,
+            io.requests[0].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/getconfig"
         );
         assert_eq!(
-            requests[1].url,
+            io.requests[1].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
         );
-        assert_eq!(requests[1].body["ilink_user_id"], "user-1");
-        assert_eq!(requests[1].body["typing_ticket"], "ticket-1");
-        assert_eq!(requests[1].body["status"], 2);
+        assert_eq!(io.requests[1].body["ilink_user_id"], "user-1");
+        assert_eq!(io.requests[1].body["typing_ticket"], "ticket-1");
+        assert_eq!(io.requests[1].body["status"], 2);
     }
 
     #[tokio::test]
@@ -1971,8 +1682,7 @@ mod tests {
         store
             .save_typing_ticket("user-1", "cached-ticket", now_ms())
             .unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut io = FakeIo::new();
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::StartTyping {
@@ -1980,26 +1690,19 @@ mod tests {
                 context_token: "ctx-1".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    captured.lock().push(request);
-                    Ok(json!({ "ret": 0 }))
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(io.requests.len(), 1);
         assert_eq!(
-            requests[0].url,
+            io.requests[0].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
         );
-        assert_eq!(requests[0].body["typing_ticket"], "cached-ticket");
-        assert_eq!(requests[0].body["status"], 1);
+        assert_eq!(io.requests[0].body["typing_ticket"], "cached-ticket");
+        assert_eq!(io.requests[0].body["status"], 1);
     }
 
     #[tokio::test]
@@ -2010,8 +1713,15 @@ mod tests {
         store
             .save_typing_ticket("user-1", "stale-ticket", 1)
             .unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
+        let mut call_count = 0usize;
+        let mut io = FakeIo::new().on_request(move |_| {
+            call_count += 1;
+            if call_count == 1 {
+                Ok(json!({ "ret": 0, "typing_ticket": "fresh-ticket" }))
+            } else {
+                Ok(json!({ "ret": 0 }))
+            }
+        });
 
         let handled = execute_wechat_effect_with(
             &WechatTurnEffect::StartTyping {
@@ -2019,35 +1729,22 @@ mod tests {
                 context_token: "ctx-1".into(),
             },
             &store,
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    let mut requests = captured.lock();
-                    requests.push(request);
-                    if requests.len() == 1 {
-                        Ok(json!({ "ret": 0, "typing_ticket": "fresh-ticket" }))
-                    } else {
-                        Ok(json!({ "ret": 0 }))
-                    }
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
 
         assert!(handled);
-        let requests = requests.lock();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(io.requests.len(), 2);
         assert_eq!(
-            requests[0].url,
+            io.requests[0].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/getconfig"
         );
         assert_eq!(
-            requests[1].url,
+            io.requests[1].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
         );
-        assert_eq!(requests[1].body["typing_ticket"], "fresh-ticket");
-        drop(requests);
+        assert_eq!(io.requests[1].body["typing_ticket"], "fresh-ticket");
         assert_eq!(
             store.load_typing_ticket("user-1").unwrap().unwrap().ticket,
             "fresh-ticket"
@@ -2066,7 +1763,7 @@ mod tests {
                 context_token: "ctx-1".into(),
             },
             &store,
-            |_request| async { Err("network down".into()) },
+            &mut FakeIo::new().on_request(|_| Err("network down".into())),
         )
         .await
         .unwrap();

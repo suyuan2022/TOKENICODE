@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::api::{GetConfigResponse, IlinkApiClient, IlinkHttpRequest, TypingStatus};
+use super::api::{GetConfigResponse, IlinkApiClient, TypingStatus};
+use super::effect_io::WechatEffectIo;
 use super::executor::parse_response;
 use super::now_ms;
 use super::store::WechatStateStore;
@@ -31,30 +32,26 @@ const TYPING_KEEPALIVE_INTERVAL_MS: u64 = 5_000;
 static TYPING_KEEPALIVE_TASKS: LazyLock<StdMutex<HashMap<String, JoinHandle<()>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-pub(super) async fn execute_typing_effect<F, Fut>(
+pub(super) async fn execute_typing_effect(
     client: &IlinkApiClient,
     store: &WechatStateStore,
     keepalive_key: &str,
     to_user_id: &str,
     context_token: &str,
     status: TypingStatus,
-    execute_request: &mut F,
-) -> Result<bool, String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<bool, String> {
     if status == TypingStatus::Stop {
         stop_typing_keepalive(keepalive_key);
     }
 
     let Some(ticket) =
-        resolve_typing_ticket(client, store, to_user_id, context_token, execute_request).await
+        resolve_typing_ticket(client, store, to_user_id, context_token, io).await
     else {
         return Ok(true);
     };
 
-    let sent = send_typing_best_effort(client, to_user_id, &ticket, status, execute_request).await;
+    let sent = send_typing_best_effort(client, to_user_id, &ticket, status, io).await;
     if status == TypingStatus::Start && sent {
         start_typing_keepalive(
             keepalive_key.to_string(),
@@ -66,17 +63,13 @@ where
     Ok(true)
 }
 
-async fn resolve_typing_ticket<F, Fut>(
+async fn resolve_typing_ticket(
     client: &IlinkApiClient,
     store: &WechatStateStore,
     to_user_id: &str,
     context_token: &str,
-    execute_request: &mut F,
-) -> Option<String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Option<String> {
     match store.load_typing_ticket(to_user_id) {
         Ok(Some(cached))
             if !cached.ticket.trim().is_empty()
@@ -89,7 +82,7 @@ where
     }
 
     let config_request = client.get_config_request(to_user_id, Some(context_token));
-    let config_value = match execute_request(config_request).await {
+    let config_value = match io.execute_request(config_request).await {
         Ok(value) => value,
         Err(err) => {
             eprintln!("[WeChat] getconfig for typing failed: {err}");
@@ -117,19 +110,15 @@ where
     Some(ticket)
 }
 
-async fn send_typing_best_effort<F, Fut>(
+async fn send_typing_best_effort(
     client: &IlinkApiClient,
     to_user_id: &str,
     ticket: &str,
     status: TypingStatus,
-    execute_request: &mut F,
-) -> bool
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> bool {
     let typing_request = client.send_typing_request(to_user_id, ticket, status);
-    match execute_request(typing_request).await {
+    match io.execute_request(typing_request).await {
         Ok(value) => {
             let ret = value.get("ret").and_then(Value::as_i64).unwrap_or_default();
             if ret != 0 {

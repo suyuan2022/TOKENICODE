@@ -5,7 +5,6 @@ use tokio::{
 };
 
 use serde::Serialize;
-use serde_json::{json, Value};
 use tauri::AppHandle;
 
 use crate::{
@@ -13,6 +12,7 @@ use crate::{
     events::emit_to_frontend,
     wechat::{
         api::{GetUpdatesResponse, IlinkApiClient, IlinkHttpRequest},
+        effect_io::{LiveIo, WechatEffectIo},
         executor::{
             execute_turn_effects_with, WechatDesktopClearConversation, WechatDesktopStop,
             WechatDesktopUserMessage,
@@ -123,47 +123,21 @@ pub async fn poll_once(
         stdin_mgr,
         now_ms(),
         |request| async move { IlinkApiClient::new(None).execute_json(request).await },
-        |request| async move {
-            IlinkApiClient::new(None)
-                .execute_json::<Value>(request)
-                .await
-        },
+        &mut LiveIo,
     )
     .await
 }
 
-pub async fn poll_once_with<F, Fut>(
+pub(crate) async fn poll_once_with_executors<F, Fut>(
     runtime: &WechatRuntimeHandle,
     stdin_mgr: &StdinManager,
     received_at_ms: u64,
     execute_updates: F,
+    io: &mut impl WechatEffectIo,
 ) -> Result<WechatPollIteration, String>
 where
     F: FnOnce(IlinkHttpRequest) -> Fut,
     Fut: Future<Output = Result<GetUpdatesResponse, String>>,
-{
-    poll_once_with_executors(
-        runtime,
-        stdin_mgr,
-        received_at_ms,
-        execute_updates,
-        |_request| async { Ok(json!({ "ret": 0 })) },
-    )
-    .await
-}
-
-pub async fn poll_once_with_executors<F, Fut, G, Gut>(
-    runtime: &WechatRuntimeHandle,
-    stdin_mgr: &StdinManager,
-    received_at_ms: u64,
-    execute_updates: F,
-    mut execute_wechat_request: G,
-) -> Result<WechatPollIteration, String>
-where
-    F: FnOnce(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<GetUpdatesResponse, String>>,
-    G: FnMut(IlinkHttpRequest) -> Gut,
-    Gut: Future<Output = Result<Value, String>>,
 {
     let Some(request) = runtime.next_get_updates_request().await? else {
         return Ok(WechatPollIteration {
@@ -191,7 +165,7 @@ where
         stdin_mgr,
         &store,
         &outcome.effects,
-        &mut execute_wechat_request,
+        io,
     )
     .await?;
 
@@ -323,8 +297,6 @@ fn emit_each<T: Serialize>(app: Option<&AppHandle>, channel: &str, items: &[T], 
 #[cfg(test)]
 mod tests {
     use std::process::Stdio;
-    use std::sync::Arc;
-    use parking_lot::Mutex as StdMutex;
     use std::time::Duration;
 
     use serde_json::json;
@@ -335,12 +307,13 @@ mod tests {
         commands::StdinManager,
         wechat::{
             api::{
-                GetUpdatesResponse, IlinkHttpRequest, MessageItem, MessageItemType, MessageType,
+                GetUpdatesResponse, MessageItem, MessageItemType, MessageType,
                 TextItem, WechatMessage,
             },
+            effect_io::FakeIo,
             executor::execute_turn_effects_with,
             monitor::MonitorStatus,
-            poller::{poll_once_with, poll_once_with_executors, WechatPollingTask},
+            poller::{poll_once_with_executors, WechatPollingTask},
             runtime::WechatRuntimeHandle,
             store::{WechatAccount, WechatStateStore},
         },
@@ -372,24 +345,30 @@ mod tests {
         let stdin_mgr = StdinManager::new();
         let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
 
-        let iteration = poll_once_with(&runtime, &stdin_mgr, 1_000, |request| async move {
-            assert_eq!(
-                request.url,
-                "https://ilinkai.weixin.qq.com/ilink/bot/getupdates"
-            );
-            assert_eq!(
-                request.headers.get("Authorization"),
-                Some(&"Bearer bot-token".into())
-            );
-            Ok(GetUpdatesResponse {
-                ret: Some(0),
-                errcode: None,
-                errmsg: None,
-                msgs: vec![text_message(7, "user-1", "ctx-1", "hello from WeChat")],
-                get_updates_buf: Some("cursor-1".into()),
-                longpolling_timeout_ms: Some(25_000),
-            })
-        })
+        let iteration = poll_once_with_executors(
+            &runtime,
+            &stdin_mgr,
+            1_000,
+            |request| async move {
+                assert_eq!(
+                    request.url,
+                    "https://ilinkai.weixin.qq.com/ilink/bot/getupdates"
+                );
+                assert_eq!(
+                    request.headers.get("Authorization"),
+                    Some(&"Bearer bot-token".into())
+                );
+                Ok(GetUpdatesResponse {
+                    ret: Some(0),
+                    errcode: None,
+                    errmsg: None,
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "hello from WeChat")],
+                    get_updates_buf: Some("cursor-1".into()),
+                    longpolling_timeout_ms: Some(25_000),
+                })
+            },
+            &mut FakeIo::new(),
+        )
         .await
         .unwrap();
 
@@ -434,8 +413,15 @@ mod tests {
 
         let stdin_mgr = StdinManager::new();
         let (mut child, mut lines) = spawn_echo_session(&stdin_mgr, "stdin-1").await;
-        let outbound_requests = Arc::new(StdMutex::new(Vec::<IlinkHttpRequest>::new()));
-        let captured = outbound_requests.clone();
+        let mut call_count = 0usize;
+        let mut io = FakeIo::new().on_request(move |_| {
+            call_count += 1;
+            if call_count == 1 {
+                Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
+            } else {
+                Ok(json!({ "ret": 0 }))
+            }
+        });
 
         let iteration = poll_once_with_executors(
             &runtime,
@@ -451,18 +437,7 @@ mod tests {
                     longpolling_timeout_ms: Some(25_000),
                 })
             },
-            move |request| {
-                let captured = captured.clone();
-                async move {
-                    let mut requests = captured.lock();
-                    requests.push(request);
-                    if requests.len() == 1 {
-                        Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
-                    } else {
-                        Ok(json!({ "ret": 0 }))
-                    }
-                }
-            },
+            &mut io,
         )
         .await
         .unwrap();
@@ -472,14 +447,13 @@ mod tests {
         let line = lines.next_line().await.unwrap().unwrap();
         assert!(line.contains("hello from WeChat"));
 
-        let outbound_requests = outbound_requests.lock();
-        assert_eq!(outbound_requests.len(), 2);
+        assert_eq!(io.requests.len(), 2);
         assert_eq!(
-            outbound_requests[0].url,
+            io.requests[0].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/getconfig"
         );
         assert_eq!(
-            outbound_requests[1].url,
+            io.requests[1].url,
             "https://ilinkai.weixin.qq.com/ilink/bot/sendtyping"
         );
 
@@ -511,7 +485,7 @@ mod tests {
                     longpolling_timeout_ms: None,
                 })
             },
-            |_request| async { Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" })) },
+            &mut FakeIo::new().on_request(|_| Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))),
         )
         .await
         .unwrap();
@@ -534,7 +508,7 @@ mod tests {
                     longpolling_timeout_ms: None,
                 })
             },
-            |_request| async { Ok(json!({ "ret": 0 })) },
+            &mut FakeIo::new(),
         )
         .await
         .unwrap();
@@ -552,21 +526,15 @@ mod tests {
                 71_001,
             )
             .await;
-        let outbound_requests = Arc::new(StdMutex::new(Vec::<IlinkHttpRequest>::new()));
-        let captured = outbound_requests.clone();
-        let dispatch = execute_turn_effects_with(&stdin_mgr, &store, &effects, move |request| {
-            let captured = captured.clone();
-            async move {
-                captured.lock().push(request);
-                Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))
-            }
-        })
-        .await
-        .unwrap();
+        let mut io = FakeIo::new()
+            .on_request(|_| Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" })));
+        let dispatch = execute_turn_effects_with(&stdin_mgr, &store, &effects, &mut io)
+            .await
+            .unwrap();
 
         assert_eq!(dispatch.wechat_effect_count, 3);
-        let send_texts: Vec<String> = outbound_requests
-            .lock()
+        let send_texts: Vec<String> = io
+            .requests
             .iter()
             .filter(|request| request.url.ends_with("/ilink/bot/sendmessage"))
             .filter_map(|request| {
@@ -608,7 +576,7 @@ mod tests {
                     longpolling_timeout_ms: None,
                 })
             },
-            |_request| async { Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" })) },
+            &mut FakeIo::new().on_request(|_| Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))),
         )
         .await
         .unwrap();
@@ -630,7 +598,7 @@ mod tests {
                     longpolling_timeout_ms: None,
                 })
             },
-            |_request| async { Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" })) },
+            &mut FakeIo::new().on_request(|_| Ok(json!({ "ret": 0, "typing_ticket": "ticket-1" }))),
         )
         .await
         .unwrap();
@@ -666,16 +634,22 @@ mod tests {
         runtime.set_desktop_session("stdin-1".into()).await;
         let stdin_mgr = StdinManager::new();
 
-        let iteration = poll_once_with(&runtime, &stdin_mgr, 1_000, |_request| async {
-            Ok(GetUpdatesResponse {
-                ret: Some(1),
-                errcode: Some(-14),
-                errmsg: Some("session expired".into()),
-                msgs: vec![text_message(7, "user-1", "ctx-1", "hello from WeChat")],
-                get_updates_buf: Some("cursor-1".into()),
-                longpolling_timeout_ms: None,
-            })
-        })
+        let iteration = poll_once_with_executors(
+            &runtime,
+            &stdin_mgr,
+            1_000,
+            |_request| async {
+                Ok(GetUpdatesResponse {
+                    ret: Some(1),
+                    errcode: Some(-14),
+                    errmsg: Some("session expired".into()),
+                    msgs: vec![text_message(7, "user-1", "ctx-1", "hello from WeChat")],
+                    get_updates_buf: Some("cursor-1".into()),
+                    longpolling_timeout_ms: None,
+                })
+            },
+            &mut FakeIo::new(),
+        )
         .await
         .unwrap();
 

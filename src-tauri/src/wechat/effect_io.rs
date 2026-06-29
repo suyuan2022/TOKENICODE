@@ -17,7 +17,6 @@ use super::api::{IlinkApiClient, IlinkHttpRequest};
 use super::executor::{download_cdn_media_bytes, upload_cdn_media_bytes};
 use super::media::{WechatCdnDownloadRequest, WechatCdnUploadRequest};
 
-#[allow(dead_code)] // implemented now; dispatch is wired onto it in B2-5
 pub(crate) trait WechatEffectIo {
     fn execute_request(
         &mut self,
@@ -36,7 +35,6 @@ pub(crate) trait WechatEffectIo {
 }
 
 /// Production IO: real iLink HTTP client and real CDN transfers.
-#[allow(dead_code)] // wired into dispatch in B2-5
 pub(crate) struct LiveIo;
 
 impl WechatEffectIo for LiveIo {
@@ -71,7 +69,6 @@ impl WechatEffectIo for LiveIo {
 /// afterwards. Because dispatch borrows `&mut FakeIo`, the recordings need no
 /// `Arc<Mutex<_>>` — the test reads `io.requests` directly once dispatch returns.
 #[cfg(test)]
-#[allow(dead_code)] // builder methods wired up per-test in B2-6
 pub(crate) struct FakeIo {
     execute_responder: Box<dyn FnMut(&IlinkHttpRequest) -> Result<Value, String> + Send>,
     download_responder: Box<dyn FnMut(&WechatCdnDownloadRequest) -> Result<Vec<u8>, String> + Send>,
@@ -82,7 +79,6 @@ pub(crate) struct FakeIo {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 impl FakeIo {
     /// Default: every iLink request gets `{ "ret": 0 }`; media transfers panic
     /// unless a test opts into them via `on_download` / `on_upload`.

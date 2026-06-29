@@ -7,19 +7,18 @@
 //! `parse_response`) stays in `executor` because the text path uses it too;
 //! only the file-specific stages live here.
 
-use std::future::Future;
 use std::path::Path;
-
-use serde_json::Value;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rand::RngCore;
 
-use super::api::{GetUploadUrlResponse, IlinkApiClient, IlinkHttpRequest, UploadMediaType};
+use serde_json::Value;
+
+use super::api::{GetUploadUrlResponse, IlinkApiClient, UploadMediaType};
+use super::effect_io::WechatEffectIo;
 use super::executor::{execute_send_message_request, new_client_id, parse_response};
 use super::media::{
     aes_128_ecb_pkcs7_padded_size, build_cdn_upload_request, encrypt_aes_128_ecb_pkcs7,
-    WechatCdnUploadRequest,
 };
 use super::store::WechatStateStore;
 use super::text::filter_wechat_markdown;
@@ -28,22 +27,15 @@ const MAX_WECHAT_FILE_BYTES: u64 = 25 * 1024 * 1024;
 pub(super) const WECHAT_SEND_MANIFEST_BASENAME: &str = "tokenicode-wechat-send-files.json";
 const MAX_WECHAT_SEND_MANIFEST_FILES: usize = 10;
 
-pub(super) async fn execute_wechat_file_effect<F, Fut, H, Hut>(
+pub(super) async fn execute_wechat_file_effect(
     client: &IlinkApiClient,
     store: &WechatStateStore,
     to_user_id: &str,
     context_token: &str,
     path: &str,
     caption: Option<&str>,
-    execute_request: &mut F,
-    upload_media: &mut H,
-) -> Result<(), String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-    H: FnMut(WechatCdnUploadRequest) -> Hut,
-    Hut: Future<Output = Result<String, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<(), String> {
     let path = Path::new(path);
     if let Some(paths) = wechat_send_manifest_paths(path)? {
         eprintln!(
@@ -59,8 +51,7 @@ where
                 context_token,
                 Path::new(&path),
                 caption,
-                execute_request,
-                upload_media,
+                io,
             )
             .await?;
         }
@@ -74,28 +65,20 @@ where
         context_token,
         path,
         caption,
-        execute_request,
-        upload_media,
+        io,
     )
     .await
 }
 
-async fn send_single_wechat_file<F, Fut, H, Hut>(
+async fn send_single_wechat_file(
     client: &IlinkApiClient,
     store: &WechatStateStore,
     to_user_id: &str,
     context_token: &str,
     path: &Path,
     caption: Option<&str>,
-    execute_request: &mut F,
-    upload_media: &mut H,
-) -> Result<(), String>
-where
-    F: FnMut(IlinkHttpRequest) -> Fut,
-    Fut: Future<Output = Result<Value, String>>,
-    H: FnMut(WechatCdnUploadRequest) -> Hut,
-    Hut: Future<Output = Result<String, String>>,
-{
+    io: &mut impl WechatEffectIo,
+) -> Result<(), String> {
     let metadata = std::fs::metadata(path)
         .map_err(|err| format!("WeChat file send stat failed for {}: {err}", path.display()))?;
     if !metadata.is_file() {
@@ -142,7 +125,7 @@ where
         &aeskey_hex,
     );
     let upload_url_response: GetUploadUrlResponse =
-        parse_response(execute_request(upload_url_request).await?)?;
+        parse_response(io.execute_request(upload_url_request).await?)?;
     if upload_url_response.ret.unwrap_or_default() != 0 {
         return Err(format!(
             "WeChat getuploadurl failed: ret={:?} errcode={:?} errmsg={:?}",
@@ -157,7 +140,7 @@ where
         &filekey,
         encrypted,
     )?;
-    let encrypt_query_param = upload_media(upload_request).await?;
+    let encrypt_query_param = io.upload_media(upload_request).await?;
     let aes_key_base64 = BASE64_STANDARD.encode(aeskey_hex.as_bytes());
     let file_name = path
         .file_name()
@@ -189,7 +172,7 @@ where
         )
     };
 
-    execute_send_message_request(store, send_request, execute_request).await
+    execute_send_message_request(store, send_request, io).await
 }
 
 fn wechat_send_manifest_paths(path: &Path) -> Result<Option<Vec<String>>, String> {
