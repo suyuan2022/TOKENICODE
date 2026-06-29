@@ -585,7 +585,9 @@ pub(super) fn new_client_id() -> String {
     format!("tc-{}-{}", now_ms(), rand::random::<u32>())
 }
 
-async fn download_cdn_media_bytes(request: WechatCdnDownloadRequest) -> Result<Vec<u8>, String> {
+pub(super) async fn download_cdn_media_bytes(
+    request: WechatCdnDownloadRequest,
+) -> Result<Vec<u8>, String> {
     let response = reqwest::Client::new()
         .get(&request.url)
         .timeout(Duration::from_millis(request.timeout_ms))
@@ -603,7 +605,9 @@ async fn download_cdn_media_bytes(request: WechatCdnDownloadRequest) -> Result<V
     Ok(bytes.to_vec())
 }
 
-async fn upload_cdn_media_bytes(request: WechatCdnUploadRequest) -> Result<String, String> {
+pub(super) async fn upload_cdn_media_bytes(
+    request: WechatCdnUploadRequest,
+) -> Result<String, String> {
     let response = reqwest::Client::new()
         .post(&request.url)
         .timeout(Duration::from_millis(request.timeout_ms))
