@@ -1,6 +1,7 @@
 pub mod api;
 pub mod commands;
 pub mod executor;
+pub mod file_send;
 pub mod inbound;
 pub mod login;
 pub mod media;
