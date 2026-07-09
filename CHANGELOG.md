@@ -6,6 +6,164 @@ All notable changes to TOKENICODE will be documented in this file.
 
 ---
 
+## [0.12.0] - Unreleased
+
+### 新增
+
+- **连接 Docker 容器后端**（Docker container backend）—— 工作区可以直接连上一个正在运行的 Docker 容器：选择容器 + 挑一个绑定挂载（bind-mount）目录作为项目根，文件树浏览 / 预览 / 编辑与本机改动自动刷新照常工作。发消息时 claude CLI 通过 `docker exec` 在容器内执行（容器内 `ps` 可见其进程），停止会话会精确结束容器内的 CLI 进程。
+  - **聊天记录**（session history）—— 容器 `~/.claude` 若被挂载到宿主机，历史会话可直接读取并显示；未挂载时给出提示条（`docker_history_available` hint）。
+  - **附件暂存**（attachment staging）—— 拖入 / 粘贴的外部文件通过项目内 `.tokenicode/tmp` 暂存目录中转（`stage_external_file`），CLI 以容器内路径读取，无需 `docker cp`。
+  - **容器中断提示**（container-stopped notice）—— 会话运行中容器被 `docker stop` 时，进程退出后自动探测容器状态并提示「容器已停止」。
+  - **容器内登录**（in-container login）—— 支持在容器内完成 `claude login`。
+
+---
+
+## [0.11.0] - 2026-06-10
+
+### 新增
+
+- **会话分组**（#112）—— 工作区下可以建「组」收纳会话：组卡片拖拽重排、右键归组 / 移出 / 重命名 / 删除、组标题 ➕ 直接在组内新建会话。分组用元数据映射实现（`~/.tokenicode/groups.json`），会话文件永不移动，归组换组不影响续聊。
+- **Claude Fable 5 模型支持**（#113）—— 模型列表新增 Fable 5 标准版和 1M 上下文版（置顶）。默认模型仍是 Sonnet 4.6。旧版 Claude Code CLI 不支持 Fable 5 时，报错明确提示「请升级 CLI」而非误导性的「请切换模型」。
+- **HTML 实时预览**（#110 by @suyuan2022）—— HTML 文件预览支持脚本执行，带交互的页面可以直接看到运行效果；读取目录时自动尝试常见索引文件。
+
+### 改进
+
+- **紫主题替换橘色**（#112）—— 主题色「橘色」更换为「紫色」，并整体打磨气泡对齐、分隔线、圆角与深色卡片配色。
+- **聊天中文件路径识别更聪明**（#110 + #112 融合）—— 隐藏目录（`.claude/`、`.github/`）、无扩展名路径（`src/build`、`./scripts/deploy`）、中文文件名均可识别为可点击路径，点击即在右侧文件区定位；消息正文中的裸路径自动变为可点击。
+
+### 修复
+
+- **流式内容不再被缓存清理误伤**（#114，发现自 @suyuan2022 #86）—— 有未投递流式文本的会话不再被 LRU 驱逐，避免已渲染内容静默丢失。
+- **新建会话掉组**（#112）—— 新会话拿到正式 id 后仍留在原来的组里。
+
+### 内部
+
+- 开发管线知识沉淀落仓：新增 `CONTEXT.md` 领域术语表与 `docs/adr/` 架构决策记录（分组用 tag 不动文件、拖拽用 dnd-kit PointerSensor）。
+- 路径检测统一收口到 `fileReveal` 共享模块（TDD 融合 #110 前缀规则），新增 dnd-kit 依赖。
+
+---
+
+## [0.10.8] - 2026-05-29
+
+### 新增
+
+- **Claude Opus 4.8 模型支持** —— 模型列表新增 Opus 4.8 标准版和 1M 上下文版（置顶）。原来选 Opus 4.7 的设置会自动迁移到 Opus 4.8，默认模型仍是 Sonnet 4.6。
+
+### 修复
+
+- **拖拽文件落点更准**（#209）—— 拖拽事件改用 Webview API + DPR 感知坐标，高分屏下拖文件到对话框的识别和落点更准（从 Her 同步）。
+- **微信分享更可靠**（#214）—— 增加剪贴板 + URL scheme 兜底，分享到微信更稳（从 Her 同步）。
+
+### 内部
+
+- 移除 Opus 4.7（类型 / 模型列表 / tier 映射 / CLI 映射 / Rust 常量与 normalize 改写），settings 持久化 v7→v8 平滑迁移存量 4.7 用户到 4.8。
+
+---
+
+## [0.10.7] - 2026-04-27
+
+### 修复
+
+- **会话生命周期和流式体验稳定性大修**（PR #103 by @suyuan2022）—— 把几类容易重现的会话/流式问题系统性修了一遍：
+  - **stdin 路由不再串台** — 切会话 / 切 Provider / 切 Model 时的清理统一走 lifecycle 入口（teardownSession / waitForStdinCleared），老的竞态窗口关上。
+  - **子进程隐性退出不再让界面卡住** — 之前 CLI 悄悄挂了但界面还转圈。加了幂等 `finalizeOnce` 保证状态收尾只跑一次。
+  - **Stop 之后再发消息继续走当前会话** — 之前会被错误地切到"新对话"，修了。
+  - **Thinking 计时器不再闪负数**。
+  - **API 重试 / 限流状态直接显示在对话活动区** —— 不再静默转圈，能看到背后发生了什么。
+  - **Provider 流式体验贴近原生 CLI** — 消除重复 thinking 块、stop/interrupt 后能恢复。
+- **本地系统字体栈** —— 移除外部 Web Font 依赖，改用系统字体；离线或网络不稳定时界面字体也能稳定加载。
+
+### 新增
+
+- **能力边界加固** —— Markdown 图片 / HTML/SVG 预览 / 文件系统授权走后端路径校验。
+- **Opus 4.7 规范化** —— CLI 模型名统一到明确的 1M variant。
+- **`.test` CLI 测试框架** —— 自动化 E2E 测试基础设施，20 个 suite 覆盖 lifecycle / routing / provider / interrupt / streaming 多组回归场景。
+
+### 内部
+
+- 新增 sessionLifecycle / path_access / api-retry / elapsed-time / thinkingDedupe 模块
+- 10+ 条新单测 + 集成测试（ownership-guard / finalizeOnce / spawnConfigHash / stdin-route-regressions 等）
+- 全量 provider 能力检测 + OpenRouter 环境修正
+
+---
+
+## [0.10.6] - 2026-04-18
+
+### 新增
+
+- **跟 CC Switch 共存时的友好提示** — 检测到同时装了 CC Switch，设置里会直接告诉你它俩怎么配合，不用自己琢磨。
+
+### 修复
+
+- **Windows 装不上 Claude CLI** —— 之前装完打开会弹「不支持的 16 位应用程序」，完全没法用。这版修好了：
+  - 安装改成直接从官方下载，绕开容易出问题的那个 npm 包
+  - 遇到坏掉的 CLI 会自动识别并清理，不会再卡住
+  - 设置 → CLI 新增「修复」按钮，一键清理坏掉的 CLI，点完就能重装
+  - 国内用户装 CLI 时自动挑版本最新的下载源
+- **连续切换会话偶尔串流 / 丢流** —— 刚切过去的会话看到别人的内容，或者自己发的消息直接没了。修好。
+- **中断消息后再发，容易绑错位置** —— 重新发的消息会误贴到上一条被中断的记录上。修好。
+- **重启后有会话卡在「运行中」** —— 明明已经结束，界面上还一直转圈。修好。
+- **改完设置要刷新才生效** —— 现在改完立即响应。
+- **标题生成偶尔卡住** —— 加了 10 秒超时，不会再无限等待。
+
+### 内部
+
+- 流式引擎重构（单一数据源架构），为后续功能打基础。
+- 新增一批回归测试，防止旧问题复发。
+
+---
+
+## [0.10.5] - 2026-04-17
+
+### Fixed
+
+- **第三方 Provider 不响应（hot-fix v0.10.3 regression）** —— 发送消息后转圈不返回。根因两处：
+  - `env.insert("ANTHROPIC_AUTH_TOKEN", "")` / `CLAUDE_CODE_OAUTH_TOKEN` 写入空字符串让 CLI 进入 OAuth 路径，触发 `oauth_token_refresh` control_request，被前端 deny 后死锁。**改为只 `env_remove`**
+  - `--setting-sources project,local` 让 CLI 跳过 user settings 丢失 workspace trust / agents / MCP，对第三方 endpoint 构造错误请求 → 429。**去掉该参数**
+- **频繁切换工作区后界面冻结** —— CLI 管理"扫描中..."、文件树转圈、chat 不响应同时发生。根因：`read_dir_recursive` 的 `sort_by` closure 调用 `a.path().is_dir()`，CLI 并发写 SDK checkpoint 让同一 entry 两次返回不同值 → Rust 1.81+ total-order 违反 → `tokio worker panic`。**改为预先缓存 `is_dir()` 后排序**
+
+### Notes
+
+- 父进程继承的 `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` 等 env 仍然清除（CCswitch 协同依赖），**没有** 完全回到 v0.10.2 baseline
+
+---
+
+## [0.10.4] - 2026-04-17
+
+### Added
+
+- **Claude Opus 4.7 支持** — 默认 1M 上下文窗口，无需额外 beta flag
+  - `ModelId` 类型 / `MODEL_OPTIONS` 切换到 `claude-opus-4-7`，原 Opus 4.7 + 1M 变体合并为单项（Opus 4.7 本身就 1M）
+  - `tierMap` / `TIER_MAP` / Provider fallback / CLI_MODEL_MAP 同步更新（CLI_MODEL_MAP 清空）
+  - `ChatPanel` 的 `is1MModel` 识别裸 `claude-opus-4-7`，context 压力警告阈值修正
+  - persist version 6 → 7，老用户的 `claude-opus-4-6` / `-1m` 自动迁移到 `claude-opus-4-7`
+  - i18n placeholder + Rust `protocol.rs` 测试 fixture 同步
+  - 修复 legacy migration map 中的 stale `claude-opus-4-6` target
+
+### Changed
+
+- **滚动条改成自动隐藏** — 默认不可见，指针移入可滚动区域时才淡入；粗细 5px → 6px
+- **发布产物目录 `release-artifacts/` 整体 gitignore** — 不再追踪本地构建产物
+
+### Fixed
+
+- **标题生成命令 401 错误（三连修复）** — Claude Desktop 继承的 `CLAUDE_CODE_OAUTH_TOKEN` 通过环境污染第三方 Provider 的 title-gen：
+  - `--setting-sources` 显式指定 settings 来源
+  - title-gen 进程启动前清除 Claude Desktop OAuth env
+  - title-gen args 声明为 `mut` 以支持动态插入 flag
+
+---
+
+## [0.10.1] - 2026-04-09
+
+### Fixed
+
+- **流式输出卡死修复** — 新增 setInterval 兜底机制，当 React 重渲染阻塞 rAF 时确保文本正常刷新
+- **同名工作区区分** — 不同路径的同名文件夹现在显示父级目录区分（如 `A (桌面)` vs `A (坚果云)`）
+- **第三方 API beta flags** — 非 Anthropic 原生 API 自动关闭 experimental betas（#69）
+
+---
+
 ## [0.10.0] - 2026-04-05
 
 ### Added

@@ -11,8 +11,12 @@ import { useT } from '../../lib/i18n';
 import { parseSessionMessages } from '../../lib/session-loader';
 import { SessionGroup } from './SessionGroup';
 import { SessionItem } from './SessionItem';
-import { SessionContextMenu, ProjectContextMenu } from './SessionContextMenu';
+import { SessionContextMenu, ProjectContextMenu, GroupContextMenu } from './SessionContextMenu';
+import { useGroupStore } from '../../stores/groupStore';
+import { initGroupPersistence } from '../../stores/groupPersistence';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { teardownSession, waitForStdinCleared } from '../../lib/sessionLifecycle';
+import { isWechatRemoteSessionId, resolveWechatRemoteWorkspace } from '../../lib/wechat-session';
 
 // --- Path utilities ---
 
@@ -23,12 +27,26 @@ function isWindowsAbsolutePath(p: string): boolean {
   return /^[A-Za-z]:[/\\]/.test(p);
 }
 
+// S16 (v3 §4.3): prefer the already-decoded `project` field from the backend
+// (decode_project_name in Rust). We only fall through to heuristic decoding
+// when the caller passes the raw projectDir token. For the encoded case we
+// cache backend decoder results — the synchronous API shape prevents us from
+// awaiting per call site, so decoding is fire-and-forget and the cached
+// answer is returned the next time the path is queried.
+const _decodedCache = new Map<string, string>();
 function resolveProjectPath(raw: string): string {
   if (raw.startsWith('/') || isWindowsAbsolutePath(raw)) return raw;
   if (raw.startsWith('~/') || raw === '~') {
     if (_cachedHomeDir) return raw.replace('~', _cachedHomeDir);
     return raw;
   }
+  const cached = _decodedCache.get(raw);
+  if (cached) return cached;
+  // Kick off an async decode so the next render picks up the authoritative
+  // value; keep a naive fallback to avoid blocking the current render.
+  bridge.decodeProjectDir(raw)
+    .then((decoded) => { _decodedCache.set(raw, decoded); })
+    .catch(() => {});
   if (/^[A-Za-z]-/.test(raw)) {
     const drive = raw[0];
     const rest = raw.slice(2);
@@ -91,11 +109,44 @@ export function ConversationList() {
   const isContentSearching = useSessionStore((s) => s.isContentSearching);
   const searchSessionContent = useSessionStore((s) => s.searchSessionContent);
   const clearContentSearch = useSessionStore((s) => s.clearContentSearch);
+  const ensureWechatRemoteSession = useSessionStore((s) => s.ensureWechatRemoteSession);
+  const workingDirectory = useSettingsStore((s) => s.workingDirectory);
+  const wechatWorkspacePath = useSettingsStore((s) => s.wechatWorkspacePath);
+  const workingBackend = useSettingsStore((s) => s.workingBackend);
+
+  // Non-blocking notice when a connected container's ~/.claude history is not
+  // readable from the host (home dir not bind-mounted). Session history for
+  // such projects simply won't appear; warn rather than fail silently.
+  const [dockerHistoryUnavailable, setDockerHistoryUnavailable] = useState(false);
+  useEffect(() => {
+    if (workingBackend.kind !== 'docker') {
+      setDockerHistoryUnavailable(false);
+      return;
+    }
+    let cancelled = false;
+    bridge
+      .dockerHistoryAvailable(workingBackend.container)
+      .then((available) => {
+        if (!cancelled) setDockerHistoryUnavailable(!available);
+      })
+      .catch(() => {
+        if (!cancelled) setDockerHistoryUnavailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workingBackend]);
 
   // Context menus
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [projectMenu, setProjectMenu] = useState<ProjectMenuState | null>(null);
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+
+  // Session groups (the grouping ledger lives in groupStore)
+  const groups = useGroupStore((s) => s.groups);
+  const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; groupId: string } | null>(null);
+  const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<SessionListItem | null>(null);
@@ -124,7 +175,6 @@ export function ConversationList() {
       return new Set(data ? JSON.parse(data) : []);
     } catch { return new Set(); }
   });
-  const [showArchived, setShowArchived] = useState(false);
 
   // Multi-select
   const [multiSelect, setMultiSelect] = useState(false);
@@ -150,12 +200,6 @@ export function ConversationList() {
     bridge.savePinnedSessions([...next]).catch(() => {});
   }, []);
 
-  const persistArchived = useCallback((next: Set<string>) => {
-    setArchivedSessions(next);
-    localStorage.setItem('tokenicode_archived_sessions', JSON.stringify([...next]));
-    bridge.saveArchivedSessions([...next]).catch(() => {});
-  }, []);
-
   // Load pinned/archived from backend on init
   useEffect(() => {
     bridge.loadPinnedSessions?.()
@@ -168,6 +212,11 @@ export function ConversationList() {
         if (data?.length) setArchivedSessions(new Set(data));
       })
       .catch(() => {});
+  }, []);
+
+  // Load session groups from disk + keep disk in sync on every change
+  useEffect(() => {
+    initGroupPersistence();
   }, []);
 
   // Initial fetch + polling
@@ -188,6 +237,18 @@ export function ConversationList() {
     const interval = setInterval(fetchSessions, 30000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    const selectedSession = sessions.find((session) => session.id === selectedId);
+    const fallbackSession = sessions.find((session) => !isWechatRemoteSessionId(session.id));
+    const projectPath = resolveWechatRemoteWorkspace(
+      wechatWorkspacePath,
+      workingDirectory,
+      selectedSession?.project || fallbackSession?.project || '',
+    );
+    if (!projectPath) return;
+    ensureWechatRemoteSession(projectPath);
+  }, [ensureWechatRemoteSession, selectedId, sessions.length, wechatWorkspacePath, workingDirectory]);
 
   // Listen for sessions:changed event for instant refresh
   useEffect(() => {
@@ -219,12 +280,8 @@ export function ConversationList() {
   const filtered = useMemo(() => {
     let result = sessions;
 
-    // Archive filter: OFF = hide archived, ON = show ONLY archived
-    if (showArchived) {
-      result = result.filter((s) => archivedSessions.has(s.id));
-    } else {
-      result = result.filter((s) => !archivedSessions.has(s.id));
-    }
+    // Always hide archived sessions
+    result = result.filter((s) => !archivedSessions.has(s.id));
 
     // Search
     if (searchQuery.trim()) {
@@ -238,7 +295,7 @@ export function ConversationList() {
     }
 
     return result;
-  }, [sessions, searchQuery, displayName, showArchived, archivedSessions]);
+  }, [sessions, searchQuery, displayName, archivedSessions]);
 
   // Group by project
   const projectGroups = useMemo(() => {
@@ -268,11 +325,10 @@ export function ConversationList() {
     return sessions.filter((s) => {
       if (metadataIds.has(s.id)) return false;
       if (!contentSearchResults.has(s.id)) return false;
-      // Respect archive filter
-      if (showArchived) return archivedSessions.has(s.id);
+      // Always hide archived sessions
       return !archivedSessions.has(s.id);
     });
-  }, [sessions, filtered, contentSearchResults, searchQuery, showArchived, archivedSessions]);
+  }, [sessions, filtered, contentSearchResults, searchQuery, archivedSessions]);
 
   // Smart expand: expand if contains selected, or manually expanded
   const isExpanded = useCallback((key: string) => {
@@ -302,6 +358,7 @@ export function ConversationList() {
   // --- Session loading (slim version using session-loader) ---
   const handleLoadSession = useCallback(async (session: SessionListItem) => {
     const { path: sessionPath, id: sessionId, project: projectOrDir } = session;
+    const cliResumeId = session.cliResumeId || sessionId;
     const currentTabId = selectedId;
     if (currentTabId === sessionId) return;
 
@@ -330,6 +387,12 @@ export function ConversationList() {
     // Draft sessions
     if (!sessionPath) {
       useChatStore.getState().ensureTab(sessionId);
+      if (isWechatRemoteSessionId(sessionId)) {
+        if (projectOrDir) {
+          useSettingsStore.getState().setWorkingDirectory(resolveProjectPath(projectOrDir));
+        }
+        return;
+      }
       useChatStore.getState().resetTab(sessionId);
       useAgentStore.getState().clearAgents();
       return;
@@ -346,7 +409,9 @@ export function ConversationList() {
     // TK-329: explicitly clear stdinId when loading from disk — no live process exists yet.
     // Only set the CLI UUID (for resume). Prevents inheriting a stale stdinId
     // from a previous session that might still be alive in the backend.
-    setSessionMeta(sessionId, { sessionId, stdinId: undefined });
+    setSessionMeta(sessionId, { sessionId: cliResumeId, stdinId: undefined });
+    // PRD §9: Write cliResumeId in sessionStore — InputBar reads this for resume
+    useSessionStore.getState().setCliResumeId(sessionId, cliResumeId);
 
     try {
       const rawMessages = await bridge.loadSession(sessionPath);
@@ -388,7 +453,24 @@ export function ConversationList() {
 
   // --- Delete handlers ---
   const executeDelete = useCallback(async (sessionId: string, sessionPath: string) => {
+    if (isWechatRemoteSessionId(sessionId)) return;
     try {
+      // Kill running process before deleting (S8 fix — prevent residual processes)
+      const tab = useChatStore.getState().getTab(sessionId);
+      const routedStdinIds = Object.entries(useSessionStore.getState().stdinToTab)
+        .filter(([, tabId]) => tabId === sessionId)
+        .map(([stdinId]) => stdinId);
+      const stdinIds = Array.from(new Set([
+        ...(tab?.sessionMeta.stdinId ? [tab.sessionMeta.stdinId] : []),
+        ...routedStdinIds,
+      ]));
+      for (const stdinId of stdinIds) {
+        await teardownSession(stdinId, sessionId, 'delete');
+        if (tab?.sessionMeta.stdinId === stdinId) {
+          await waitForStdinCleared(sessionId, stdinId).catch(() => {});
+        }
+      }
+
       if (sessionPath) {
         await bridge.deleteSession(sessionId, sessionPath);
       } else {
@@ -400,6 +482,12 @@ export function ConversationList() {
         useSettingsStore.getState().setWorkingDirectory('');
       }
       useChatStore.getState().removeFromCache(sessionId);
+      // Drop the per-tab agent cache — otherwise creating a new session
+      // that reuses this ID shows the ghost agents of the old one (#B9).
+      useAgentStore.getState().clearCacheForTab(sessionId);
+      // Phase 3 §3.1: drop per-tab path grants so an authorized external
+      // file can't be read again after the tab is gone.
+      bridge.clearPathGrants(sessionId).catch(() => {});
       fetchSessions();
     } catch (err) {
       console.error('Failed to delete session:', err);
@@ -442,6 +530,7 @@ export function ConversationList() {
   const handleContextMenu = useCallback((e: React.MouseEvent, session: SessionListItem) => {
     e.preventDefault();
     e.stopPropagation();
+    if (isWechatRemoteSessionId(session.id)) return;
     setContextMenu({ x: e.clientX, y: e.clientY, session });
   }, []);
 
@@ -484,7 +573,24 @@ export function ConversationList() {
     useChatStore.getState().ensureTab(newDraftId);
     useChatStore.getState().resetTab(newDraftId);
     useSessionStore.getState().addDraftSession(newDraftId, realPath);
+    return newDraftId;
   }, []);
+
+  // New session that lands straight into a task group: create it in the group's
+  // workspace, then write the draft id into the group ledger.
+  const handleNewSessionInGroup = useCallback((groupId: string) => {
+    const group = useGroupStore.getState().groups.find((g) => g.id === groupId);
+    if (!group) return;
+    const draftId = handleNewSessionInProject(group.workspace);
+    useGroupStore.getState().addToGroup(draftId, groupId);
+  }, [handleNewSessionInProject]);
+
+  const handleReorderGroups = useCallback(
+    (workspace: string, orderedGroupIds: string[]) => {
+      useGroupStore.getState().reorderGroups(workspace, orderedGroupIds);
+    },
+    [],
+  );
 
   // Pin / Archive handlers
   const handleTogglePin = useCallback((session: SessionListItem) => {
@@ -494,12 +600,52 @@ export function ConversationList() {
     persistPinned(next);
   }, [pinnedSessions, persistPinned]);
 
-  const handleToggleArchive = useCallback((session: SessionListItem) => {
-    const next = new Set(archivedSessions);
-    if (next.has(session.id)) next.delete(session.id);
-    else next.add(session.id);
-    persistArchived(next);
-  }, [archivedSessions, persistArchived]);
+  // --- Session group handlers ---
+  // Create an empty group in a workspace (workspace header → "create group").
+  const handleCreateGroup = useCallback((projectKey: string) => {
+    const id = useGroupStore.getState().createGroup(projectKey, '新任务组');
+    setRenamingGroupId(id); // jump straight into inline rename
+  }, []);
+
+  // Create a group and drop this session into it (session → "create group").
+  const handleCreateGroupWithSession = useCallback((session: SessionListItem) => {
+    const ws = normalizeProjectKey(session.project || session.projectDir);
+    const id = useGroupStore.getState().createGroup(ws, '新任务组');
+    useGroupStore.getState().addToGroup(session.id, id);
+    setRenamingGroupId(id);
+  }, []);
+
+  const handleAddToGroup = useCallback((session: SessionListItem, groupId: string) => {
+    useGroupStore.getState().addToGroup(session.id, groupId);
+  }, []);
+
+  const handleRemoveFromGroup = useCallback((session: SessionListItem) => {
+    useGroupStore.getState().removeFromGroup(session.id);
+  }, []);
+
+  const handleGroupContextMenu = useCallback((e: React.MouseEvent, groupId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setGroupMenu({ x: e.clientX, y: e.clientY, groupId });
+  }, []);
+
+  const handleRenameGroupCommit = useCallback((groupId: string, label: string) => {
+    useGroupStore.getState().renameGroup(groupId, label);
+    setRenamingGroupId(null);
+  }, []);
+
+  const handleDeleteGroup = useCallback((groupId: string) => {
+    useGroupStore.getState().deleteGroup(groupId);
+  }, []);
+
+  const handleToggleGroupCollapse = useCallback((groupId: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
 
   // Build flat list of visible session IDs for shift+click range selection
   const flatSessionIds = useMemo(() => {
@@ -563,15 +709,8 @@ export function ConversationList() {
     fetchSessions();
   }, [selectedIds, executeDelete, fetchSessions]);
 
-  const handleBatchArchive = useCallback(() => {
-    const next = new Set(archivedSessions);
-    for (const id of selectedIds) next.add(id);
-    persistArchived(next);
-    setSelectedIds(new Set());
-    setMultiSelect(false);
-  }, [selectedIds, archivedSessions, persistArchived]);
-
   const handleRename = useCallback((sessionId: string, newName: string) => {
+    if (isWechatRemoteSessionId(sessionId)) return;
     setCustomPreview(sessionId, newName);
   }, [setCustomPreview]);
 
@@ -619,26 +758,16 @@ export function ConversationList() {
               </button>
             )}
           </div>
-
-          {/* Archive toggle */}
-          <button
-            onClick={() => setShowArchived(!showArchived)}
-            className={`flex-shrink-0 p-2 rounded-lg transition-smooth
-              ${showArchived
-                ? 'bg-accent/10 text-accent'
-                : 'text-text-tertiary hover:bg-bg-secondary hover:text-text-primary'
-              }`}
-            title={t('conv.showArchived')}
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
-              stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="1" y="2" width="14" height="3" rx="1" />
-              <path d="M2 5v7a1 1 0 001 1h10a1 1 0 001-1V5" />
-              <path d="M6 8h4" />
-            </svg>
-          </button>
         </div>
       </div>
+
+      {/* Docker history unavailable notice (home dir not mounted) */}
+      {dockerHistoryUnavailable && (
+        <div className="mx-1 mb-2 rounded-lg border border-warning/30 bg-warning/10
+          px-3 py-2 text-[12px] text-warning">
+          {t('docker.historyUnavailable')}
+        </div>
+      )}
 
       {/* Loading */}
       {isLoading && sessions.length === 0 && (
@@ -676,6 +805,15 @@ export function ConversationList() {
           onToggleCheck={handleToggleCheck}
           renamingSessionId={renamingSessionId}
           onRenameDone={() => setRenamingSessionId(null)}
+          workspaceGroups={groups.filter((g) => g.workspace === project)}
+          collapsedGroups={collapsedGroups}
+          onToggleGroupCollapse={handleToggleGroupCollapse}
+          onGroupContextMenu={handleGroupContextMenu}
+          renamingGroupId={renamingGroupId}
+          onRenameGroupCommit={handleRenameGroupCommit}
+          onRenameGroupCancel={() => setRenamingGroupId(null)}
+          onReorderGroups={handleReorderGroups}
+          onNewSessionInGroup={handleNewSessionInGroup}
         />
         );
       })}
@@ -755,15 +893,6 @@ export function ConversationList() {
             {t('conv.selected').replace('{n}', String(selectedIds.size))}
           </span>
           <button
-            onClick={handleBatchArchive}
-            disabled={selectedIds.size === 0}
-            className="px-2 py-1 text-xs rounded-lg bg-bg-tertiary text-text-primary
-              hover:bg-accent/10 hover:text-accent transition-smooth
-              disabled:opacity-30"
-          >
-            {t('conv.archive')}
-          </button>
-          <button
             onClick={handleBatchDelete}
             disabled={selectedIds.size === 0}
             className="px-2 py-1 text-xs rounded-lg bg-error/10 text-error
@@ -783,7 +912,11 @@ export function ConversationList() {
       )}
 
       {/* Session context menu */}
-      {contextMenu && (
+      {contextMenu && (() => {
+        const ws = normalizeProjectKey(contextMenu.session.project || contextMenu.session.projectDir);
+        const wsGroups = groups.filter((g) => g.workspace === ws);
+        const currentGroup = wsGroups.find((g) => g.sessionIds.includes(contextMenu.session.id));
+        return (
         <SessionContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
@@ -793,12 +926,18 @@ export function ConversationList() {
           onExport={handleExportMarkdown}
           onDelete={handleDeleteSingle}
           onPin={handleTogglePin}
-          onArchive={handleToggleArchive}
           isPinned={pinnedSessions.has(contextMenu.session.id)}
-          isArchived={archivedSessions.has(contextMenu.session.id)}
+          onCreateGroupWithSession={handleCreateGroupWithSession}
+          availableGroups={wsGroups
+            .filter((g) => g.id !== currentGroup?.id)
+            .map((g) => ({ id: g.id, label: g.label }))}
+          onAddToGroup={handleAddToGroup}
+          currentGroupId={currentGroup?.id ?? null}
+          onRemoveFromGroup={handleRemoveFromGroup}
           onClose={() => setContextMenu(null)}
         />
-      )}
+        );
+      })()}
 
       {/* Project context menu */}
       {projectMenu && (
@@ -807,9 +946,22 @@ export function ConversationList() {
           y={projectMenu.y}
           project={projectMenu.project}
           onNewSession={handleNewSessionInProject}
+          onCreateGroup={handleCreateGroup}
           onDeleteAll={handleDeleteAllInProject}
           onSelectMode={handleSelectMode}
           onClose={() => setProjectMenu(null)}
+        />
+      )}
+
+      {/* Group context menu */}
+      {groupMenu && (
+        <GroupContextMenu
+          x={groupMenu.x}
+          y={groupMenu.y}
+          groupId={groupMenu.groupId}
+          onRename={(id) => setRenamingGroupId(id)}
+          onDelete={handleDeleteGroup}
+          onClose={() => setGroupMenu(null)}
         />
       )}
 

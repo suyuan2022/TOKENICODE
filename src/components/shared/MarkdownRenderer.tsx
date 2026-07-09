@@ -7,6 +7,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useLightboxStore } from './ImageLightbox';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useFileStore } from '../../stores/fileStore';
+import { classifyPathToken, resolvePathToken, KNOWN_FILE_EXTENSIONS } from '../../stores/fileReveal';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 
@@ -23,18 +24,105 @@ function isLocalPath(src: string): boolean {
 
 function AsyncImage({ src, alt }: { src: string; alt?: string }) {
   const t = useT();
+  const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const [dataUrl, setDataUrl] = useState<string | null>(null);
   const [error, setError] = useState(false);
+  // Phase 3 §3.3: external (non-project) paths need explicit user authorization
+  // before we load their bytes. Unauthorized paths render a placeholder with
+  // an "authorize" button that opens the native file dialog.
+  const filePath = useMemo(() => (src.startsWith('file://') ? src.slice(7) : src), [src]);
+  const inProject = useMemo(() => {
+    if (!workingDirectory) return false;
+    // Resolve '..' and '.' segments to prevent path traversal bypassing
+    // the project-containment check (e.g. /project/../outside.png would
+    // naively pass a startsWith('/project/') test).
+    const segments: string[] = [];
+    for (const seg of filePath.split('/')) {
+      if (seg === '..') { segments.pop(); }
+      else if (seg !== '.' && seg !== '') { segments.push(seg); }
+    }
+    const normalized = '/' + segments.join('/');
+    const base = workingDirectory.endsWith('/') ? workingDirectory : workingDirectory + '/';
+    return normalized === workingDirectory || normalized.startsWith(base);
+  }, [filePath, workingDirectory]);
+  const [authorized, setAuthorized] = useState(inProject);
 
+  // Note: we pass no tab_id here — path_access.validate() with tab_id=None
+  // falls back to checking fixed roots + any tab's grants, which is what we
+  // want for Markdown images (the rendering context isn't strictly per-tab).
   useEffect(() => {
-    const filePath = src.startsWith('file://') ? src.slice(7) : src;
-    bridge.readFileBase64(filePath).then(setDataUrl).catch(() => setError(true));
-  }, [src]);
+    if (!authorized) return;
+    let cancelled = false;
+    bridge
+      .readFileBase64(filePath)
+      .then((d) => { if (!cancelled) setDataUrl(d); })
+      .catch(() => { if (!cancelled) setError(true); });
+    return () => { cancelled = true; };
+  }, [filePath, authorized]);
+
+  const handleAuthorize = useCallback(async () => {
+    const { useSessionStore } = await import('../../stores/sessionStore');
+    const activeTabId = useSessionStore.getState().selectedSessionId;
+    try {
+      const { open: openDialog } = await import('@tauri-apps/plugin-dialog');
+      const selected = await openDialog({
+        title: t('msg.authorizeImage') ?? 'Authorize external image',
+        defaultPath: filePath,
+        multiple: false,
+      });
+      const chosen = Array.isArray(selected) ? selected[0] : selected;
+      if (!chosen || !activeTabId) return;
+      // Grant the original filePath (the one we will actually read), not the
+      // user-chosen path.  The file dialog serves as a user-intent confirmation
+      // step; the displayed path is already known.  If chosen differs from
+      // filePath we still grant filePath so the subsequent readFileBase64 works.
+      await bridge.addPathGrant(activeTabId, filePath);
+      if (chosen !== filePath) {
+        // Also grant the chosen path in case the user picked something else
+        await bridge.addPathGrant(activeTabId, chosen);
+      }
+      setAuthorized(true);
+    } catch (e) {
+      console.warn('[MarkdownRenderer] authorize failed:', e);
+    }
+  }, [filePath, t]);
 
   const handleClick = useCallback(() => {
-    const filePath = src.startsWith('file://') ? src.slice(7) : src;
     useLightboxStore.getState().openFile(filePath, alt);
-  }, [src, alt]);
+  }, [filePath, alt]);
+
+  if (!authorized) {
+    const fileName = filePath.split(/[\\/]/).pop() || filePath;
+    return (
+      <div className="my-3 rounded-xl overflow-hidden border border-border-subtle
+        inline-block max-w-full bg-bg-secondary">
+        <div className="flex items-center gap-3 px-4 py-3">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none"
+            stroke="currentColor" strokeWidth="1.5" className="flex-shrink-0 text-text-muted">
+            <rect x="2" y="3" width="16" height="14" rx="2" />
+            <circle cx="6.5" cy="7.5" r="1.5" />
+            <path d="M2 14l4-4 4 4 2-2 6 6" />
+          </svg>
+          <div className="flex-1 min-w-0">
+            <div className="text-xs text-text-primary truncate">{fileName}</div>
+            <div className="text-[11px] text-text-muted truncate">{filePath}</div>
+          </div>
+          <button
+            onClick={handleAuthorize}
+            className="px-2 py-1 rounded-md text-[11px] font-medium bg-accent/10
+              text-accent border border-accent/25 hover:bg-accent/20
+              transition-smooth cursor-pointer flex-shrink-0"
+          >
+            {t('msg.authorize') ?? '授权'}
+          </button>
+        </div>
+        {alt && (
+          <div className="px-3 py-1.5 text-xs text-text-muted bg-bg-secondary
+            border-t border-border-subtle">{alt}</div>
+        )}
+      </div>
+    );
+  }
 
   if (error) {
     return (
@@ -122,23 +210,6 @@ function extractText(node: ReactNode): string {
   return '';
 }
 
-/** Known code/config file extensions — shared between wrapBareFilePaths and inline code detection. */
-const KNOWN_FILE_EXTENSIONS = new Set([
-  'md', 'mdx', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'json', 'jsonl',
-  'toml', 'yaml', 'yml', 'py', 'pyi', 'rs', 'go', 'html', 'htm', 'css',
-  'scss', 'sass', 'less', 'vue', 'svelte', 'sh', 'bash', 'zsh', 'fish',
-  'env', 'conf', 'cfg', 'ini', 'xml', 'sql', 'graphql', 'gql', 'proto',
-  'lock', 'log', 'txt', 'csv', 'rb', 'php', 'java', 'kt', 'swift', 'c',
-  'cpp', 'h', 'hpp', 'cs', 'r', 'lua', 'zig', 'ex', 'exs', 'erl', 'ml',
-  'mli', 'tf', 'hcl', 'dockerfile', 'makefile', 'png', 'jpg', 'jpeg',
-  'gif', 'svg', 'webp', 'ico', 'wasm', 'map',
-]);
-
-/** Detect file paths in inline code — conservative regex to avoid false positives.
- *  Matches: path-prefixed files (/foo.ts, ./bar.md, src/baz.rs) AND
- *  bare filenames with known code/config extensions (CLAUDE.md, package.json). */
-const KNOWN_EXT_RE = /^[\w][\w.-]*\.(?:md|mdx|ts|tsx|js|jsx|mjs|cjs|json|jsonl|toml|yaml|yml|py|pyi|rs|go|html|htm|css|scss|sass|less|vue|svelte|sh|bash|zsh|fish|env|conf|cfg|ini|xml|sql|graphql|gql|proto|lock|log|txt|csv|rb|php|java|kt|swift|c|cpp|h|hpp|cs|r|lua|zig|ex|exs|erl|ml|mli|tf|hcl|dockerfile|makefile)$/i;
-const FILE_PATH_RE = /^(?:\/|\.\/|\.\.\/|[a-zA-Z]:[/\\]|src\/|lib\/|components\/|stores\/|hooks\/|utils\/|tests\/|__tests__\/)[\w.@/-]+\.\w{1,10}$/;
 
 /**
  * Pre-process markdown to wrap bare file paths in backticks so the existing
@@ -148,7 +219,7 @@ const FILE_PATH_RE = /^(?:\/|\.\/|\.\.\/|[a-zA-Z]:[/\\]|src\/|lib\/|components\/
  * Matches absolute paths (/..., C:\...), relative (./..., ../...), and
  * common project-relative paths (src/..., lib/..., etc.).
  */
-const BARE_PATH_RE = /(^|[^`\w:@#/])((?:(?:\/|\.\.?\/)[\w.@/+-]+\.\w{1,10}|(?:src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config)\/[\w.@/+-]+\.\w{1,10}))(?![`\w])/g;
+const BARE_PATH_RE = /(^|[^`\w:@#/])((?:(?:\/|\.\.?\/)[\w.@/+-]+\.\w{1,10}|(?:\.[a-zA-Z][\w.-]*|src|lib|components|stores|hooks|utils|tests|__tests__|app|pages|public|assets|styles|config)\/[\w.@/+-]+(?:\.\w{1,10})?))(?![`\w])/g;
 
 function wrapBareFilePaths(content: string): string {
   // Split by fenced code blocks (``` ... ```) — don't touch code blocks
@@ -167,9 +238,11 @@ function wrapBareFilePaths(content: string): string {
         // Don't wrap if preceded by ]( (markdown link)
         const before = str.slice(Math.max(0, pathStart - 2), pathStart);
         if (before.endsWith('](')) return match;
-        // TK-323: Only wrap if extension is a known code/config file type
+        // TK-323: Only wrap if extension is a known file type, OR path starts
+        // with a hidden dir (.claude/, .github/) where extension is optional
         const ext = path.split('.').pop()?.toLowerCase();
-        if (!ext || !KNOWN_FILE_EXTENSIONS.has(ext)) return match;
+        const isHiddenDirPath = /^\.[a-zA-Z][\w.-]*\//.test(path);
+        if (!isHiddenDirPath && (!ext || !KNOWN_FILE_EXTENSIONS.has(ext))) return match;
         return `${prefix}\`${path}\``;
       });
     }).join('');
@@ -440,25 +513,26 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
       if (className) return <code className={className}>{children}</code>;
 
       const text = extractText(children).trim();
-      const ext = text.split('.').pop()?.toLowerCase() ?? '';
-      if (((FILE_PATH_RE.test(text) || KNOWN_EXT_RE.test(text)) && KNOWN_FILE_EXTENSIONS.has(ext))) {
-        const resolved = text.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(text)
-          ? text
-          : resolveBase ? `${resolveBase.replace(/\/$/, '')}/${text}` : text;
-        const fileName = text.split(/[\\/]/).pop() || text;
+      const kind = classifyPathToken(text);
+      if (kind) {
+        const resolved = resolvePathToken(text, resolveBase);
         return (
           <button
-            onClick={() => useFileStore.getState().selectFile(resolved)}
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
-              bg-accent/10 border border-accent/25 rounded-md
+            onClick={() => {
+              // 纯定位：右侧文件区展开到该路径并高亮（不读内容、不预览）
+              useSettingsStore.getState().setSecondaryTab('files');
+              useFileStore.getState().revealPath(resolved);
+            }}
+            className="inline-flex items-center gap-1 px-2 py-0.5 mx-0.5
+              bg-bg-secondary border border-accent/50 rounded-full
               text-xs text-accent font-medium cursor-pointer
-              hover:bg-accent/20 hover:border-accent/40
+              hover:bg-accent/10 hover:border-accent
               transition-all duration-150 select-none
               align-baseline leading-normal whitespace-nowrap"
             title={resolved}
           >
-            <span className="text-[10px]">📄</span>
-            <span className="max-w-[180px] truncate">{fileName}</span>
+            <span className="text-[10px] leading-none">{kind === 'folder' ? '📁' : '📄'}</span>
+            <span className="max-w-[240px] truncate">{text}</span>
           </button>
         );
       }

@@ -8,7 +8,7 @@ export interface StartSessionParams {
   cwd: string;
   model?: string;
   /** Desk-generated process key (stdinId) — used as key in Rust StdinManager/ProcessManager.
-   *  NOT the Claude CLI session UUID (that comes back as SessionInfo.session_id). */
+   *  NOT the Claude CLI session UUID (that comes back as SessionInfo.cli_session_id). */
   session_id?: string;
   allowed_tools?: string[];
   /** Resume an existing Claude CLI conversation by its UUID (for session continuity) */
@@ -23,12 +23,46 @@ export interface StartSessionParams {
    *  "acceptEdits" | "default" | "plan" | "bypassPermissions"
    *  When not "bypassPermissions", enables structured permission requests via SDK protocol. */
   permission_mode?: string;
+  /** When true and resume_session_id is set, strip thinking blocks from the session JSONL
+   *  before resuming. This prevents "invalid thinking signature" 400 errors when switching
+   *  to a different model that can't verify the old model's cryptographic signatures. */
+  model_switch?: boolean;
+  /** When set, the session runs inside this Docker container (via `docker exec`).
+   *  Maps to the Rust `StartSessionParams.docker_container` serde field. */
+  docker_container?: string;
 }
 
+// --- Docker backend ---
+
+/** A running Docker container as reported by `docker ps`. */
+export interface ContainerSummary {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+}
+
+/** A bind mount of a container (docker inspect .Mounts[] with Type=="bind"). */
+export interface MountEntry {
+  /** Host-side path (.Source) */
+  source: string;
+  /** Container-side path (.Destination) */
+  destination: string;
+}
+
+/** Backend hosting the current working project. */
+export type WorkspaceBackend =
+  | { kind: 'local' }
+  | { kind: 'docker'; container: string; containerCwd: string };
+
 export interface SessionInfo {
-  /** The Claude CLI's own conversation UUID (used for --resume).
-   *  This is different from the stdinId (desk-generated process key). */
-  session_id: string;
+  /** Desk-generated process key used as routing/stdin identifier.
+   *  Maps to Rust StdinManager keys. NOT the Claude CLI session UUID. */
+  stdin_id: string;
+  /** Claude CLI's session UUID for --resume. Non-null only when resuming;
+   *  null for new sessions — the real UUID arrives via the first system:init
+   *  stream event and is stored in sessionStore.cliResumeId. */
+  cli_session_id: string | null;
   pid: number;
   cli_path: string;
 }
@@ -40,6 +74,8 @@ export interface SessionListItem {
   projectDir: string;
   modifiedAt: number;
   preview: string;
+  /** CLI's own session UUID, used for --resume. Null for new sessions before CLI responds. */
+  cliResumeId: string | null;
 }
 
 export interface ContentSearchResult {
@@ -95,7 +131,8 @@ export interface CliStatus {
   installed: boolean;
   path: string | null;
   version: string | null;
-  version_compatible: boolean;
+  // NEW-D: removed `version_compatible` — the Rust CliStatus struct never
+  // serialized this field, so the frontend always received `undefined`.
   git_bash_missing: boolean;
 }
 
@@ -115,6 +152,64 @@ export interface CleanupResult {
 export interface AuthStatus {
   authenticated: boolean;
   unknown?: boolean;
+}
+
+export interface WechatAccountInfo {
+  accountId: string;
+  userId: string;
+  baseUrl: string;
+}
+
+export interface WechatStatus {
+  connected: boolean;
+  polling: boolean;
+  account: WechatAccountInfo | null;
+}
+
+export interface WechatPreferences {
+  splitOutboundTextByLineBreaks: boolean;
+}
+
+export interface WechatStatusEvent {
+  status: 'sessionExpired' | string;
+  connected: boolean;
+  message: string;
+  retryAfterMs?: number | null;
+}
+
+export interface WechatQrStart {
+  qrcodeId: string;
+  qrcodeImage: string;
+  qrcodeUrl: string;
+}
+
+export interface WechatQrPoll {
+  status: string;
+  connected: boolean;
+  message?: string | null;
+  account?: WechatAccountInfo | null;
+  redirectBaseUrl?: string | null;
+}
+
+export interface WechatDesktopAttachment {
+  name: string;
+  path: string;
+  isImage: boolean;
+}
+
+export interface WechatDesktopUserMessageEvent {
+  desktopSessionId: string;
+  content: string;
+  attachments?: WechatDesktopAttachment[];
+}
+
+export interface WechatDesktopClearConversationEvent {
+  desktopSessionId: string;
+}
+
+export interface WechatDesktopStopEvent {
+  desktopSessionId: string;
+  source: 'wechat' | string;
 }
 
 export interface StepResult {
@@ -237,28 +332,41 @@ export const bridge = {
     invoke<void>('share_file', { path }),
 
   shareToWechat: (path: string) =>
-    invoke<void>('share_to_wechat', { path }),
+    invoke<string>('share_to_wechat', { path }),
 
   readFileTree: (path: string, depth?: number) =>
     invoke<FileNode[]>('read_file_tree', { path, depth }),
 
-  readFileContent: (path: string) =>
-    invoke<string>('read_file_content', { path }),
+  readFileContent: (path: string, tabId?: string) =>
+    invoke<string>('read_file_content', { path, tabId: tabId ?? null }),
 
-  writeFileContent: (path: string, content: string) =>
-    invoke<void>('write_file_content', { path, content }),
+  writeFileContent: (path: string, content: string, tabId?: string) =>
+    invoke<void>('write_file_content', { path, content, tabId: tabId ?? null }),
 
-  copyFile: (src: string, dest: string) =>
-    invoke<void>('copy_file', { src, dest }),
+  copyFile: (src: string, dest: string, tabId?: string) =>
+    invoke<void>('copy_file', { src, dest, tabId: tabId ?? null }),
 
-  renameFile: (src: string, dest: string) =>
-    invoke<void>('rename_file', { src, dest }),
+  renameFile: (src: string, dest: string, tabId?: string) =>
+    invoke<void>('rename_file', { src, dest, tabId: tabId ?? null }),
 
-  deleteFile: (path: string) =>
-    invoke<void>('delete_file', { path }),
+  deleteFile: (path: string, tabId?: string) =>
+    invoke<void>('delete_file', { path, tabId: tabId ?? null }),
 
-  createDirectory: (path: string) =>
-    invoke<void>('create_directory', { path }),
+  createDirectory: (path: string, tabId?: string) =>
+    invoke<void>('create_directory', { path, tabId: tabId ?? null }),
+
+  /** Add a path grant for the given tab (authorize external file access). */
+  addPathGrant: (tabId: string, path: string) =>
+    invoke<void>('add_path_grant', { tabId, path }),
+
+  /** Revoke all grants for the given tab (called on tab close / teardown). */
+  clearPathGrants: (tabId: string) =>
+    invoke<void>('clear_path_grants', { tabId }),
+
+  /** Decode a ~/.claude/projects/ directory name back to its source path.
+   *  Uses the filesystem-aware Rust decoder instead of naive `.replace('-', '/')`. */
+  decodeProjectDir: (encoded: string) =>
+    invoke<string>('decode_project_dir', { encoded }),
 
   getHomeDir: () =>
     invoke<string>('get_home_dir'),
@@ -281,11 +389,17 @@ export const bridge = {
   saveTempFile: (name: string, data: number[], cwd?: string) =>
     invoke<string>('save_temp_file', { name, data, cwd: cwd || null }),
 
-  getFileSize: (path: string) =>
-    invoke<number>('get_file_size', { path }),
+  /** Copy an OS-dragged external file into a docker project's bind-mounted
+   *  `.tokenicode/tmp/` and return the CONTAINER path the in-container CLI can
+   *  read. `cwd` is the container working dir; `src` is a host OS path. */
+  stageExternalFile: (cwd: string, src: string) =>
+    invoke<string>('stage_external_file', { cwd, src }),
 
-  readFileBase64: (path: string) =>
-    invoke<string>('read_file_base64', { path }),
+  getFileSize: (path: string, tabId?: string) =>
+    invoke<number>('get_file_size', { path, tabId: tabId ?? null }),
+
+  readFileBase64: (path: string, tabId?: string) =>
+    invoke<string>('read_file_base64', { path, tabId: tabId ?? null }),
 
   /** Check if app has file system access to a directory (macOS TCC detection) */
   checkFileAccess: (path: string) =>
@@ -299,17 +413,17 @@ export const bridge = {
   listSkills: (cwd?: string) =>
     invoke<SkillInfo[]>('list_skills', { cwd }),
 
-  readSkill: (path: string) =>
-    invoke<string>('read_skill', { path }),
+  readSkill: (path: string, tabId?: string) =>
+    invoke<string>('read_skill', { path, tabId: tabId ?? null }),
 
-  writeSkill: (path: string, content: string) =>
-    invoke<void>('write_skill', { path, content }),
+  writeSkill: (path: string, content: string, tabId?: string) =>
+    invoke<void>('write_skill', { path, content, tabId: tabId ?? null }),
 
-  deleteSkill: (path: string) =>
-    invoke<void>('delete_skill', { path }),
+  deleteSkill: (path: string, tabId?: string) =>
+    invoke<void>('delete_skill', { path, tabId: tabId ?? null }),
 
-  toggleSkillEnabled: (path: string, enabled: boolean) =>
-    invoke<void>('toggle_skill_enabled', { path, enabled }),
+  toggleSkillEnabled: (path: string, enabled: boolean, tabId?: string) =>
+    invoke<void>('toggle_skill_enabled', { path, enabled, tabId: tabId ?? null }),
 
   // Unified commands (commands + skills)
   listAllCommands: (cwd?: string) =>
@@ -356,6 +470,12 @@ export const bridge = {
   injectCliPath: (path: string) => invoke<string>('inject_cli_path', { path }),
   deleteCli: (path: string) => invoke<string>('delete_cli', { path }),
 
+  /** Scan all discoverable Claude CLIs and remove any that fail with
+   *  Windows error 193 ("不支持的 16 位应用程序" / corrupt .exe).
+   *  No-op on non-Windows. */
+  repairCli: () =>
+    invoke<{ scanned: string[]; removed: string[]; notes: string[] }>('repair_cli'),
+
   installClaudeCli: () =>
     invoke<void>('install_claude_cli'),
 
@@ -379,8 +499,43 @@ export const bridge = {
   checkClaudeAuth: () =>
     invoke<AuthStatus>('check_claude_auth'),
 
-  openTerminalLogin: () =>
-    invoke<void>('open_terminal_login'),
+  /** Open a native terminal running `claude login`. When `container` is set the
+   *  command becomes `docker exec -it <container> claude login`. */
+  openTerminalLogin: (container?: string) =>
+    invoke<void>('open_terminal_login', { container: container ?? null }),
+
+  wechatGetStatus: () =>
+    invoke<WechatStatus>('wechat_get_status'),
+
+  wechatGetPreferences: () =>
+    invoke<WechatPreferences>('wechat_get_preferences'),
+
+  wechatSetPreferences: (splitOutboundTextByLineBreaks: boolean) =>
+    invoke<WechatPreferences>('wechat_set_preferences', {
+      splitOutboundTextByLineBreaks,
+    }),
+
+  wechatStartQrLogin: () =>
+    invoke<WechatQrStart>('wechat_start_qr_login'),
+
+  wechatPollQrLogin: (qrcodeId: string, verifyCode?: string, baseUrl?: string) =>
+    invoke<WechatQrPoll>('wechat_poll_qr_login', {
+      qrcodeId,
+      verifyCode: verifyCode || null,
+      baseUrl: baseUrl || null,
+    }),
+
+  wechatDisconnect: () =>
+    invoke<void>('wechat_disconnect'),
+
+  wechatStartPolling: (sessionId: string) =>
+    invoke<void>('wechat_start_polling', { sessionId }),
+
+  wechatStopPolling: () =>
+    invoke<void>('wechat_stop_polling'),
+
+  wechatSetDesktopSession: (sessionId: string | null) =>
+    invoke<void>('wechat_set_desktop_session', { sessionId }),
 
   // Session custom names (persisted to ~/.claude/tokenicode_session_names.json)
   loadCustomPreviews: () =>
@@ -403,9 +558,16 @@ export const bridge = {
   saveArchivedSessions: (data: string[]) =>
     invoke<void>('save_archived_sessions', { data }).catch(() => {}),
 
+  // Session groups (persisted to ~/.tokenicode/groups.json)
+  loadSessionGroups: () =>
+    invoke<unknown[]>('load_session_groups').catch(() => []),
+
+  saveSessionGroups: (data: unknown[]) =>
+    invoke<void>('save_session_groups', { data }).catch(() => {}),
+
   // AI title generation (spawns separate CLI process, no channel interference)
   generateSessionTitle: (userMessage: string, assistantMessage: string, providerId?: string) =>
-    invoke<string>('generate_session_title', { userMessage, assistantMessage, providerId: providerId || null }),
+    invoke<string | null>('generate_session_title', { userMessage, assistantMessage, providerId: providerId || null }),
 
   // --- Provider Management ---
 
@@ -436,7 +598,60 @@ export const bridge = {
   /** Send a runtime interrupt command */
   interruptSession: (sessionId: string) =>
     invoke<void>('send_control_request', { sessionId, subtype: 'interrupt', payload: {} }),
+
+  /** Submit user feedback via Feishu webhook (self-built app). */
+  submitFeedback: (params: {
+    description: string;
+    screenshotBase64?: string;
+    metadata: FeedbackMetadata;
+  }) =>
+    invoke<void>('submit_feedback', {
+      description: params.description,
+      screenshotBase64: params.screenshotBase64 ?? null,
+      metadata: params.metadata,
+    }),
+
+  /** Check whether FEISHU_* env vars were baked in at build time. */
+  feedbackIsConfigured: () => invoke<boolean>('feedback_is_configured'),
+
+  // --- Docker backend ---
+
+  /** List running Docker containers (docker ps). */
+  listDockerContainers: () =>
+    invoke<ContainerSummary[]>('list_docker_containers'),
+
+  /** List a container's bind mounts (docker inspect + parse). */
+  listContainerMounts: (container: string) =>
+    invoke<MountEntry[]>('list_container_mounts', { container }),
+
+  /** Register a docker-backed project rooted at the given container path. */
+  connectDockerProject: (container: string, containerCwd: string) =>
+    invoke<void>('connect_docker_project', { container, containerCwd }),
+
+  /** Verify the container is running and has the `claude` binary installed. */
+  dockerPreflight: (container: string) =>
+    invoke<void>('docker_preflight', { container }),
+
+  /** Whether the container's ~/.claude/projects history is readable from the host. */
+  dockerHistoryAvailable: (container: string) =>
+    invoke<boolean>('docker_history_available', { container }),
+
+  /** Start a stopped container (docker start). */
+  startContainer: (container: string) =>
+    invoke<void>('docker_start', { container }),
 };
+
+/** Metadata collected alongside user feedback for server-side diagnostics.
+ *  OS / arch are filled in by the Rust side from std::env::consts. */
+export interface FeedbackMetadata {
+  app_name: string;
+  app_version: string;
+  locale?: string;
+  provider_name?: string;
+  model?: string;
+  session_id?: string;
+  user_contact?: string;
+}
 
 // --- SDK Control Protocol Types ---
 
@@ -450,7 +665,9 @@ export interface PermissionRequest {
 
 // --- Event Listeners ---
 
-/** Listen for structured permission requests from the SDK control protocol.
+/** @deprecated This listener has no corresponding backend emit — permission requests
+ *  arrive through the main stream channel as `tokenicode_permission_request` messages.
+ *  Kept for reference; will be removed in a future cleanup pass.
  *  @param stdinId - Desk-generated process key (NOT the CLI session UUID) */
 export function onPermissionRequest(
   stdinId: string,
@@ -495,6 +712,42 @@ export function onSessionExit(
 ): Promise<UnlistenFn> {
   return listen<number | null>(
     `claude:exit:${stdinId}`,
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopUserMessage(
+  callback: (message: WechatDesktopUserMessageEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopUserMessageEvent>(
+    'wechat:desktop_user_message',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopClearConversation(
+  callback: (message: WechatDesktopClearConversationEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopClearConversationEvent>(
+    'wechat:clear_desktop_conversation',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopStop(
+  callback: (message: WechatDesktopStopEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopStopEvent>(
+    'wechat:desktop_stop',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatStatus(
+  callback: (status: WechatStatusEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatStatusEvent>(
+    'wechat:status',
     (event) => callback(event.payload),
   );
 }

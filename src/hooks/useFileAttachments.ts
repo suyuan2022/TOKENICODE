@@ -1,9 +1,11 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { bridge } from '../lib/tauri-bridge';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { isTreeDragActive } from '../lib/drag-state';
 import { useSettingsStore } from '../stores/settingsStore';
 import { useFileStore } from '../stores/fileStore';
+import { useChatStore } from '../stores/chatStore';
+import { useSessionStore } from '../stores/sessionStore';
 
 // --- Types ---
 
@@ -48,6 +50,21 @@ function guessMime(name: string): string {
 function isImageExt(name: string): boolean {
   const ext = name.split('.').pop()?.toLowerCase() || '';
   return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico'].includes(ext);
+}
+
+function toLogicalPos(pos: { x: number; y: number }): { x: number; y: number } {
+  const dpr = window.devicePixelRatio || 1;
+  return { x: pos.x / dpr, y: pos.y / dpr };
+}
+
+function isPosOverFileTree(pos: { x: number; y: number }): boolean {
+  const treeEl = document.querySelector('[data-file-tree]');
+  if (!treeEl) return false;
+  const rect = treeEl.getBoundingClientRect();
+  const lp = toLogicalPos(pos);
+  if (lp.x >= rect.left && lp.x <= rect.right && lp.y >= rect.top && lp.y <= rect.bottom) return true;
+  if (pos.x >= rect.left && pos.x <= rect.right && pos.y >= rect.top && pos.y <= rect.bottom) return true;
+  return false;
 }
 
 /** Generate a small base64 thumbnail for an image file */
@@ -97,8 +114,18 @@ async function readFileAsBytes(file: File): Promise<Uint8Array> {
 export function useFileAttachments() {
   const [files, setFiles] = useState<FileAttachment[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const setFilesForTab = useCallback((tabId: string | null, nextFiles: FileAttachment[]) => {
+    if (tabId) {
+      useChatStore.getState().ensureTab(tabId);
+      useChatStore.getState().setPendingAttachments(tabId, nextFiles);
+    }
+    if (useSessionStore.getState().selectedSessionId === tabId) {
+      setFiles(nextFiles);
+    }
+  }, []);
 
-  const addFiles = useCallback(async (fileList: FileList | File[]) => {
+  const addFiles = useCallback(async (fileList: FileList | File[], ownerTabId?: string | null) => {
+    const targetTabId = ownerTabId ?? useSessionStore.getState().selectedSessionId;
     setIsProcessing(true);
     try {
       const newFiles: FileAttachment[] = [];
@@ -133,15 +160,19 @@ export function useFileAttachments() {
       }
 
       if (newFiles.length > 0) {
-        setFiles((prev) => [...prev, ...newFiles]);
+        const existing = targetTabId
+          ? (useChatStore.getState().getTab(targetTabId)?.pendingAttachments ?? [])
+          : files;
+        setFilesForTab(targetTabId ?? null, [...existing, ...newFiles]);
       }
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [files, setFilesForTab]);
 
   /** Add files by their OS file paths (for Tauri native drag-drop) */
-  const addFilePaths = useCallback(async (paths: string[]) => {
+  const addFilePaths = useCallback(async (paths: string[], ownerTabId?: string | null) => {
+    const targetTabId = ownerTabId ?? useSessionStore.getState().selectedSessionId;
     setIsProcessing(true);
     try {
       const newFiles: FileAttachment[] = [];
@@ -191,10 +222,21 @@ export function useFileAttachments() {
             }
           }
 
+          // For docker projects the dropped file lives on the host but the
+          // in-container CLI can't see it — stage a copy into the project's
+          // bind-mounted .tokenicode/tmp/ and hand the CLI the container path.
+          // Thumbnail/size above still read the original host path directly.
+          let attachPath = filePath;
+          const backend = useSettingsStore.getState().workingBackend;
+          if (backend.kind === 'docker') {
+            const cwd = useSettingsStore.getState().workingDirectory;
+            attachPath = await bridge.stageExternalFile(cwd, filePath);
+          }
+
           newFiles.push({
             id: generateFileId(),
             name,
-            path: filePath,
+            path: attachPath,
             size: fileSize,
             type: mime,
             isImage: isImg,
@@ -205,12 +247,15 @@ export function useFileAttachments() {
         }
       }
       if (newFiles.length > 0) {
-        setFiles((prev) => [...prev, ...newFiles]);
+        const existing = targetTabId
+          ? (useChatStore.getState().getTab(targetTabId)?.pendingAttachments ?? [])
+          : files;
+        setFilesForTab(targetTabId ?? null, [...existing, ...newFiles]);
       }
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [files, setFilesForTab]);
 
   // Listen for Tauri native drag-drop events (OS file drag into window)
   // Debounce guard: Tauri may fire onDragDropEvent multiple times per drop
@@ -218,17 +263,14 @@ export function useFileAttachments() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    getCurrentWindow().onDragDropEvent((event) => {
+    getCurrentWebview().onDragDropEvent((event) => {
       const { type } = event.payload;
 
       if (type === 'over' || type === 'enter') {
-        // Skip internal tree drags
         if (isTreeDragActive()) return;
-        // Check if pointer is over the file tree area
         const pos = (event.payload as any).position;
         if (pos) {
-          const el = document.elementFromPoint(pos.x, pos.y);
-          const overTree = !!el?.closest('[data-file-tree]');
+          const overTree = isPosOverFileTree(pos);
           useFileStore.getState().setDragOverTree(overTree);
         }
         return;
@@ -253,13 +295,22 @@ export function useFileAttachments() {
         const key = [...paths].sort().join('|');
         if (now - lastDropRef.current.time < 500 && key === lastDropRef.current.key) return;
         lastDropRef.current = { time: now, key };
+        const ownerTabId = useSessionStore.getState().selectedSessionId;
 
-        if (wasOverTree) {
-          // Drop onto file tree → copy files into project
-          const rootPath = useSettingsStore.getState().workingDirectory
-            || useFileStore.getState().rootPath;
-          if (rootPath) {
-            (async () => {
+        // Phase 3 §3.2: user dropped files in = user-initiated authorization.
+        // Register each dropped path as a path grant for the active tab so
+        // subsequent reads (thumbnail preview, size lookup) are allowed.
+        // Grants MUST be awaited before any file operation that depends on them.
+        (async () => {
+          if (ownerTabId) {
+            await Promise.all(paths.map((p) => bridge.addPathGrant(ownerTabId, p).catch(() => { /* best-effort */ })));
+          }
+
+          if (wasOverTree) {
+            // Drop onto file tree → copy files into project
+            const rootPath = useSettingsStore.getState().workingDirectory
+              || useFileStore.getState().rootPath;
+            if (rootPath) {
               for (const srcPath of paths) {
                 const name = srcPath.split(/[\\/]/).pop() || srcPath;
                 const dest = `${rootPath}/${name}`;
@@ -270,45 +321,48 @@ export function useFileAttachments() {
                 }
               }
               useFileStore.getState().refreshTree(rootPath);
-            })();
-          }
-        } else {
-          // Split: images → file attachments (with preview), non-images → inline chips.
-          // This ensures images show as visual thumbnails in FileUploadChips and
-          // their paths are properly included in the message sent to CLI (#70).
-          const imagePaths: string[] = [];
-          const otherPaths: string[] = [];
-          for (const p of paths) {
-            const name = p.split(/[\\/]/).pop() || '';
-            if (isImageExt(name)) {
-              imagePaths.push(p);
-            } else {
-              otherPaths.push(p);
+            }
+          } else {
+            // Split: images → file attachments (with preview), non-images → inline chips.
+            // This ensures images show as visual thumbnails in FileUploadChips and
+            // their paths are properly included in the message sent to CLI (#70).
+            const imagePaths: string[] = [];
+            const otherPaths: string[] = [];
+            for (const p of paths) {
+              const name = p.split(/[\\/]/).pop() || '';
+              if (isImageExt(name)) {
+                imagePaths.push(p);
+              } else {
+                otherPaths.push(p);
+              }
+            }
+
+            // Images → attachment system (addFilePaths generates thumbnails)
+            if (imagePaths.length > 0) {
+              addFilePaths(imagePaths, ownerTabId);
+            }
+
+            // Non-images → inline file chips
+            for (const p of otherPaths) {
+              window.dispatchEvent(new CustomEvent('tokenicode:tree-file-inline', { detail: p }));
             }
           }
-
-          // Images → attachment system (addFilePaths generates thumbnails)
-          if (imagePaths.length > 0) {
-            addFilePaths(imagePaths);
-          }
-
-          // Non-images → inline file chips
-          for (const p of otherPaths) {
-            window.dispatchEvent(new CustomEvent('tokenicode:tree-file-inline', { detail: p }));
-          }
-        }
+        })();
       }
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };
   }, []);
 
   const removeFile = useCallback((id: string) => {
-    setFiles((prev) => prev.filter((f) => f.id !== id));
-  }, []);
+    const tabId = useSessionStore.getState().selectedSessionId;
+    const existing = tabId ? (useChatStore.getState().getTab(tabId)?.pendingAttachments ?? []) : files;
+    setFilesForTab(tabId, existing.filter((f) => f.id !== id));
+  }, [files, setFilesForTab]);
 
   const clearFiles = useCallback(() => {
-    setFiles([]);
-  }, []);
+    const tabId = useSessionStore.getState().selectedSessionId;
+    setFilesForTab(tabId, []);
+  }, [setFilesForTab]);
 
   return { files, setFiles, isProcessing, addFiles, addFilePaths, removeFile, clearFiles };
 }

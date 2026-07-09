@@ -29,6 +29,8 @@ interface AgentState {
   saveToCache: (tabId: string) => void;
   /** Restore agents from cache for a tab (returns true if found) */
   restoreFromCache: (tabId: string) => boolean;
+  /** Drop per-tab cache entry (call when the session is deleted) — fixes #B9 ghost-agent on delete+recreate with same ID */
+  clearCacheForTab: (tabId: string) => void;
 }
 
 // --- Store ---
@@ -48,6 +50,9 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     const next = new Map(get().agents);
     const agent = next.get(id);
     if (agent && agent.phase !== 'completed' && agent.phase !== 'error') {
+      if (agent.phase === 'writing' && phase === 'thinking') {
+        return;
+      }
       next.set(id, { ...agent, phase, currentTool });
       set({ agents: next });
     }
@@ -90,6 +95,14 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     }
     set({ agents: new Map(cached) });
     return true;
+  },
+
+  clearCacheForTab: (tabId) => {
+    const current = get().agentCache;
+    if (!current.has(tabId)) return;
+    const next = new Map(current);
+    next.delete(tabId);
+    set({ agentCache: next });
   },
 }));
 

@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useState, useCallback, useRef } from 'react';
 import { useProviderStore } from '../../stores/providerStore';
+import { useSessionStore } from '../../stores/sessionStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 import { type PresetProvider } from '../../lib/provider-presets';
@@ -46,7 +47,7 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
       baseUrl: preset.baseUrl,
       apiFormat: preset.apiFormat,
       modelMappings: [
-        { tier: 'opus', providerModel: preset.defaultModels?.opus || preset.defaultModel || 'claude-opus-4-6' },
+        { tier: 'opus', providerModel: preset.defaultModels?.opus || preset.defaultModel || 'claude-opus-4-8' },
         { tier: 'sonnet', providerModel: preset.defaultModels?.sonnet || preset.defaultModel || 'claude-sonnet-4-6' },
         { tier: 'haiku', providerModel: preset.defaultModels?.haiku || preset.defaultModel || 'claude-haiku-4-5-20251001' },
       ],
@@ -67,7 +68,7 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
       baseUrl: '',
       apiFormat: 'anthropic',
       modelMappings: [
-        { tier: 'opus', providerModel: 'claude-opus-4-6' },
+        { tier: 'opus', providerModel: 'claude-opus-4-8' },
         { tier: 'sonnet', providerModel: 'claude-sonnet-4-6' },
         { tier: 'haiku', providerModel: 'claude-haiku-4-5-20251001' },
       ],
@@ -95,7 +96,13 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
     setImportStatus('idle');
 
     try {
-      const content = await bridge.readFileContent(filePath);
+      // Phase 3 §3.2: user chose this path via the native file dialog →
+      // authorize it so read_file_content is permitted.
+      const importTabId = useSessionStore.getState().selectedSessionId;
+      if (importTabId) {
+        await bridge.addPathGrant(importTabId, filePath).catch(() => {});
+      }
+      const content = await bridge.readFileContent(filePath, importTabId || undefined);
       const parsed = parseAndValidate(content);
       if (!parsed.ok) {
         setImportError(parsed.error);
@@ -170,7 +177,11 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
         filters: [{ name: 'JSON', extensions: ['json'] }],
       });
       if (!filePath) return;
-      await bridge.writeFileContent(filePath, json);
+      const exportTabId = useSessionStore.getState().selectedSessionId;
+      if (exportTabId) {
+        await bridge.addPathGrant(exportTabId, filePath).catch(() => {});
+      }
+      await bridge.writeFileContent(filePath, json, exportTabId || undefined);
     } catch (e) {
       console.error('Export failed:', e);
     }
@@ -204,6 +215,11 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
 
       {isExpanded && (
         <div className="space-y-3 ml-0">
+          {/* CC Switch coexistence notice */}
+          <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning">
+            {t('provider.ccswitchNotice')}
+          </div>
+
           {/* Inherit system config option */}
           <div className={`rounded-lg text-[13px] transition-smooth border
             ${!activeProviderId
@@ -213,6 +229,7 @@ export function ProviderManager({ alwaysExpanded = false }: { alwaysExpanded?: b
           >
             <button
               onClick={() => setActive(null)}
+              {...(import.meta.env.DEV && { 'data-testid': 'provider-inherit-button' })}
               className={`text-left w-full px-3 py-2 ${!activeProviderId ? 'text-accent' : 'text-text-muted'}`}
             >
               {t('provider.inherit')}

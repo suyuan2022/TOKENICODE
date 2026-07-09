@@ -3,24 +3,44 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, ChildStdin};
-use tokio::sync::Mutex;
+use tokio::process::ChildStdin;
+use tokio::sync::{oneshot, Mutex, Notify};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionInfo {
-    pub session_id: String,
+    /// Desk-generated process key used as routing key and stdin identifier.
+    /// Maps to StdinManager / ProcessManager keys. NOT the Claude CLI session UUID.
+    pub stdin_id: String,
+    /// Claude CLI's session UUID for --resume. `Some` when resuming an existing
+    /// session (from `resume_session_id`), `None` for new sessions — the real
+    /// UUID arrives later via the first system:init stream event and is stored
+    /// on the frontend in `sessionStore.cliResumeId`.
+    pub cli_session_id: Option<String>,
     pub pid: u32,
     pub cli_path: String,
 }
 
+/// A managed CLI session whose child process is owned by an independent
+/// waiter task. `kill_tx` sends a request to that waiter task to kill the
+/// child; the waiter task then emits `process_exit` authoritatively.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct ManagedProcess {
-    pub child: Child,
     pub session_id: String,
+    pub pid: u32,
+    /// Kill signal channel to the waiter task. Option so we can take() on remove.
+    pub kill_tx: Option<oneshot::Sender<()>>,
+    /// Signalled by the stdout reader after emitting process_exit.
+    /// kill_session waits on this to avoid SESSION_ALREADY_ACTIVE races.
+    pub exit_notify: Arc<Notify>,
+    /// Docker-backed sessions only: (container name, shared in-container PID).
+    /// The PID is filled asynchronously by the stderr reader once the
+    /// `__TOKENICODE_PID__` marker arrives. kill_session uses it for a
+    /// two-step in-container kill. `None` for local sessions.
+    pub container_kill: Option<(String, Arc<std::sync::atomic::AtomicU32>)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProcessManager {
     processes: Arc<Mutex<HashMap<String, Arc<Mutex<ManagedProcess>>>>>,
 }
@@ -66,6 +86,11 @@ impl StdinManager {
         let mut map = self.handles.lock().await;
         map.remove(id);
     }
+
+    /// Alias for remove — used by drop_entry path for natural process exit.
+    pub async fn drop_entry(&self, id: &str) {
+        self.remove(id).await;
+    }
 }
 
 impl ProcessManager {
@@ -80,18 +105,36 @@ impl ProcessManager {
         map.insert(id, Arc::new(Mutex::new(process)));
     }
 
-    pub async fn remove(&self, id: &str) {
+    /// Remove a process and send the kill signal. Returns the exit_notify
+    /// so the caller can wait for the stdout reader to confirm process exit.
+    pub async fn remove(&self, id: &str) -> Option<Arc<Notify>> {
         let mut map = self.processes.lock().await;
         if let Some(proc) = map.remove(id) {
-            // Actually kill the child process to prevent zombie leaks (P0-2 fix)
             let mut managed = proc.lock().await;
-            if let Err(e) = managed.child.kill().await {
-                eprintln!(
-                    "[TOKENICODE] Failed to kill process for session {}: {}",
-                    id, e
-                );
+            if let Some(tx) = managed.kill_tx.take() {
+                if tx.send(()).is_err() {
+                    // Receiver dropped — waiter task already exited because
+                    // the child died naturally. No-op is correct.
+                }
             }
+            Some(managed.exit_notify.clone())
+        } else {
+            None
         }
+    }
+
+    /// Read-only lookup of the in-container kill info for a session, without
+    /// removing the entry. kill_session calls this before `remove` so it can
+    /// signal the process inside the container.
+    pub async fn container_kill_info(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, Arc<std::sync::atomic::AtomicU32>)> {
+        let map = self.processes.lock().await;
+        let proc = map.get(session_id)?.clone();
+        drop(map);
+        let managed = proc.lock().await;
+        managed.container_kill.clone()
     }
 
     /// TK-329: List all active stdinIds so the frontend can detect orphaned processes
@@ -99,6 +142,14 @@ impl ProcessManager {
     pub async fn active_ids(&self) -> Vec<String> {
         let map = self.processes.lock().await;
         map.keys().cloned().collect()
+    }
+
+    /// Remove a process entry WITHOUT sending a kill signal.
+    /// Used for naturally exited processes where the child is already dead.
+    /// Prevents active_ids from accumulating stale entries (C2 fix).
+    pub async fn drop_entry(&self, id: &str) {
+        let mut map = self.processes.lock().await;
+        map.remove(id);
     }
 }
 
@@ -140,6 +191,19 @@ impl BypassModeMap {
         let mut map = self.flags.lock().await;
         map.remove(session_id);
     }
+
+    /// Remove the stored flag only if it still points to the same Arc.
+    /// This avoids an old stdout reader dropping a newer session's flag when
+    /// the same stdin_id is reused during a fast restart.
+    pub async fn drop_if_current(&self, session_id: &str, current: &Arc<AtomicBool>) {
+        let mut map = self.flags.lock().await;
+        if map
+            .get(session_id)
+            .is_some_and(|flag| Arc::ptr_eq(flag, current))
+        {
+            map.remove(session_id);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -164,4 +228,13 @@ pub struct StartSessionParams {
     /// When not "bypassPermissions", enables --permission-prompt-tool stdio for structured
     /// permission requests via the SDK control protocol.
     pub permission_mode: Option<String>,
+    /// When true and resume_session_id is set, strip thinking blocks from the session JSONL
+    /// before resuming. This prevents "invalid thinking signature" 400 errors when switching
+    /// to a different model that can't verify the old model's cryptographic signatures.
+    pub model_switch: Option<bool>,
+    /// When set, spawn claude via `docker exec` inside this container instead of
+    /// locally. Absent (None) for local sessions — backward compatible with
+    /// existing frontend callers that don't pass the field.
+    #[serde(default)]
+    pub docker_container: Option<String>,
 }

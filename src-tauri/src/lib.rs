@@ -1,12 +1,25 @@
 mod commands;
+pub mod docker_backend;
+pub mod env_manager;
+mod events;
+pub mod path_access;
 mod protocol;
+pub mod wechat;
+// windows_ps compiles on all platforms so its pure-logic tests run on
+// non-Windows CI; it is only *invoked* from `#[cfg(target_os = "windows")]`
+// code paths.
+mod windows_ps;
 
-use commands::{ManagedProcess, ProcessManager, SessionInfo, StartSessionParams, StdinManager};
+use crate::events::emit_to_frontend;
+use crate::path_access::{PathAccessManager, PathCapability};
+use commands::{
+    BypassModeMap, ManagedProcess, ProcessManager, SessionInfo, StartSessionParams, StdinManager,
+};
 // protocol module kept for ControlRequest (send_control_request) and tests
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
@@ -132,7 +145,10 @@ pub(crate) fn find_git_bash() -> Option<String> {
     ];
     // Also check non-C drives (D:, E:, F:, etc.) where Git may be installed
     for drive in b'D'..=b'F' {
-        candidates.push(format!(r"{}:\Program Files\Git\bin\bash.exe", drive as char));
+        candidates.push(format!(
+            r"{}:\Program Files\Git\bin\bash.exe",
+            drive as char
+        ));
     }
     for c in &candidates {
         if std::path::Path::new(c).exists() {
@@ -156,7 +172,9 @@ pub(crate) fn find_git_bash() -> Option<String> {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if let Some(path) = stdout.lines().next() {
                 let path = path.trim().to_string();
-                if !path.is_empty() && commands::cli_resolver::is_valid_executable(std::path::Path::new(&path)) {
+                if !path.is_empty()
+                    && commands::cli_resolver::is_valid_executable(std::path::Path::new(&path))
+                {
                     return Some(path);
                 }
             }
@@ -314,11 +332,7 @@ fn probe_local_proxy() -> Option<String> {
     ];
     for &(port, scheme) in ports {
         let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-        if std::net::TcpStream::connect_timeout(
-            &addr,
-            std::time::Duration::from_millis(80),
-        )
-        .is_ok()
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(80)).is_ok()
         {
             let url = format!("{}://127.0.0.1:{}", scheme, port);
             eprintln!("auto-detected local proxy: {}", url);
@@ -444,7 +458,9 @@ fn truncate_large_content(value: &mut Value, max_bytes: usize) {
                     end -= 1;
                 }
                 s.truncate(end);
-                s.push_str("\n\n... [content truncated for display, full content available to Claude]");
+                s.push_str(
+                    "\n\n... [content truncated for display, full content available to Claude]",
+                );
             }
         }
         Value::Array(arr) => {
@@ -741,6 +757,37 @@ struct ProvidersFile {
     providers: Vec<ApiProvider>,
 }
 
+const PARTIAL_MESSAGES_OVERRIDE_ENV: &str = "TOKENICODE_INCLUDE_PARTIAL_MESSAGES";
+const DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV: &str =
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL";
+const CLAUDE_PLUGIN_CACHE_DIR_ENV: &str = "CLAUDE_CODE_PLUGIN_CACHE_DIR";
+const CLAUDE_PLUGIN_GIT_TIMEOUT_ENV: &str = "CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS";
+const INCLUDE_MCP_SERVERS_ENV: &str = "TOKENICODE_INCLUDE_MCP_SERVERS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderRuntimeCapabilities {
+    is_native_anthropic: bool,
+    supports_partial_messages: bool,
+    supports_thinking_effort: bool,
+}
+
+impl ProviderRuntimeCapabilities {
+    fn native_anthropic() -> Self {
+        Self {
+            is_native_anthropic: true,
+            supports_partial_messages: true,
+            supports_thinking_effort: true,
+        }
+    }
+}
+
+type ProviderEnvResolution = (
+    HashMap<String, String>,
+    Vec<String>,
+    Vec<String>,
+    ProviderRuntimeCapabilities,
+);
+
 impl Default for ProvidersFile {
     fn default() -> Self {
         Self {
@@ -814,7 +861,10 @@ async fn test_provider_connection(
                         .build()
                         .unwrap_or_default()
                 } else {
-                    eprintln!("test_provider_connection: provider proxy {} unreachable, direct", purl);
+                    eprintln!(
+                        "test_provider_connection: provider proxy {} unreachable, direct",
+                        purl
+                    );
                     build_smart_http_client(
                         std::time::Duration::from_secs(10),
                         std::time::Duration::from_secs(30),
@@ -909,7 +959,11 @@ async fn test_provider_connection(
                 (
                     StepResult {
                         ok: false,
-                        message: format!("HTTP {} — {}", status, text.chars().take(200).collect::<String>()),
+                        message: format!(
+                            "HTTP {} — {}",
+                            status,
+                            text.chars().take(200).collect::<String>()
+                        ),
                     },
                     skipped,
                 )
@@ -919,24 +973,47 @@ async fn test_provider_connection(
                 let text = resp.text().await.unwrap_or_default();
                 let text_lower = text.to_lowercase();
                 let is_auth_error = text_lower.contains("invalid")
-                    && (text_lower.contains("api key") || text_lower.contains("api_key")
-                        || text_lower.contains("token") || text_lower.contains("credentials"));
+                    && (text_lower.contains("api key")
+                        || text_lower.contains("api_key")
+                        || text_lower.contains("token")
+                        || text_lower.contains("credentials"));
                 if is_auth_error {
                     (
-                        StepResult { ok: false, message: format!("HTTP 403 — {}", text.chars().take(200).collect::<String>()) },
+                        StepResult {
+                            ok: false,
+                            message: format!(
+                                "HTTP 403 — {}",
+                                text.chars().take(200).collect::<String>()
+                            ),
+                        },
                         skipped,
                     )
                 } else {
                     // 403 but not clearly auth — treat as auth OK + model issue
                     (
-                        StepResult { ok: true, message: "Authenticated (HTTP 403 — access restricted)".to_string() },
-                        StepResult { ok: false, message: format!("HTTP 403 — {}", text.chars().take(200).collect::<String>()) },
+                        StepResult {
+                            ok: true,
+                            message: "Authenticated (HTTP 403 — access restricted)".to_string(),
+                        },
+                        StepResult {
+                            ok: false,
+                            message: format!(
+                                "HTTP 403 — {}",
+                                text.chars().take(200).collect::<String>()
+                            ),
+                        },
                     )
                 }
             } else if status >= 200 && status < 300 {
                 (
-                    StepResult { ok: true, message: format!("Authenticated (HTTP {})", status) },
-                    StepResult { ok: true, message: format!("Model OK (HTTP {})", status) },
+                    StepResult {
+                        ok: true,
+                        message: format!("Authenticated (HTTP {})", status),
+                    },
+                    StepResult {
+                        ok: true,
+                        message: format!("Model OK (HTTP {})", status),
+                    },
                 )
             } else {
                 // 400, 404, 429, 500, etc. — auth is OK (server processed the request)
@@ -950,18 +1027,34 @@ async fn test_provider_connection(
                             || text_lower.contains("invalid model")
                             || text_lower.contains("invalid_model")));
                 let model_result = if is_model_error {
-                    StepResult { ok: false, message: format!("HTTP {} — {}", status, text.chars().take(200).collect::<String>()) }
+                    StepResult {
+                        ok: false,
+                        message: format!(
+                            "HTTP {} — {}",
+                            status,
+                            text.chars().take(200).collect::<String>()
+                        ),
+                    }
                 } else {
-                    StepResult { ok: true, message: format!("Model accepted (HTTP {})", status) }
+                    StepResult {
+                        ok: true,
+                        message: format!("Model accepted (HTTP {})", status),
+                    }
                 };
                 (
-                    StepResult { ok: true, message: format!("Authenticated (HTTP {})", status) },
+                    StepResult {
+                        ok: true,
+                        message: format!("Authenticated (HTTP {})", status),
+                    },
                     model_result,
                 )
             }
         }
         Err(e) => (
-            StepResult { ok: false, message: format!("Request failed: {}", e) },
+            StepResult {
+                ok: false,
+                message: format!("Request failed: {}", e),
+            },
             skipped,
         ),
     };
@@ -974,12 +1067,22 @@ async fn test_provider_connection(
 }
 
 /// Resolve provider env vars and CLI args from a provider_id.
-/// Returns (extra_env, keys_to_remove, extra_args).
-fn resolve_provider_env(
-    provider_id: Option<&str>,
-) -> Result<(HashMap<String, String>, Vec<String>, Vec<String>), String> {
+/// Returns (extra_env, keys_to_remove, extra_args, runtime capabilities).
+/// Phase 5 / C8 (v3 §4.3) originally treated every non-native provider as
+/// degraded. That avoided compatibility errors, but also disabled the partial
+/// text/thinking stream for providers that do support Anthropic-compatible
+/// partial messages. Keep risky native-only env vars native-only, but default
+/// Anthropic-format API providers to the same partial-message stream path as
+/// native Claude. Providers can opt out with TOKENICODE_INCLUDE_PARTIAL_MESSAGES=false.
+fn resolve_provider_env(provider_id: Option<&str>) -> Result<ProviderEnvResolution, String> {
     let Some(pid) = provider_id else {
-        return Ok((HashMap::new(), vec![], vec![]));
+        // No provider → assume native Anthropic (Claude Desktop / CCswitch).
+        return Ok((
+            HashMap::new(),
+            vec![],
+            vec![],
+            ProviderRuntimeCapabilities::native_anthropic(),
+        ));
     };
 
     let providers_file = load_providers()?;
@@ -1010,6 +1113,10 @@ fn resolve_provider_env(
     let mut keys_to_remove = Vec::new();
     if let Some(ref extra) = provider.extra_env {
         for (k, v) in extra {
+            // App-private capability override; do not leak it to Claude CLI.
+            if k == PARTIAL_MESSAGES_OVERRIDE_ENV {
+                continue;
+            }
             if v.is_empty() {
                 keys_to_remove.push(k.clone());
             } else {
@@ -1039,20 +1146,673 @@ fn resolve_provider_env(
     // will return 400 errors if these flags are present.
     // Only keep betas enabled when the base URL is explicitly Anthropic's native API.
     let base_lower = provider.base_url.to_lowercase();
-    let is_native_anthropic = base_lower.is_empty()
-        || base_lower.contains("api.anthropic.com");
+    let is_native_anthropic = base_lower.is_empty() || base_lower.contains("api.anthropic.com");
+    let provider_capabilities = resolve_provider_capabilities(provider, is_native_anthropic);
     if !is_native_anthropic {
         env.entry("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS".to_string())
             .or_insert_with(|| "1".to_string());
     }
 
-    // No extra CLI args needed — env vars set on the process take precedence.
-    // Previously we used --setting-sources project,local to skip user settings,
-    // but that broke directories without .claude/ (e.g. empty/new folders) because
-    // the CLI lost workspace trust and other user-level config.
-    let extra_args: Vec<String> = vec![];
+    // HOT-FIX (v0.10.5): strip inherited OAuth / host-managed env vars when
+    // using a third-party provider, WITHOUT the v0.10.3 side effects.
+    //
+    // Background: the parent process (Her/TOKENICODE) inherits CCswitch's
+    // ANTHROPIC_AUTH_TOKEN and Claude Desktop's CLAUDE_CODE_OAUTH_TOKEN /
+    // CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST from its own environment.
+    // tokio::process::Command inherits parent env by default, so the CLI
+    // child sees those too. With an OAuth token present the CLI goes into
+    // Bearer-auth mode and sends `Authorization: Bearer <token>` to the
+    // third-party provider, which rejects with 401/429. Need to wipe them.
+    //
+    // What v0.10.3 got wrong (and we do NOT repeat):
+    //   • `env.insert(<name>, "")` — a defined-but-empty AUTH_TOKEN is read
+    //     by the CLI as "OAuth path with stale token" and triggers an
+    //     oauth_token_refresh control_request which we can only deny →
+    //     deadlock, CLI waits forever, user sees "send → spinner forever".
+    //   • `--setting-sources project,local` — skips user settings.json and
+    //     thus loses workspace trust / agents / MCP, which somehow causes
+    //     the CLI to produce 429-triggering requests to third-party
+    //     endpoints (same key works fine via curl).
+    //
+    // So: only env_remove, no empty insert, no setting-sources arg.
+    let extra_args: Vec<String> = if !is_native_anthropic {
+        keys_to_remove.extend([
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            "ANTHROPIC_MODEL".to_string(),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+            "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".to_string(),
+            "CLAUDE_CODE_ENTRYPOINT".to_string(),
+        ]);
+        for k in &keys_to_remove {
+            env.remove(k);
+        }
+        vec![]
+    } else {
+        vec![]
+    };
 
-    Ok((env, keys_to_remove, extra_args))
+    Ok((env, keys_to_remove, extra_args, provider_capabilities))
+}
+
+fn resolve_provider_capabilities(
+    provider: &ApiProvider,
+    is_native_anthropic: bool,
+) -> ProviderRuntimeCapabilities {
+    if is_native_anthropic {
+        return ProviderRuntimeCapabilities::native_anthropic();
+    }
+
+    let supports_partial_messages = provider_partial_messages_override(provider)
+        .unwrap_or_else(|| provider.api_format.eq_ignore_ascii_case("anthropic"));
+    let supports_thinking_effort = provider.api_format.eq_ignore_ascii_case("anthropic");
+
+    ProviderRuntimeCapabilities {
+        is_native_anthropic: false,
+        supports_partial_messages,
+        supports_thinking_effort,
+    }
+}
+
+fn provider_partial_messages_override(provider: &ApiProvider) -> Option<bool> {
+    provider
+        .extra_env
+        .as_ref()
+        .and_then(|extra| extra.get(PARTIAL_MESSAGES_OVERRIDE_ENV))
+        .and_then(|value| parse_bool_override(value))
+}
+
+fn parse_bool_override(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn apply_claude_cli_runtime_defaults(env: &mut HashMap<String, String>) {
+    // TOKENICODE should not let Claude Code's official marketplace auto-install
+    // delay or block normal chat startup. Users can still override this through
+    // provider extra_env when they need that specific Claude Code behavior.
+    env.entry(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV.to_string())
+        .or_insert_with(|| "1".to_string());
+    if let Some(cache_dir) = tokenicode_claude_plugin_cache_dir() {
+        env.entry(CLAUDE_PLUGIN_CACHE_DIR_ENV.to_string())
+            .or_insert_with(|| cache_dir);
+    }
+    env.entry(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV.to_string())
+        .or_insert_with(|| "10000".to_string());
+}
+
+fn tokenicode_claude_plugin_cache_dir() -> Option<String> {
+    dirs::home_dir().map(|home| {
+        home.join(".tokenicode")
+            .join("claude-plugin-cache")
+            .to_string_lossy()
+            .to_string()
+    })
+}
+
+fn should_include_mcp_servers(value: Option<&str>) -> bool {
+    value.and_then(parse_bool_override).unwrap_or(false)
+}
+
+fn redacted_env_for_log(env: &HashMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .map(|(key, value)| {
+            let key_upper = key.to_ascii_uppercase();
+            let should_redact = key_upper.contains("KEY")
+                || key_upper.contains("TOKEN")
+                || key_upper.contains("AUTH")
+                || key_upper.contains("SECRET")
+                || key_upper.contains("PASSWORD")
+                || key_upper.contains("PROXY");
+            (
+                key.clone(),
+                if should_redact {
+                    "[REDACTED]".to_string()
+                } else {
+                    value.clone()
+                },
+            )
+        })
+        .collect()
+}
+
+/// Normalize a UI model id to the CLI-expected model name.
+///
+/// The frontend already maps its `-1m` UI ids to the CLI's `[1m]` form
+/// (see api-provider.ts CLI_MODEL_MAP) before the id reaches Rust, so standard
+/// and 1M Opus variants both pass through unchanged. Kept as a seam in case
+/// future models need backend-side rewriting.
+fn normalize_cli_model_id(model: &str) -> String {
+    model.to_string()
+}
+
+#[cfg(test)]
+mod provider_capability_tests {
+    use super::{
+        apply_claude_cli_runtime_defaults, normalize_cli_model_id, parse_bool_override,
+        redacted_env_for_log, resolve_provider_capabilities, should_include_mcp_servers,
+        ApiProvider, ModelMapping, CLAUDE_PLUGIN_CACHE_DIR_ENV, CLAUDE_PLUGIN_GIT_TIMEOUT_ENV,
+        DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV, INCLUDE_MCP_SERVERS_ENV,
+        PARTIAL_MESSAGES_OVERRIDE_ENV,
+    };
+    use std::collections::HashMap;
+
+    fn provider(
+        base_url: &str,
+        preset: Option<&str>,
+        api_format: &str,
+        extra_env: Option<HashMap<String, String>>,
+    ) -> ApiProvider {
+        ApiProvider {
+            id: "p1".to_string(),
+            name: "Provider".to_string(),
+            base_url: base_url.to_string(),
+            api_format: api_format.to_string(),
+            api_key: Some("key".to_string()),
+            model_mappings: vec![ModelMapping {
+                tier: "sonnet".to_string(),
+                provider_model: "model".to_string(),
+            }],
+            extra_env,
+            proxy_url: None,
+            preset: preset.map(str::to_string),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn native_anthropic_always_supports_partial_messages() {
+        let p = provider("https://api.anthropic.com", None, "anthropic", None);
+        let caps = resolve_provider_capabilities(&p, true);
+        assert!(caps.is_native_anthropic);
+        assert!(caps.supports_partial_messages);
+        assert!(caps.supports_thinking_effort);
+    }
+
+    #[test]
+    fn normalize_cli_model_id_passes_models_through_unchanged() {
+        // Standard Opus passes through; the 1M form already arrives in `[1m]`
+        // shape from the frontend, so it is also untouched.
+        assert_eq!(normalize_cli_model_id("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(
+            normalize_cli_model_id("claude-opus-4-8[1m]"),
+            "claude-opus-4-8[1m]"
+        );
+        assert_eq!(normalize_cli_model_id("glm-5"), "glm-5");
+    }
+
+    #[test]
+    fn anthropic_format_providers_default_to_partial_messages() {
+        let p = provider(
+            "https://dashscope.aliyuncs.com/apps/anthropic",
+            Some("qwen"),
+            "anthropic",
+            None,
+        );
+        let caps = resolve_provider_capabilities(&p, false);
+        assert!(!caps.is_native_anthropic);
+        assert!(caps.supports_partial_messages);
+        assert!(caps.supports_thinking_effort);
+    }
+
+    #[test]
+    fn openai_format_providers_do_not_get_claude_partial_messages() {
+        let p = provider("https://example.com/v1", None, "openai", None);
+        let caps = resolve_provider_capabilities(&p, false);
+        assert!(!caps.supports_partial_messages);
+        assert!(!caps.supports_thinking_effort);
+    }
+
+    #[test]
+    fn explicit_partial_messages_override_wins_for_non_native_provider() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            PARTIAL_MESSAGES_OVERRIDE_ENV.to_string(),
+            "false".to_string(),
+        );
+        let p = provider(
+            "https://openrouter.ai/api",
+            Some("openrouter"),
+            "anthropic",
+            Some(extra),
+        );
+        let caps = resolve_provider_capabilities(&p, false);
+        assert!(!caps.supports_partial_messages);
+        assert!(caps.supports_thinking_effort);
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            PARTIAL_MESSAGES_OVERRIDE_ENV.to_string(),
+            "true".to_string(),
+        );
+        let p = provider(
+            "https://unknown.example.com",
+            None,
+            "anthropic",
+            Some(extra),
+        );
+        let caps = resolve_provider_capabilities(&p, false);
+        assert!(caps.supports_partial_messages);
+        assert!(caps.supports_thinking_effort);
+    }
+
+    #[test]
+    fn bool_override_parser_accepts_common_values() {
+        assert_eq!(parse_bool_override("1"), Some(true));
+        assert_eq!(parse_bool_override("on"), Some(true));
+        assert_eq!(parse_bool_override("false"), Some(false));
+        assert_eq!(parse_bool_override("OFF"), Some(false));
+        assert_eq!(parse_bool_override("maybe"), None);
+    }
+
+    #[test]
+    fn runtime_defaults_disable_official_marketplace_autoinstall() {
+        let mut env = HashMap::new();
+        apply_claude_cli_runtime_defaults(&mut env);
+        assert_eq!(
+            env.get(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV).map(String::as_str),
+            Some("10000")
+        );
+        assert!(env
+            .get(CLAUDE_PLUGIN_CACHE_DIR_ENV)
+            .is_some_and(|path| path.ends_with(".tokenicode/claude-plugin-cache")));
+    }
+
+    #[test]
+    fn runtime_defaults_do_not_override_provider_extra_env() {
+        let mut env = HashMap::from([
+            (
+                DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV.to_string(),
+                "0".to_string(),
+            ),
+            (
+                CLAUDE_PLUGIN_CACHE_DIR_ENV.to_string(),
+                "/custom/cache".to_string(),
+            ),
+            (
+                CLAUDE_PLUGIN_GIT_TIMEOUT_ENV.to_string(),
+                "2500".to_string(),
+            ),
+        ]);
+        apply_claude_cli_runtime_defaults(&mut env);
+        assert_eq!(
+            env.get(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV)
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_CACHE_DIR_ENV).map(String::as_str),
+            Some("/custom/cache")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV).map(String::as_str),
+            Some("2500")
+        );
+    }
+
+    #[test]
+    fn mcp_servers_are_excluded_unless_explicitly_enabled() {
+        assert!(!should_include_mcp_servers(None));
+        assert!(!should_include_mcp_servers(Some("0")));
+        assert!(!should_include_mcp_servers(Some("false")));
+        assert!(!should_include_mcp_servers(Some("maybe")));
+        assert!(should_include_mcp_servers(Some("1")));
+        assert!(should_include_mcp_servers(Some("true")));
+        assert_eq!(INCLUDE_MCP_SERVERS_ENV, "TOKENICODE_INCLUDE_MCP_SERVERS");
+    }
+
+    #[test]
+    fn env_log_redacts_secrets_but_keeps_routing_context() {
+        let env = HashMap::from([
+            ("ANTHROPIC_API_KEY".to_string(), "sk-real".to_string()),
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://api.example.com".to_string(),
+            ),
+            (
+                "https_proxy".to_string(),
+                "http://user:pass@127.0.0.1:7890".to_string(),
+            ),
+        ]);
+        let redacted = redacted_env_for_log(&env);
+        assert_eq!(
+            redacted.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            redacted.get("https_proxy").map(String::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            redacted.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://api.example.com")
+        );
+    }
+}
+
+/// All roots to scan for Claude CLI session history: the host
+/// `~/.claude/projects` first (may not exist — scanners tolerate that), then
+/// any bind-mounted container project dirs surfaced by the backend manager.
+async fn claude_projects_dirs(
+    backends: &docker_backend::BackendManager,
+) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".claude").join("projects"));
+    }
+    // Dedupe: a container may bind-mount the host home, so its extra projects
+    // dir can equal (or already be covered by) a root already present. Skipping
+    // exact duplicates prevents duplicate session rows.
+    for dir in backends.extra_claude_projects_dirs().await {
+        if !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    }
+    roots
+}
+
+/// Find the JSONL file for a given session UUID by scanning ~/.claude/projects/*/.
+/// Returns the path if found, None otherwise.
+/// Validates that session_id looks like a UUID to prevent path traversal.
+///
+/// `extra_roots` lets callers with access to the docker `BackendManager` also
+/// search bind-mounted container history dirs; sync callers without state pass
+/// `&[]` (host-only, unchanged behaviour). The host `~/.claude/projects` is
+/// always searched first, then each extra root in order — first hit wins.
+fn find_session_jsonl(
+    session_id: &str,
+    extra_roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    // Reject non-UUID session IDs to prevent path traversal (e.g. "../../../etc/passwd")
+    if uuid::Uuid::parse_str(session_id).is_err() {
+        eprintln!(
+            "[TOKENICODE] find_session_jsonl: rejecting non-UUID session_id: {}",
+            session_id
+        );
+        return None;
+    }
+
+    let target_filename = format!("{}.jsonl", session_id);
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".claude").join("projects"));
+    }
+    roots.extend(extra_roots.iter().cloned());
+
+    for claude_projects in &roots {
+        if !claude_projects.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(claude_projects) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let candidate = entry.path().join(&target_filename);
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Strip thinking and redacted_thinking blocks from a session's JSONL file.
+/// This is used before resuming a session with a different model, because the
+/// new model cannot verify the old model's cryptographic thinking signatures
+/// and will reject the request with a 400 error.
+///
+/// Returns Ok(blocks_stripped) on success, or Err with a description on failure.
+/// The caller should NOT block the session resume on failure — let the auto-retry
+/// path handle it as a safety net.
+fn strip_thinking_blocks_from_session(
+    session_id: &str,
+    extra_roots: &[std::path::PathBuf],
+) -> Result<usize, String> {
+    use std::io::{BufRead, Write};
+
+    let jsonl_path = find_session_jsonl(session_id, extra_roots)
+        .ok_or_else(|| format!("Session JSONL not found for id: {}", session_id))?;
+
+    eprintln!(
+        "[TOKENICODE] strip_thinking_blocks: processing {:?}",
+        jsonl_path
+    );
+
+    // Read all lines
+    let file =
+        std::fs::File::open(&jsonl_path).map_err(|e| format!("Failed to open JSONL: {}", e))?;
+    let reader = std::io::BufReader::new(file);
+    let lines: Vec<String> = reader
+        .lines()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read JSONL: {}", e))?;
+
+    let mut total_stripped = 0usize;
+    let mut modified_lines = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            modified_lines.push(line);
+            continue;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(mut json_line) => {
+                // Look for assistant messages with content arrays.
+                // Format: {"type":"assistant","message":{"role":"assistant","content":[...]}}
+                // Thinking blocks only appear at this level — tool_result content arrays
+                // contain tool output, not model thinking.
+                if let Some(stripped) = strip_thinking_from_value(&mut json_line) {
+                    total_stripped += stripped;
+                }
+                modified_lines.push(serde_json::to_string(&json_line).unwrap_or(line));
+            }
+            Err(_) => {
+                // Not valid JSON — keep the line as-is
+                modified_lines.push(line);
+            }
+        }
+    }
+
+    if total_stripped > 0 {
+        // Backup the original file before overwriting
+        let backup_path = jsonl_path.with_extension("jsonl.bak");
+        if let Err(e) = std::fs::copy(&jsonl_path, &backup_path) {
+            eprintln!(
+                "[TOKENICODE] strip_thinking_blocks: backup failed ({}) — proceeding anyway",
+                e
+            );
+        }
+
+        // Write the cleaned JSONL via temp file + platform-specific replace.
+        let tmp_path = jsonl_path.with_extension("jsonl.tmp");
+        let mut tmp_file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create temp file: {}", e))?;
+        for line in &modified_lines {
+            writeln!(tmp_file, "{}", line)
+                .map_err(|e| format!("Failed to write temp file: {}", e))?;
+        }
+        tmp_file
+            .flush()
+            .map_err(|e| format!("Failed to flush temp file: {}", e))?;
+        // Drop the file handle before rename — on Windows, an open handle
+        // can prevent rename from succeeding.
+        drop(tmp_file);
+
+        // On Unix, rename() atomically replaces the target — no data loss window.
+        // On Windows, rename() cannot overwrite an existing file, so we use a
+        // two-step approach with rollback from backup on failure.
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::fs::rename(&tmp_path, &jsonl_path)
+                .map_err(|e| format!("Failed to rename temp file: {}", e))?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let replace_result = (|| -> std::io::Result<()> {
+                // Try std::fs::rename first — works if target doesn't exist
+                if std::fs::rename(&tmp_path, &jsonl_path).is_ok() {
+                    return Ok(());
+                }
+                // Fallback: backup old file, rename new, rollback on failure
+                let win_backup = jsonl_path.with_extension("jsonl.wbak");
+                let _ = std::fs::remove_file(&win_backup);
+                std::fs::rename(&jsonl_path, &win_backup)?;
+                if let Err(e) = std::fs::rename(&tmp_path, &jsonl_path) {
+                    // Rollback: restore original file
+                    let _ = std::fs::rename(&win_backup, &jsonl_path);
+                    return Err(e);
+                }
+                let _ = std::fs::remove_file(&win_backup);
+                Ok(())
+            })();
+            replace_result.map_err(|e| format!("Failed to replace JSONL on Windows: {}", e))?;
+        }
+
+        eprintln!(
+            "[TOKENICODE] strip_thinking_blocks: stripped {} thinking blocks from {:?}",
+            total_stripped, jsonl_path
+        );
+    } else {
+        eprintln!(
+            "[TOKENICODE] strip_thinking_blocks: no thinking blocks found in {:?}",
+            jsonl_path
+        );
+    }
+
+    Ok(total_stripped)
+}
+
+/// Strip thinking/redacted_thinking content blocks from a JSON value's message.content array.
+/// Returns the number of blocks stripped, or None if nothing was modified.
+fn strip_thinking_from_value(value: &mut serde_json::Value) -> Option<usize> {
+    let mut stripped = 0usize;
+
+    // Look for message.content array (assistant messages)
+    if let Some(message) = value.get_mut("message") {
+        if let Some(content) = message.get_mut("content") {
+            if let Some(arr) = content.as_array_mut() {
+                let before_len = arr.len();
+                arr.retain(|item| {
+                    item.get("type")
+                        .and_then(|t| t.as_str())
+                        .map_or(true, |t| t != "thinking" && t != "redacted_thinking")
+                });
+                stripped += before_len - arr.len();
+            }
+        }
+    }
+
+    if stripped > 0 {
+        Some(stripped)
+    } else {
+        None
+    }
+}
+
+/// Write a per-session MCP config scratch file only when explicitly enabled.
+///
+/// TOKENICODE's default chat path uses `--strict-mcp-config` without copying
+/// global MCP servers because slow or unrelated servers can block the first
+/// desktop response. Advanced users can opt in with
+/// `TOKENICODE_INCLUDE_MCP_SERVERS=1`.
+fn build_mcp_scratch_config(stdin_id: &str) -> Option<std::path::PathBuf> {
+    if !should_include_mcp_servers(std::env::var(INCLUDE_MCP_SERVERS_ENV).ok().as_deref()) {
+        return None;
+    }
+
+    let home = dirs::home_dir()?;
+    let claude_json = home.join(".claude.json");
+    let raw = std::fs::read_to_string(&claude_json).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+
+    // Tolerate the double-nested mcpServers.mcpServers shape the frontend
+    // already auto-fixes; prefer the outer layer when present.
+    let mut servers = value
+        .get("mcpServers")
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    if let Some(inner) = servers.get("mcpServers").cloned() {
+        if inner.is_object() {
+            servers = inner;
+        }
+    }
+
+    // No servers → skip --mcp-config entirely (CLI starts faster).
+    match &servers {
+        serde_json::Value::Object(m) if m.is_empty() => return None,
+        serde_json::Value::Object(_) => {}
+        _ => return None,
+    }
+
+    let dir = home.join(".tokenicode");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join(format!(
+        "mcp-session-{}.json",
+        safe_stdin_for_path(stdin_id)
+    ));
+    let payload = serde_json::json!({ "mcpServers": servers });
+    std::fs::write(&path, serde_json::to_string_pretty(&payload).ok()?).ok()?;
+    Some(path)
+}
+
+fn safe_stdin_for_path(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Remove the per-session MCP scratch file written by `build_mcp_scratch_config`.
+/// Called after the CLI process exits so `~/.tokenicode/` doesn't accumulate
+/// stale files across sessions.
+fn cleanup_mcp_scratch_config(stdin_id: &str) {
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".tokenicode").join(format!(
+            "mcp-session-{}.json",
+            safe_stdin_for_path(stdin_id)
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+async fn dispatch_wechat_stream_event(
+    runtime: &wechat::runtime::WechatRuntimeHandle,
+    stdin_mgr: &StdinManager,
+    source_session_id: &str,
+    event: &Value,
+) {
+    let effects = runtime
+        .process_stream_event_for_session(Some(source_session_id), event, wechat::now_ms())
+        .await;
+    if effects.is_empty() {
+        return;
+    }
+
+    let store = runtime.state_store().await;
+    if let Err(err) = wechat::executor::execute_turn_effects(stdin_mgr, &store, &effects).await {
+        eprintln!("[WeChat] stream fanout failed: {err}");
+    }
 }
 
 #[tauri::command]
@@ -1060,8 +1820,30 @@ async fn start_claude_session(
     app: AppHandle,
     state: State<'_, ProcessManager>,
     stdin_mgr: State<'_, StdinManager>,
+    wechat_runtime: State<'_, wechat::runtime::WechatRuntimeHandle>,
+    bypass_modes: State<'_, BypassModeMap>,
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     params: StartSessionParams,
 ) -> Result<SessionInfo, String> {
+    // Phase 3 §3.1: register the per-session cwd as a fixed path-access root
+    // so all file commands running in this working directory are allowed.
+    // For docker-backed sessions params.cwd is a container path; translate it
+    // to the host path that std::fs actually touches before registering.
+    path_access
+        .register_cwd(&backends.to_host_or_passthrough(&params.cwd).await)
+        .await;
+
+    // Resolve the docker backend for this session, if any. Selection is driven
+    // solely by the explicit `docker_container` field the frontend sends for
+    // docker sessions; we do NOT infer from cwd. Inference could misroute a
+    // deliberately-local session into a container when host/container paths are
+    // identical (e.g. `-v $PWD:$PWD`). `None` means a normal local spawn.
+    let docker_backend_proj = match params.docker_container {
+        Some(ref c) => backends.project_by_container(c).await,
+        None => None,
+    };
+
     let session_id = params
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1069,6 +1851,7 @@ async fn start_claude_session(
     // Clean up any existing process with the same session_id
     stdin_mgr.remove(&session_id).await;
     state.remove(&session_id).await;
+    bypass_modes.remove(&session_id).await;
 
     // Use persistent stream-json input mode instead of per-message -p mode.
     // This keeps the CLI process alive so slash commands (/rewind, /compact, /cost, etc.) work.
@@ -1083,8 +1866,39 @@ async fn start_claude_session(
         // Skip global MCP servers from ~/.claude.json to avoid slow cold start.
         // MCP servers (chrome-devtools, codex, gemini, pencil etc.) add 20-30s startup
         // overhead as each must initialize before the CLI accepts input.
+        // Phase 4 §5.4 (S10): pair with a per-session scratch config so the
+        // user's configured servers remain available (see below).
         "--strict-mcp-config".to_string(),
     ];
+
+    // Build a per-session MCP scratch config only for explicit opt-in. Keeping
+    // the default empty preserves fast desktop startup and prevents unrelated
+    // global MCP servers from blocking the first stream event.
+    let mcp_scratch_path = build_mcp_scratch_config(&session_id);
+    if let Some(ref scratch) = mcp_scratch_path {
+        args.push("--mcp-config".to_string());
+        args.push(scratch.to_string_lossy().to_string());
+        eprintln!(
+            "[TOKENICODE] MCP scratch config for {}: {:?}",
+            session_id, scratch
+        );
+    }
+
+    // Model switch: strip thinking blocks from the session JSONL before resuming.
+    // When switching models, the old model's cryptographic thinking signatures in the
+    // JSONL cause the new model to reject the request (400 error). Stripping them
+    // preserves the conversation text while removing the invalid signatures.
+    // This is best-effort: failure is logged but does NOT block the resume attempt.
+    // The auto-retry path in useStreamProcessor.ts will catch any remaining errors.
+    if params.model_switch.unwrap_or(false) {
+        if let Some(ref resume_id) = params.resume_session_id {
+            let extra_roots = backends.extra_claude_projects_dirs().await;
+            match strip_thinking_blocks_from_session(resume_id, &extra_roots) {
+                Ok(n) => eprintln!("[TOKENICODE] model_switch: stripped {} thinking blocks before resume", n),
+                Err(e) => eprintln!("[TOKENICODE] model_switch: thinking-block strip failed ({}), attempting resume anyway", e),
+            }
+        }
+    }
 
     // Resume an existing CLI session if requested
     if let Some(ref resume_id) = params.resume_session_id {
@@ -1094,7 +1908,7 @@ async fn start_claude_session(
 
     if let Some(ref model) = params.model {
         args.push("--model".to_string());
-        args.push(model.clone());
+        args.push(normalize_cli_model_id(model));
     }
 
     if let Some(ref tools) = params.allowed_tools {
@@ -1125,57 +1939,108 @@ async fn start_claude_session(
         args.push(r#"{"alwaysThinkingEnabled":true}"#.to_string());
     }
 
-    // Resolve claude binary — it may not be on the default PATH
-    let claude_bin = find_claude_binary().unwrap_or_else(|| {
-        #[cfg(target_os = "windows")]
-        {
-            "claude.cmd".to_string()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            "claude".to_string()
-        }
-    });
+    // Resolve claude binary — it may not be on the default PATH.
+    // For docker-backed sessions the binary runs inside the container, so the
+    // host path from find_claude_binary() is meaningless; use plain "claude".
+    let claude_bin = if docker_backend_proj.is_some() {
+        "claude".to_string()
+    } else {
+        find_claude_binary().unwrap_or_else(|| {
+            #[cfg(target_os = "windows")]
+            {
+                "claude.cmd".to_string()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                "claude".to_string()
+            }
+        })
+    };
 
     // Build an enriched PATH for the child process
     let enriched_path = build_enriched_path();
 
-    // Resolve provider environment variables from provider_id
-    let (mut resolved_env, inherited_keys_to_remove, provider_extra_args) =
+    // Resolve provider environment variables from provider_id.
+    // ProviderRuntimeCapabilities keeps native-only env vars separate from
+    // partial-message streaming support. Some Anthropic-compatible providers
+    // support partial text/thinking deltas even though they are not the native
+    // api.anthropic.com endpoint.
+    let (mut resolved_env, inherited_keys_to_remove, provider_extra_args, provider_caps) =
         resolve_provider_env(params.provider_id.as_deref())?;
+    apply_claude_cli_runtime_defaults(&mut resolved_env);
 
-    // Append provider-specific CLI args (e.g. --setting-sources project,local)
+    // Append provider-specific CLI args. Do NOT force a blanket
+    // `--setting-sources local` here: in the Claude CLI that flag also gates
+    // CLAUDE.md memory loading, so forcing "local" drops the user
+    // (~/.claude/CLAUDE.md) and parent-workspace CLAUDE.md that the desktop
+    // session is expected to honor (only the cwd's own CLAUDE.md survives).
+    // Startup-hook isolation is handled separately via runtime env defaults and
+    // MCP opt-out; providers may still inject their own --setting-sources.
     args.extend(provider_extra_args);
 
-    // Inject effort level env var for non-off thinking levels
-    if thinking_level != "off" {
+    // Keep partial text/thinking deltas for known-compatible providers; degrade
+    // explicitly for unknown providers that may reject the partial-message path.
+    if !provider_caps.supports_partial_messages {
+        if let Some(idx) = args.iter().position(|a| a == "--include-partial-messages") {
+            args.remove(idx);
+        }
+        eprintln!(
+            "[TOKENICODE] partial streaming disabled for provider {:?} (unsupported/unknown capability)",
+            params.provider_id
+        );
+    } else if !provider_caps.is_native_anthropic {
+        eprintln!(
+            "[TOKENICODE] partial streaming enabled for provider {:?}",
+            params.provider_id
+        );
+    }
+
+    // Apply effort level for non-off thinking levels.
+    // Native Claude keeps the existing env path. Anthropic-format API
+    // providers use the CLI's public --effort flag so the setting can reach
+    // provider-routed sessions without enabling native-only env side effects.
+    if thinking_level != "off" && provider_caps.is_native_anthropic {
         resolved_env.insert(
             "CLAUDE_CODE_EFFORT_LEVEL".to_string(),
             thinking_level.to_string(),
         );
+    } else if thinking_level != "off" && provider_caps.supports_thinking_effort {
+        args.push("--effort".to_string());
+        args.push(thinking_level.to_string());
     }
 
     // Raise the per-turn output token cap from the CLI default (32K) to 64K.
-    // This prevents "response exceeded the 32000 output token maximum" errors
-    // when generating large files (e.g. HTML presentations).
-    resolved_env
-        .entry("CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string())
-        .or_insert_with(|| "64000".to_string());
+    // NEW-N (v3 §4.3): CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 confuses some
+    // third-party providers (their underlying models cap lower and they
+    // reject the request with 400). Keep this Anthropic-native only; users
+    // on third-party providers can still override via provider extra_env.
+    if provider_caps.is_native_anthropic {
+        resolved_env
+            .entry("CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string())
+            .or_insert_with(|| "64000".to_string());
+    }
 
     // Enable CLI-managed file checkpoints for rewind functionality.
-    // With --replay-user-messages, user messages in stream output carry a uuid
-    // that identifies the checkpoint. The rewind_files command uses these UUIDs.
-    resolved_env.insert(
-        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".to_string(),
-        "1".to_string(),
-    );
+    // C8: SDK file checkpointing is an Anthropic-specific CLI feature — it
+    // requires --replay-user-messages which third-party providers don't
+    // reliably support.
+    if provider_caps.is_native_anthropic {
+        resolved_env.insert(
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".to_string(),
+            "1".to_string(),
+        );
+    }
 
-    // For models with 1M context window (MiMo v2 Pro etc.), override the auto-compact
-    // threshold so Claude Code doesn't compact prematurely. The CLI's internal model map
-    // may only know ~200K for these models; this env var directly sets the compact window.
+    // For models with a 1M context window (explicit Opus 1M variants such as
+    // `claude-opus-4-8[1m]` / `claude-opus-4-6[1m]`, MiMo v2 Pro, etc.), override
+    // the auto-compact threshold so Claude Code doesn't compact prematurely. The
+    // CLI's internal model map may only know ~200K for some of these models; this
+    // env var directly sets the compact window. Standard 200K variants (e.g.
+    // `claude-opus-4-8`) deliberately do not match.
     if let Some(model_name) = params.model.as_deref() {
         let m = model_name.to_lowercase();
-        if m.contains("mimo") || m.contains("[1m]") {
+        let is_1m_model = m.contains("mimo") || m.contains("[1m]") || m.ends_with("-1m");
+        if is_1m_model {
             resolved_env.insert(
                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
                 "1000000".to_string(),
@@ -1193,9 +2058,11 @@ async fn start_claude_session(
     // especially with non-ASCII (Chinese) characters in paths.
     #[cfg(target_os = "windows")]
     {
-        resolved_env.entry("MSYS_NO_PATHCONV".to_string())
+        resolved_env
+            .entry("MSYS_NO_PATHCONV".to_string())
             .or_insert_with(|| "1".to_string());
-        resolved_env.entry("MSYS2_ARG_CONV_EXCL".to_string())
+        resolved_env
+            .entry("MSYS2_ARG_CONV_EXCL".to_string())
             .or_insert_with(|| "*".to_string());
     }
 
@@ -1250,11 +2117,40 @@ async fn start_claude_session(
         }
     }
 
-    // On Windows, .cmd/.bat files must be launched via cmd /C
-    #[cfg(target_os = "windows")]
-    let mut child = {
-        // Helper: build and spawn a Command for the given binary
-        let spawn_win = |bin: &str| {
+    // Docker-backed sessions spawn claude via `docker exec` (its own simple
+    // spawn — no PATH/EACCES/ENOEXEC handling, which only apply to host
+    // binaries). Local sessions keep the existing cfg-branched spawn verbatim.
+    let mut child = if let Some(ref proj) = docker_backend_proj {
+        let env_pairs: Vec<(String, String)> = resolved_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let spec = docker_backend::build_docker_exec(
+            &proj.container,
+            &params.cwd,
+            &env_pairs,
+            &claude_bin,
+            &args,
+        );
+        eprintln!(
+            "[TOKENICODE] docker exec spawn: container={} args={:?}",
+            proj.container,
+            docker_backend::redact_env_args(&spec.args)
+        );
+        Command::new(&spec.program)
+            .args(&spec.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn docker exec: {}", e))?
+    } else {
+        // ── Local spawn: existing cfg-branched code, unchanged. ──
+        // On Windows, .cmd/.bat files must be launched via cmd /C
+        #[cfg(target_os = "windows")]
+        let local_child = {
+            // Helper: build and spawn a Command for the given binary
+            let spawn_win = |bin: &str| {
             let needs_cmd = bin.ends_with(".cmd")
                 || bin.ends_with(".bat")
                 || (!bin.contains('\\') && !bin.contains('/') && !bin.contains('.'));
@@ -1286,14 +2182,10 @@ async fn start_claude_session(
             Ok(c) => c,
             Err(e) if e.raw_os_error() == Some(193) => {
                 // Error 193: not a valid Win32 application — binary is corrupt.
-                // Clean up the bad binary and try to find an alternative.
+                // Delete the exact file that failed (covers both ~/.claude/local/
+                // and npm-global paths) and fall back to the next candidate.
                 eprintln!("error 193 on '{}', cleaning up and retrying...", claude_bin);
-                if let Some(cli_dir) = cli_download_dir() {
-                    let suspect = cli_dir.join("claude.exe");
-                    if suspect.exists() {
-                        let _ = std::fs::remove_file(&suspect);
-                    }
-                }
+                remove_corrupt_claude_exe(&claude_bin);
                 let alt_bin = find_claude_binary().unwrap_or_else(|| "claude.cmd".to_string());
                 if alt_bin == claude_bin {
                     return Err(format!(
@@ -1316,9 +2208,9 @@ async fn start_claude_session(
                 ));
             }
         }
-    };
-    #[cfg(not(target_os = "windows"))]
-    let mut child = {
+        };
+        #[cfg(not(target_os = "windows"))]
+        let local_child = {
         let spawn_unix = |bin: &str| -> std::io::Result<tokio::process::Child> {
             let mut cmd = Command::new(bin);
             cmd.args(&args)
@@ -1411,6 +2303,8 @@ async fn start_claude_session(
                 ));
             }
         }
+        };
+        local_child
     };
 
     let pid = child.id().unwrap_or(0);
@@ -1420,7 +2314,10 @@ async fn start_claude_session(
     );
     eprintln!("[TOKENICODE] args: {:?}", &args);
     eprintln!("[TOKENICODE] PATH: {}", &enriched_path);
-    eprintln!("[TOKENICODE] resolved_env: {:?}", &resolved_env);
+    eprintln!(
+        "[TOKENICODE] resolved_env: {:?}",
+        redacted_env_for_log(&resolved_env)
+    );
     eprintln!("[TOKENICODE] cwd: {}", &params.cwd);
 
     // Capture stdin and store in StdinManager for sending follow-up messages
@@ -1432,32 +2329,82 @@ async fn start_claude_session(
 
     let sid = session_id.clone();
 
+    // ── Spawn child waiter task — owns the child process ──
+    //
+    // The waiter task's sole purpose is to **own the child process** and
+    // provide a kill channel for kill_session. It does NOT emit process_exit
+    // or do any cleanup — those responsibilities belong to the stdout reader,
+    // because stdout EOF is naturally time-ordered after all stream messages
+    // have been drained, whereas child.wait() can return BEFORE the stdout
+    // reader has finished processing the last buffered lines (race!).
+    //
+    //   1. child.wait() returns naturally → child exited on its own.
+    //      stdout will close, stdout_reader will hit EOF, THAT emits
+    //      process_exit. The waiter simply ends, silent.
+    //   2. kill_rx fires → kill_session was called. We start_kill the child,
+    //      wait for reap, then end silently. stdout reader will see EOF.
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let waiter_sid = sid.clone();
+        tokio::spawn(async move {
+            let mut child = child;
+            tokio::select! {
+                status = child.wait() => {
+                    eprintln!(
+                        "[TOKENICODE] child naturally exited for {}: code={:?} (stdout reader will emit process_exit)",
+                        waiter_sid,
+                        status.as_ref().ok().and_then(|s| s.code())
+                    );
+                }
+                _ = kill_rx => {
+                    eprintln!("[TOKENICODE] kill signal received for {} — killing child", waiter_sid);
+                    if let Err(e) = child.start_kill() {
+                        eprintln!("[TOKENICODE] start_kill failed for {}: {}", waiter_sid, e);
+                    }
+                    // Wait for child to actually die, then stdout reader will
+                    // see EOF and do the ProcessExit + cleanup.
+                    let _ = child.wait().await;
+                }
+            }
+        });
+    }
+
+    let exit_notify = Arc::new(tokio::sync::Notify::new());
+
+    // Docker-backed sessions report their in-container PID asynchronously via a
+    // stderr marker (see build_docker_exec). The stderr reader fills this atomic
+    // once the marker arrives; kill_session reads it for an in-container kill.
+    let container_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     state
         .insert(
             sid.clone(),
             ManagedProcess {
-                child,
                 session_id: sid.clone(),
+                pid,
+                kill_tx: Some(kill_tx),
+                exit_notify: exit_notify.clone(),
+                container_kill: docker_backend_proj
+                    .as_ref()
+                    .map(|p| (p.container.clone(), container_pid.clone())),
             },
         )
         .await;
-
-    // Helper: emit to the main webview using emit_to for reliable delivery
-    fn emit_to_frontend(app: &AppHandle, event: &str, payload: Value) -> Result<(), String> {
-        if let Err(e1) = app.emit_to("main", event, payload.clone()) {
-            // Fallback: use global emit
-            if let Err(e2) = app.emit(event, payload) {
-                return Err(format!("emit_to failed: {}, emit failed: {}", e1, e2));
-            }
-        }
-        Ok(())
-    }
 
     // Spawn stdout reader — streams NDJSON to frontend, intercepts control_request
     let app_clone = app.clone();
     let sid_clone = sid.clone();
     let stdin_clone = stdin_mgr.inner().clone();
-    let is_bypass = permission_mode == "bypassPermissions";
+    let exit_notify_clone = exit_notify.clone();
+    let state_clone = state.inner().clone();
+    let stdin_mgr_clone = stdin_mgr.inner().clone();
+    let stdin_mgr_for_wechat = stdin_mgr.inner().clone();
+    let wechat_runtime_clone = wechat_runtime.inner().clone();
+    let bypass_modes_clone = bypass_modes.inner().clone();
+    let bypass_flag = bypass_modes
+        .register(&sid, permission_mode == "bypassPermissions")
+        .await;
+    let bypass_flag_for_reader = bypass_flag.clone();
     tokio::spawn(async move {
         let stream_event = format!("claude:stream:{}", sid_clone);
         // Use a large buffer (1MB) to efficiently read large NDJSON lines from Claude CLI.
@@ -1471,9 +2418,12 @@ async fn start_claude_session(
         loop {
             let line = match lines.next_line().await {
                 Ok(Some(line)) => line,
-                Ok(None) => break,  // normal EOF
+                Ok(None) => break, // normal EOF
                 Err(e) => {
-                    eprintln!("[TOKENICODE:CRITICAL] stdout read error after {} lines: {}", line_count, e);
+                    eprintln!(
+                        "[TOKENICODE:CRITICAL] stdout read error after {} lines: {}",
+                        line_count, e
+                    );
                     break;
                 }
             };
@@ -1481,11 +2431,20 @@ async fn start_claude_session(
             // Log first 10 lines with timing to diagnose startup delay
             if line_count <= 10 {
                 let elapsed = spawn_time.elapsed().as_millis();
-                let preview = if line.len() > 150 {
-                    &line[..150]
+                // CRITICAL: must clamp to char boundary, otherwise slicing
+                // through a multi-byte UTF-8 char (e.g. Chinese punctuation
+                // at byte 149-152) panics the entire stdout reader task,
+                // killing the stream pipeline while CLI is still alive.
+                let end = if line.len() > 150 {
+                    let mut i = 150;
+                    while i > 0 && !line.is_char_boundary(i) {
+                        i -= 1;
+                    }
+                    i
                 } else {
-                    &line
+                    line.len()
                 };
+                let preview = &line[..end];
                 eprintln!(
                     "[TOKENICODE:stdout] #{} @{}ms type={} preview={}",
                     line_count,
@@ -1502,6 +2461,14 @@ async fn start_claude_session(
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
+
+            dispatch_wechat_stream_event(
+                &wechat_runtime_clone,
+                &stdin_mgr_for_wechat,
+                &sid_clone,
+                &json,
+            )
+            .await;
 
             // Intercept control_request messages for SDK control protocol routing.
             // All modes use --permission-prompt-tool stdio. In bypass mode, we
@@ -1522,7 +2489,7 @@ async fn start_claude_session(
                         .unwrap_or_default();
 
                     // Bypass mode: auto-approve everything except user interactions.
-                    if is_bypass {
+                    if bypass_flag_for_reader.load(std::sync::atomic::Ordering::Relaxed) {
                         let tool_name = request
                             .get("tool_name")
                             .or_else(|| request.get("toolName"))
@@ -1571,10 +2538,24 @@ async fn start_claude_session(
                                 .or_else(|| request.get("toolUseId"))
                                 .and_then(|v| v.as_str())
                                 .map(String::from);
+                            // P0-1 (#39): forward parent_tool_use_id and agent_id so the
+                            // frontend can compute sub-agent depth. Without these, every
+                            // sub-agent permission freezes the main input because
+                            // resolveAgentId falls back to "main agent" depth 0.
+                            let parent_tool_use_id = request
+                                .get("parent_tool_use_id")
+                                .or_else(|| request.get("parentToolUseId"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let agent_id = request
+                                .get("agent_id")
+                                .or_else(|| request.get("agentId"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
 
                             eprintln!(
-                                "[TOKENICODE] permission request: tool={} request_id={}",
-                                tool_name, request_id
+                                "[TOKENICODE] permission request: tool={} request_id={} parent_tool_use_id={:?} agent_id={:?}",
+                                tool_name, request_id, parent_tool_use_id, agent_id
                             );
 
                             // Emit as a special stream message (reuses the working stream channel)
@@ -1585,7 +2566,16 @@ async fn start_claude_session(
                                 "input": input,
                                 "description": description,
                                 "tool_use_id": tool_use_id,
+                                "parent_tool_use_id": parent_tool_use_id,
+                                "agent_id": agent_id,
                             });
+                            dispatch_wechat_stream_event(
+                                &wechat_runtime_clone,
+                                &stdin_mgr_for_wechat,
+                                &sid_clone,
+                                &perm_payload,
+                            )
+                            .await;
                             let _ = emit_to_frontend(&app_clone, &stream_event, perm_payload);
                             continue; // Don't forward to stream as normal msg
                         }
@@ -1600,6 +2590,21 @@ async fn start_claude_session(
                                 }
                             });
                             let _ = stdin_clone.send(&sid_clone, &auto_resp.to_string()).await;
+                            continue;
+                        }
+                        "oauth_token_refresh" => {
+                            // Deny oauth_token_refresh — allowing it makes CLI refresh to
+                            // an Anthropic OAuth token that overrides the provider's API key.
+                            eprintln!("[TOKENICODE] oauth_token_refresh: denying to prevent OAuth override (request_id={})", request_id);
+                            let deny_resp = serde_json::json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": request_id,
+                                    "response": { "behavior": "deny" }
+                                }
+                            });
+                            let _ = stdin_clone.send(&sid_clone, &deny_resp.to_string()).await;
                             continue;
                         }
                         other => {
@@ -1662,17 +2667,40 @@ async fn start_claude_session(
             };
             if let Err(e) = emit_to_frontend(&app_clone, &stream_event, json_to_emit) {
                 emit_fail_count += 1;
-                eprintln!("[TOKENICODE] emit_to_frontend failed (#{emit_fail_count}): {e}");
-                // If emit fails repeatedly, the frontend is likely unreachable.
-                // Break the loop to trigger process_exit cleanup (#64).
-                if emit_fail_count >= 10 {
-                    eprintln!("[TOKENICODE:CRITICAL] {} consecutive emit failures — frontend unreachable, stopping stream", emit_fail_count);
-                    break;
+                // Log every 10 failures to avoid flooding stderr when the
+                // WebView is unresponsive for a sustained period.
+                if emit_fail_count == 1 || emit_fail_count % 10 == 0 {
+                    eprintln!(
+                        "[TOKENICODE] emit_to_frontend failed (#{emit_fail_count}): {e} — continuing (watchdog will recover user session if needed)"
+                    );
                 }
+                // DO NOT break. Previously we broke after 10 failures, but
+                // that caused permanent silent disconnection: subsequent
+                // events would never reach the WebView, and the frontend
+                // session would stay stuck in 'running' forever. Keep
+                // trying — WebView usually recovers quickly, and the
+                // frontend watchdog (App.tsx) handles user-facing recovery
+                // if the stall persists.
             } else {
-                emit_fail_count = 0;  // reset on success
+                if emit_fail_count > 0 {
+                    eprintln!(
+                        "[TOKENICODE] emit_to_frontend recovered after {} failures",
+                        emit_fail_count
+                    );
+                }
+                emit_fail_count = 0;
             }
         }
+        // stdout EOF means the child's write end is closed (child exited,
+        // naturally or via kill). This is ALWAYS the authoritative signal
+        // for process_exit because it guarantees all buffered stream
+        // messages have been drained and emitted before the exit event.
+        // The child waiter task only provides a kill proxy; it does NOT
+        // emit process_exit, to avoid racing with stdout drain.
+        eprintln!(
+            "[TOKENICODE] stdout reader reached EOF for {} after {} lines",
+            sid_clone, line_count
+        );
         // Emit process_exit on the stream channel (primary detection)
         let _ = emit_to_frontend(
             &app_clone,
@@ -1685,18 +2713,39 @@ async fn start_claude_session(
             &format!("claude:exit:{}", sid_clone),
             serde_json::json!(null),
         );
-
         // Notify frontend that session list may have changed
         let _ = emit_to_frontend(&app_clone, "sessions:changed", serde_json::json!(null));
+
+        // C2 fix: Clean up manager entries for naturally exited process.
+        // drop_entry does NOT send kill signal (unlike remove), so it's safe
+        // for already-dead processes.
+        state_clone.drop_entry(&sid_clone).await;
+        stdin_mgr_clone.drop_entry(&sid_clone).await;
+        bypass_modes_clone
+            .drop_if_current(&sid_clone, &bypass_flag_for_reader)
+            .await;
+
+        // Phase 4 §5.4 (S10): remove the per-session MCP scratch config.
+        cleanup_mcp_scratch_config(&sid_clone);
+
+        // Signal kill_session that the process has fully exited
+        exit_notify_clone.notify_one();
     });
 
     // Spawn stderr reader
     let app_clone2 = app.clone();
     let sid_clone2 = sid.clone();
+    let container_pid_clone = container_pid.clone();
     tokio::spawn(async move {
         let reader = BufReader::with_capacity(256 * 1024, stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            // Docker-backed sessions emit their in-container PID as the first
+            // stderr line. Capture it and swallow the marker — never forward it.
+            if let Some(pid) = docker_backend::parse_pid_marker(&line) {
+                container_pid_clone.store(pid, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
             let _ = emit_to_frontend(
                 &app_clone2,
                 &format!("claude:stderr:{}", sid_clone2),
@@ -1718,7 +2767,8 @@ async fn start_claude_session(
     }
 
     Ok(SessionInfo {
-        session_id: sid,
+        stdin_id: sid,
+        cli_session_id: params.resume_session_id.clone(),
         pid,
         cli_path: claude_bin.clone(),
     })
@@ -1801,11 +2851,22 @@ async fn respond_permission(
 #[tauri::command]
 async fn send_control_request(
     stdin_mgr: State<'_, StdinManager>,
+    bypass_modes: State<'_, BypassModeMap>,
     session_id: String,
     subtype: String,
     payload: Value,
 ) -> Result<(), String> {
     use protocol::ControlRequest;
+    let next_bypass_mode = match subtype.as_str() {
+        "set_permission_mode" => Some(
+            payload
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'mode' in payload")?
+                == "bypassPermissions",
+        ),
+        _ => None,
+    };
     let req = match subtype.as_str() {
         "interrupt" => ControlRequest::interrupt(),
         "set_permission_mode" => {
@@ -1820,7 +2881,7 @@ async fn send_control_request(
             let model = payload
                 .get("model")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(normalize_cli_model_id);
             ControlRequest::set_model(model)
         }
         "rewind_files" => {
@@ -1835,26 +2896,55 @@ async fn send_control_request(
     };
     let json_str = serde_json::to_string(&req)
         .map_err(|e| format!("Failed to serialize control request: {}", e))?;
-    stdin_mgr.send(&session_id, &json_str).await
+    stdin_mgr.send(&session_id, &json_str).await?;
+    if let Some(is_bypass) = next_bypass_mode {
+        bypass_modes.set_bypass(&session_id, is_bypass).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn kill_session(
     state: State<'_, ProcessManager>,
     stdin_mgr: State<'_, StdinManager>,
+    bypass_modes: State<'_, BypassModeMap>,
     session_id: String,
 ) -> Result<(), String> {
     stdin_mgr.remove(&session_id).await;
-    state.remove(&session_id).await;
+    bypass_modes.remove(&session_id).await;
+    // Docker-backed sessions: the host `docker exec` client has no signal path
+    // to the in-container process, so kill it inside the container first. Prefer
+    // the captured PID; fall back to pkill by command line if the marker never
+    // arrived (pid == 0).
+    if let Some((container, pid_atomic)) = state.container_kill_info(&session_id).await {
+        let pid = pid_atomic.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = if pid > 0 {
+            docker_backend::docker_capture(&["exec", &container, "kill", "-TERM", &pid.to_string()])
+                .await
+        } else {
+            docker_backend::docker_capture(&[
+                "exec",
+                &container,
+                "pkill",
+                "-f",
+                "claude --input-format stream-json",
+            ])
+            .await
+        };
+    }
+    if let Some(notify) = state.remove(&session_id).await {
+        // Wait for the stdout reader to confirm process exit before returning.
+        // Without this, the frontend can send a new message before the old process
+        // has fully cleaned up, causing SESSION_ALREADY_ACTIVE errors.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified()).await;
+    }
     Ok(())
 }
 
 /// TK-329: List all active stdinIds from ProcessManager.
 /// Frontend uses this after refresh to detect and clean up orphaned backend processes.
 #[tauri::command]
-async fn list_active_processes(
-    state: State<'_, ProcessManager>,
-) -> Result<Vec<String>, String> {
+async fn list_active_processes(state: State<'_, ProcessManager>) -> Result<Vec<String>, String> {
     Ok(state.active_ids().await)
 }
 
@@ -1867,7 +2957,7 @@ fn tracked_sessions_path() -> std::path::PathBuf {
 /// Load the set of tracked session IDs.
 /// If the tracking file is missing or empty, rebuild from ~/.claude/projects/
 /// to recover from index loss (e.g., after update, disk issue, new machine).
-fn load_tracked_sessions() -> std::collections::HashSet<String> {
+fn load_tracked_sessions(extra_roots: &[std::path::PathBuf]) -> std::collections::HashSet<String> {
     use std::io::BufRead;
     let path = tracked_sessions_path();
     let mut set = std::collections::HashSet::new();
@@ -1886,8 +2976,10 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
     // missing do we fall back to importing all sessions (better than losing data).
     if set.is_empty() {
         if let Some(home) = dirs::home_dir() {
-            let claude_projects = home.join(".claude").join("projects");
-            if !claude_projects.exists() {
+            // Scan the host projects dir first, then any mounted container dirs.
+            let mut roots = vec![home.join(".claude").join("projects")];
+            roots.extend(extra_roots.iter().cloned());
+            if !roots.iter().any(|r| r.exists()) {
                 return set;
             }
 
@@ -1895,15 +2987,18 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
             let names_filter: Option<std::collections::HashSet<String>> =
                 session_names_path().ok().and_then(|p| {
                     std::fs::read_to_string(&p).ok().and_then(|content| {
-                        serde_json::from_str::<serde_json::Value>(&content).ok().map(|v| {
-                            v.as_object()
-                                .map(|obj| obj.keys().cloned().collect())
-                                .unwrap_or_default()
-                        })
+                        serde_json::from_str::<serde_json::Value>(&content)
+                            .ok()
+                            .map(|v| {
+                                v.as_object()
+                                    .map(|obj| obj.keys().cloned().collect())
+                                    .unwrap_or_default()
+                            })
                     })
                 });
 
-            if let Ok(entries) = std::fs::read_dir(&claude_projects) {
+            for claude_projects in &roots {
+            if let Ok(entries) = std::fs::read_dir(claude_projects) {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         if let Ok(files) = std::fs::read_dir(entry.path()) {
@@ -1912,9 +3007,13 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
                                 if p.extension().map_or(false, |e| e == "jsonl") {
                                     if let Some(stem) = p.file_stem() {
                                         let id = stem.to_string_lossy().to_string();
-                                        if id.starts_with("desk_") { continue; }
+                                        if id.starts_with("desk_") {
+                                            continue;
+                                        }
                                         if let Some(ref filter) = names_filter {
-                                            if filter.contains(&id) { set.insert(id); }
+                                            if filter.contains(&id) {
+                                                set.insert(id);
+                                            }
                                         } else {
                                             set.insert(id);
                                         }
@@ -1924,6 +3023,7 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
                         }
                     }
                 }
+            }
             }
             if !set.is_empty() {
                 if let Some(parent) = path.parent() {
@@ -1935,8 +3035,16 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
                         let _ = writeln!(f, "{}", id);
                     }
                 }
-                let mode = if names_filter.is_some() { "filtered by session_names" } else { "all (no filter)" };
-                eprintln!("[TOKENICODE] Rebuilt tracked_sessions.txt: {} sessions ({})", set.len(), mode);
+                let mode = if names_filter.is_some() {
+                    "filtered by session_names"
+                } else {
+                    "all (no filter)"
+                };
+                eprintln!(
+                    "[TOKENICODE] Rebuilt tracked_sessions.txt: {} sessions ({})",
+                    set.len(),
+                    mode
+                );
             }
         }
     }
@@ -2000,7 +3108,11 @@ fn cleanup_tracked_sessions() {
 
 /// Delete a session: remove from tracking file and delete the .jsonl file
 #[tauri::command]
-async fn delete_session(session_id: String, session_path: String) -> Result<(), String> {
+async fn delete_session(
+    backends: State<'_, docker_backend::BackendManager>,
+    session_id: String,
+    session_path: String,
+) -> Result<(), String> {
     // Remove from tracking file
     let track_path = tracked_sessions_path();
     if track_path.exists() {
@@ -2028,9 +3140,13 @@ async fn delete_session(session_id: String, session_path: String) -> Result<(), 
             let canonical = target
                 .canonicalize()
                 .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
+            // Allow the host `~/.claude/projects/` plus any bind-mounted container
+            // history dir (so docker sessions surfaced by list_sessions can be
+            // deleted). Everything else is refused to prevent path traversal.
             let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-            let allowed_dir = home.join(".claude").join("projects");
-            if !canonical.starts_with(&allowed_dir) {
+            let mut allowed = vec![home.join(".claude").join("projects")];
+            allowed.extend(backends.extra_claude_projects_dirs().await);
+            if !allowed.iter().any(|dir| canonical.starts_with(dir)) {
                 return Err(format!(
                     "Refusing to delete file outside ~/.claude/projects/: {:?}",
                     canonical
@@ -2044,19 +3160,22 @@ async fn delete_session(session_id: String, session_path: String) -> Result<(), 
 }
 
 #[tauri::command]
-async fn list_sessions() -> Result<Vec<Value>, String> {
-    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-    let claude_dir = home.join(".claude").join("projects");
+async fn list_sessions(
+    backends: State<'_, docker_backend::BackendManager>,
+) -> Result<Vec<Value>, String> {
+    // Host `~/.claude/projects` first, then any mounted container history dirs.
+    let roots = claude_projects_dirs(&backends).await;
 
-    if !claude_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    // Only show sessions tracked by TOKENICODE
-    let tracked = load_tracked_sessions();
+    // Only show sessions tracked by TOKENICODE. The rebuild fallback also scans
+    // mounted container dirs (roots[1..]) so docker history can be recovered.
+    let tracked = load_tracked_sessions(&roots[1.min(roots.len())..]);
 
     let mut sessions = vec![];
-    if let Ok(entries) = std::fs::read_dir(&claude_dir) {
+    for claude_dir in &roots {
+        if !claude_dir.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(claude_dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 if let Ok(files) = std::fs::read_dir(entry.path()) {
@@ -2105,6 +3224,7 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
                 }
             }
         }
+        }
     }
 
     // Sort by modified time, newest first
@@ -2120,24 +3240,27 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
 /// Search across tracked session JSONL files for a query string.
 /// Returns matching sessions with snippets, sorted by match_count descending (max 50).
 #[tauri::command]
-async fn search_sessions(query: String) -> Result<Vec<Value>, String> {
+async fn search_sessions(
+    backends: State<'_, docker_backend::BackendManager>,
+    query: String,
+) -> Result<Vec<Value>, String> {
     if query.len() < 2 {
         return Ok(vec![]);
     }
 
-    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-    let claude_dir = home.join(".claude").join("projects");
+    // Host `~/.claude/projects` first, then any mounted container history dirs.
+    let roots = claude_projects_dirs(&backends).await;
 
-    if !claude_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let tracked = load_tracked_sessions();
+    let tracked = load_tracked_sessions(&roots[1.min(roots.len())..]);
     let query_lower = query.to_lowercase();
 
     let mut results: Vec<Value> = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(&claude_dir) {
+    for claude_dir in &roots {
+        if !claude_dir.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(claude_dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 if let Ok(files) = std::fs::read_dir(entry.path()) {
@@ -2157,6 +3280,7 @@ async fn search_sessions(query: String) -> Result<Vec<Value>, String> {
                     }
                 }
             }
+        }
         }
     }
 
@@ -2569,7 +3693,11 @@ async fn load_session(path: String) -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
-async fn open_in_vscode(path: String) -> Result<(), String> {
+async fn open_in_vscode(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let mut cmd = Command::new("code");
     cmd.arg(&path);
     #[cfg(target_os = "windows")]
@@ -2580,7 +3708,11 @@ async fn open_in_vscode(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn reveal_in_finder(path: String) -> Result<(), String> {
+async fn reveal_in_finder(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     #[cfg(target_os = "macos")]
     {
         // Use 'open -R' to reveal (select) the file in Finder
@@ -2613,7 +3745,11 @@ async fn reveal_in_finder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn open_with_default_app(path: String) -> Result<(), String> {
+async fn open_with_default_app(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     #[cfg(target_os = "macos")]
     {
         Command::new("open")
@@ -2669,7 +3805,12 @@ unsafe fn create_nsurl_from_path(path: &str) -> *mut objc::runtime::Object {
 
 /// Show the macOS native share sheet for a file at the current mouse position.
 #[tauri::command]
-async fn share_file(path: String, app: AppHandle) -> Result<(), String> {
+async fn share_file(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     #[cfg(target_os = "macos")]
     {
         app.run_on_main_thread(move || {
@@ -2748,39 +3889,57 @@ async fn share_file(path: String, app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Directly invoke WeChat's sharing service for a file (macOS only).
+/// Share a file to WeChat.
+///
+/// Strategy (macOS):
+///   1. Try NSSharingService — works when WeChat registers a share extension.
+///   2. Fallback: copy the file to the system pasteboard and open WeChat via
+///      its `weixin://` URL scheme so the user can paste.
+///   Returns `"fallback"` when using the clipboard path.
+///
+/// Strategy (Windows):
+///   Copy file to clipboard via PowerShell, then open WeChat via `weixin://`.
 #[tauri::command]
-async fn share_to_wechat(path: String, app: AppHandle) -> Result<(), String> {
+#[allow(deprecated)]
+async fn share_to_wechat(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    if !std::path::Path::new(&path).exists() {
+        return Err("File not found".to_string());
+    }
+
     #[cfg(target_os = "macos")]
     {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+        let path_clone = path.clone();
         app.run_on_main_thread(move || {
-            objc::rc::autoreleasepool(|| {
+            let result = objc::rc::autoreleasepool(|| -> String {
                 unsafe {
                     use objc::msg_send;
                     use objc::runtime::{Class, Object};
                     use objc::sel;
                     use objc::sel_impl;
 
-                    let file_url = create_nsurl_from_path(&path);
+                    let file_url = create_nsurl_from_path(&path_clone);
                     if file_url.is_null() {
-                        return;
+                        return "error:Failed to create file URL".to_string();
                     }
 
-                    // Create NSArray with the URL
                     let nsarray_class = Class::get("NSArray").unwrap();
                     let items: *mut Object = msg_send![nsarray_class,
                         arrayWithObject: file_url
                     ];
 
-                    // Get all sharing services for this file
                     let service_class = Class::get("NSSharingService").unwrap();
                     let services: *mut Object = msg_send![service_class,
                         sharingServicesForItems: items
                     ];
-
                     let count: usize = msg_send![services, count];
 
-                    // Find WeChat's sharing service by title
                     for i in 0..count {
                         let service: *mut Object = msg_send![services, objectAtIndex: i];
                         let title: *mut Object = msg_send![service, title];
@@ -2789,38 +3948,172 @@ async fn share_to_wechat(path: String, app: AppHandle) -> Result<(), String> {
                             continue;
                         }
                         let title_str = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
-                        if title_str.contains("WeChat") || title_str.contains("微信") {
+                        let lower = title_str.to_lowercase();
+                        if lower.contains("wechat") || title_str.contains("微信") {
                             let _: () = msg_send![service, performWithItems: items];
-                            return;
+                            return "service".to_string();
                         }
                     }
 
-                    // WeChat service not found — log for debugging
-                    eprintln!(
-                        "[share_to_wechat] WeChat sharing service not found. Available services:"
-                    );
-                    for i in 0..count {
-                        let service: *mut Object = msg_send![services, objectAtIndex: i];
-                        let title: *mut Object = msg_send![service, title];
-                        let utf8: *const std::ffi::c_char = msg_send![title, UTF8String];
-                        if !utf8.is_null() {
-                            let t = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
-                            eprintln!("  - {}", t);
-                        }
+                    // Clipboard fallback
+                    let pb_class = Class::get("NSPasteboard").unwrap();
+                    let pb: *mut Object = msg_send![pb_class, generalPasteboard];
+                    let _: () = msg_send![pb, clearContents];
+
+                    let write_arr: *mut Object = msg_send![nsarray_class,
+                        arrayWithObject: file_url
+                    ];
+                    let ok: bool = msg_send![pb, writeObjects: write_arr];
+                    if !ok {
+                        return "error:Failed to copy file to clipboard".to_string();
                     }
+
+                    let ws_class = Class::get("NSWorkspace").unwrap();
+                    let ws: *mut Object = msg_send![ws_class, sharedWorkspace];
+
+                    let scheme = "weixin://";
+                    let nsstring_class = Class::get("NSString").unwrap();
+                    let scheme_ns: *mut Object = msg_send![nsstring_class, alloc];
+                    let scheme_ns: *mut Object = msg_send![scheme_ns,
+                        initWithBytes: scheme.as_ptr() as *const std::ffi::c_void
+                        length: scheme.len()
+                        encoding: 4u64
+                    ];
+
+                    let nsurl_class = Class::get("NSURL").unwrap();
+                    let wechat_url: *mut Object = msg_send![nsurl_class,
+                        URLWithString: scheme_ns
+                    ];
+
+                    if !wechat_url.is_null() {
+                        let _: bool = msg_send![ws, openURL: wechat_url];
+                    }
+
+                    "fallback".to_string()
                 }
             });
+            let _ = tx.send(result);
         })
         .map_err(|e| format!("Failed to share to WeChat: {}", e))?;
+
+        match rx.recv() {
+            Ok(ref r) if r.starts_with("error:") => {
+                return Err(r.strip_prefix("error:").unwrap_or(r).to_string());
+            }
+            Ok(r) => return Ok(r),
+            Err(_) => return Err("Share thread communication failed".to_string()),
+        }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = app;
+        let ps_script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $fc = New-Object System.Collections.Specialized.StringCollection; \
+             $fc.Add('{}'); \
+             [System.Windows.Forms.Clipboard]::SetFileDropList($fc)",
+            path.replace('\'', "''")
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps_script])
+            .output();
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", "weixin://"])
+            .spawn();
+
+        return Ok("fallback".to_string());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = app;
         let _ = path;
+        return Err("Not supported on this platform".to_string());
+    }
+}
+
+/// NEW-Q (v3 §4.3): extract a semver triple from raw CLI version output.
+/// `claude --version` prints "2.1.92 (Claude Code)" today, but some builds
+/// prefix ANSI warnings, deprecation notices, or (on Windows) "Claude Code v"
+/// markers before the number. Earlier code used `split_whitespace().next()`
+/// which broke on any of those variants; this helper scans for the first
+/// `\d+.\d+.\d+` substring so the parse is stable across builds.
+fn extract_semver(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut dots = 0;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                if bytes[i] == b'.' {
+                    dots += 1;
+                    if dots > 2 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let candidate = &raw[start..i];
+            // Require at least x.y.z (dots == 2) and digits on both sides of
+            // each dot. `2.1.92` passes; `2.1` and `2..` do not.
+            if dots == 2 {
+                let parts: Vec<&str> = candidate.split('.').collect();
+                if parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                {
+                    return Some(candidate.to_string());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod extract_semver_tests {
+    use super::extract_semver;
+
+    #[test]
+    fn simple_version() {
+        assert_eq!(extract_semver("2.1.92"), Some("2.1.92".into()));
     }
 
-    Ok(())
+    #[test]
+    fn with_suffix() {
+        assert_eq!(
+            extract_semver("2.1.92 (Claude Code)"),
+            Some("2.1.92".into())
+        );
+    }
+
+    #[test]
+    fn with_prefix() {
+        assert_eq!(extract_semver("Claude Code v2.1.92"), Some("2.1.92".into()));
+    }
+
+    #[test]
+    fn with_warning_prefix() {
+        assert_eq!(
+            extract_semver("(node:1) Warning: ...\nclaude 2.1.92"),
+            Some("2.1.92".into())
+        );
+    }
+
+    #[test]
+    fn rejects_two_part() {
+        assert_eq!(extract_semver("2.1"), None);
+    }
+
+    #[test]
+    fn empty() {
+        assert_eq!(extract_semver(""), None);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2831,14 +4124,162 @@ struct FileNode {
     children: Option<Vec<FileNode>>,
 }
 
+// ── Path access (Phase 3 §3.1) ───────────────────────────────────────────
+//
+// Frontend entry points for recording/clearing per-tab path grants. These
+// are called after the user has explicitly authorized a path via the native
+// file dialog, OS drag-drop, or a Markdown "authorize" button.
+
 #[tauri::command]
-async fn read_file_tree(path: String, depth: Option<u32>) -> Result<Vec<FileNode>, String> {
+async fn add_path_grant(
+    path_access: State<'_, PathAccessManager>,
+    tab_id: String,
+    path: String,
+) -> Result<(), String> {
+    path_access
+        .add_grant(&tab_id, std::path::Path::new(&path))
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_path_grants(
+    path_access: State<'_, PathAccessManager>,
+    tab_id: String,
+) -> Result<(), String> {
+    path_access.clear_grants(&tab_id).await;
+    Ok(())
+}
+
+/// Decode a `~/.claude/projects/` directory name back to its source path.
+/// Used by the frontend to avoid the buggy `.replace('-', '/')` fallback
+/// that breaks on names containing hyphens (S16).
+#[tauri::command]
+async fn decode_project_dir(encoded: String) -> Result<String, String> {
+    Ok(decode_project_name(&encoded))
+}
+
+#[tauri::command]
+async fn list_docker_containers() -> Result<Vec<docker_backend::ContainerSummary>, String> {
+    let out = docker_backend::docker_capture(&["ps", "--format", "{{json .}}"]).await?;
+    Ok(docker_backend::parse_docker_ps(&out))
+}
+
+/// List a container's bind mounts (docker inspect + parse). Thin wrapper reusing
+/// the Task 2/3 parsing helpers; used by the connect dialog to offer mount roots.
+#[tauri::command]
+async fn list_container_mounts(container: String) -> Result<Vec<docker_backend::MountEntry>, String> {
+    let inspect = docker_backend::docker_capture(&["inspect", &container]).await?;
+    docker_backend::parse_inspect_mounts(&inspect)
+}
+
+/// Start a stopped container (docker start).
+#[tauri::command]
+async fn docker_start(container: String) -> Result<(), String> {
+    docker_backend::docker_capture(&["start", &container]).await.map(|_| ())
+}
+
+#[tauri::command]
+async fn connect_docker_project(
+    backends: State<'_, docker_backend::BackendManager>,
+    path_access: State<'_, PathAccessManager>,
+    container: String,
+    container_cwd: String,
+) -> Result<(), String> {
+    let inspect = docker_backend::docker_capture(&["inspect", &container]).await?;
+    if !docker_backend::parse_inspect_running(&inspect)? {
+        return Err(format!("CONTAINER_NOT_RUNNING:{}", container));
+    }
+    let mounts = docker_backend::parse_inspect_mounts(&inspect)?;
+    let mapper = docker_backend::PathMapper::new(mounts);
+    let host_cwd = mapper
+        .to_host(&container_cwd)
+        .ok_or_else(|| format!("PATH_NOT_MOUNTED:{}", container_cwd))?;
+    if !host_cwd.exists() {
+        return Err(format!("HOST_PATH_MISSING:{}", host_cwd.display()));
+    }
+    // Container-side $HOME, best-effort (used later for reading ~/.claude).
+    let home = docker_backend::docker_capture(&["exec", &container, "sh", "-c", "echo $HOME"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    path_access.register_cwd(&host_cwd).await;
+    backends
+        .register(docker_backend::DockerProject { container, mapper, home })
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn docker_preflight(container: String) -> Result<(), String> {
+    let inspect = docker_backend::docker_capture(&["inspect", &container]).await?;
+    if !docker_backend::parse_inspect_running(&inspect)? {
+        return Err(format!("CONTAINER_NOT_RUNNING:{}", container));
+    }
+    docker_backend::docker_capture(&["exec", &container, "sh", "-c", "command -v claude"])
+        .await
+        .map_err(|_| format!("CLAUDE_NOT_FOUND_IN_CONTAINER:{}", container))?;
+    Ok(())
+}
+
+/// Whether the given container's `~/.claude/projects` is readable from the host,
+/// i.e. its home directory is bind-mounted and the projects dir exists on disk.
+/// The frontend shows a "history unavailable" hint for docker projects where
+/// this is false (Task 7). `--resume` is unaffected — the in-container CLI reads
+/// its own history regardless.
+#[tauri::command]
+async fn docker_history_available(
+    backends: State<'_, docker_backend::BackendManager>,
+    container: String,
+) -> Result<bool, String> {
+    let proj = match backends.project_by_container(&container).await {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let available = proj
+        .home
+        .as_deref()
+        .and_then(|home| proj.mapper.to_host(&format!("{}/.claude/projects", home)))
+        .map(|host| host.exists())
+        .unwrap_or(false);
+    Ok(available)
+}
+
+#[tauri::command]
+async fn read_file_tree(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    depth: Option<u32>,
+) -> Result<Vec<FileNode>, String> {
+    // Keep the original (possibly container-space) path so we can look up the
+    // mapper and remap the produced host paths back to container space.
+    let original_path = path.clone();
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let mapper = backends.mapper_for_container_path(&original_path).await;
+    // Register the browsed directory as a fixed root so file operations
+    // (preview, read) work even before the first CLI session is started.
+    // Registers the TRANSLATED host path (fs operations run against host).
+    path_access.register_cwd(std::path::Path::new(&path)).await;
     let max_depth = depth.unwrap_or(5);
     let root = std::path::Path::new(&path);
     if !root.exists() {
         return Err("Directory does not exist".to_string());
     }
-    Ok(read_dir_recursive(root, 0, max_depth))
+    let mut nodes = read_dir_recursive(root, 0, max_depth);
+    if mapper.is_some() {
+        fn remap(nodes: &mut Vec<FileNode>, mapper: &Option<docker_backend::PathMapper>) {
+            for n in nodes.iter_mut() {
+                n.path = docker_backend::remap_path_out(mapper, &n.path);
+                if let Some(ref mut ch) = n.children {
+                    remap(ch, mapper);
+                }
+            }
+        }
+        remap(&mut nodes, &mapper);
+    }
+    Ok(nodes)
 }
 
 fn read_dir_recursive(dir: &std::path::Path, current_depth: u32, max_depth: u32) -> Vec<FileNode> {
@@ -2848,19 +4289,27 @@ fn read_dir_recursive(dir: &std::path::Path, current_depth: u32, max_depth: u32)
         Err(_) => return nodes,
     };
 
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by(|a, b| {
-        let a_dir = a.path().is_dir();
-        let b_dir = b.path().is_dir();
-        b_dir.cmp(&a_dir).then_with(|| {
-            a.file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(&b.file_name().to_string_lossy().to_lowercase())
+    // PATCH C (v0.10.5): snapshot is_dir() + lowercase name BEFORE sort_by.
+    //
+    // The previous closure called `a.path().is_dir()` inline — a filesystem
+    // syscall on every comparison. While the sort runs, the Claude CLI
+    // concurrently writes SDK checkpoint / temp files into the workspace,
+    // so the same entry can return `true` on one call and `false` on the next.
+    // Rust 1.81+'s strict total-order check detects this violation and panics
+    // the tokio worker thread, tearing down all async tauri commands (CLI
+    // detection, file scan, chat) → "CLI env / file manager disappears after
+    // first response" + flood of "Couldn't find callback id" warnings.
+    let mut entries_meta: Vec<(std::fs::DirEntry, bool, String)> = entries
+        .flatten()
+        .map(|e| {
+            let is_dir = e.path().is_dir();
+            let lower = e.file_name().to_string_lossy().to_lowercase();
+            (e, is_dir, lower)
         })
-    });
+        .collect();
+    entries_meta.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
 
-    for entry in entries {
+    for (entry, _, _) in entries_meta {
         let name = entry.file_name().to_string_lossy().to_string();
         // Skip specific ignored dirs (but show dotfiles like .claude, .github, .vscode)
         if name == "node_modules"
@@ -2905,20 +4354,37 @@ fn read_dir_recursive(dir: &std::path::Path, current_depth: u32, max_depth: u32)
 }
 
 #[tauri::command]
-async fn read_file_content(path: String) -> Result<String, String> {
+async fn read_file_content(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    tab_id: Option<String>,
+) -> Result<String, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Read,
+        )
+        .await?;
     // Limit to 1MB to prevent loading huge files
-    let metadata = std::fs::metadata(&path).map_err(|e| format!("Cannot read file: {}", e))?;
+    let metadata = std::fs::metadata(&p).map_err(|e| format!("Cannot read file: {}", e))?;
     if metadata.len() > 1_048_576 {
         return Err("File too large (>1MB)".to_string());
     }
-    std::fs::read_to_string(&path).map_err(|e| format!("Cannot read file: {}", e))
+    std::fs::read_to_string(&p).map_err(|e| format!("Cannot read file: {}", e))
 }
 
 /// Check if the app has file system access to a given directory.
 /// Returns Ok(true) if readable, Ok(false) if not, Err on other failures.
 /// Used at startup to detect macOS TCC restrictions.
 #[tauri::command]
-async fn check_file_access(path: String) -> Result<bool, String> {
+async fn check_file_access(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<bool, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     match std::fs::read_dir(&path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
@@ -2930,18 +4396,32 @@ async fn check_file_access(path: String) -> Result<bool, String> {
 /// Used for previewing images, PDFs, and other binary files in the webview.
 /// Limit: 50MB to prevent memory issues.
 #[tauri::command]
-async fn read_file_base64(path: String) -> Result<String, String> {
+async fn read_file_base64(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    tab_id: Option<String>,
+) -> Result<String, String> {
     use base64::Engine as _;
 
-    let metadata = std::fs::metadata(&path).map_err(|e| format!("Cannot read file: {}", e))?;
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Read,
+        )
+        .await?;
+
+    let metadata = std::fs::metadata(&p).map_err(|e| format!("Cannot read file: {}", e))?;
     if metadata.len() > 50_000_000 {
         return Err("File too large (>50MB)".to_string());
     }
 
-    let bytes = std::fs::read(&path).map_err(|e| format!("Cannot read file: {}", e))?;
+    let bytes = std::fs::read(&p).map_err(|e| format!("Cannot read file: {}", e))?;
 
     // Guess MIME type from extension
-    let ext = std::path::Path::new(&path)
+    let ext = p
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -2969,35 +4449,123 @@ async fn read_file_base64(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn write_file_content(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, &content).map_err(|e| format!("Cannot write file: {}", e))
+async fn write_file_content(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    content: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
+    std::fs::write(&p, &content).map_err(|e| format!("Cannot write file: {}", e))
 }
 
 #[tauri::command]
-async fn copy_file(src: String, dest: String) -> Result<(), String> {
-    std::fs::copy(&src, &dest)
+async fn copy_file(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    src: String,
+    dest: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let src = backends.to_host_or_passthrough(&src).await.to_string_lossy().to_string();
+    let dest = backends.to_host_or_passthrough(&dest).await.to_string_lossy().to_string();
+    let s = path_access
+        .validate(
+            std::path::Path::new(&src),
+            tab_id.as_deref(),
+            PathCapability::Read,
+        )
+        .await?;
+    let d = path_access
+        .validate(
+            std::path::Path::new(&dest),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
+    std::fs::copy(&s, &d)
         .map(|_| ())
         .map_err(|e| format!("Cannot copy file: {}", e))
 }
 
 #[tauri::command]
-async fn rename_file(src: String, dest: String) -> Result<(), String> {
-    std::fs::rename(&src, &dest).map_err(|e| format!("Cannot rename file: {}", e))
+async fn rename_file(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    src: String,
+    dest: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let src = backends.to_host_or_passthrough(&src).await.to_string_lossy().to_string();
+    let dest = backends.to_host_or_passthrough(&dest).await.to_string_lossy().to_string();
+    let s = path_access
+        .validate(
+            std::path::Path::new(&src),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
+    let d = path_access
+        .validate(
+            std::path::Path::new(&dest),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
+    std::fs::rename(&s, &d).map_err(|e| format!("Cannot rename file: {}", e))
 }
 
 #[tauri::command]
-async fn delete_file(path: String) -> Result<(), String> {
+async fn delete_file(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Delete,
+        )
+        .await?;
     // Move to system trash/recycle bin (recoverable) instead of permanent delete
-    trash::delete(&path).map_err(|e| format!("Cannot move to trash: {}", e))
+    trash::delete(&p).map_err(|e| format!("Cannot move to trash: {}", e))
 }
 
 #[tauri::command]
-async fn create_directory(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path).map_err(|e| format!("Cannot create directory: {}", e))
+async fn create_directory(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
+    std::fs::create_dir_all(&p).map_err(|e| format!("Cannot create directory: {}", e))
 }
 
 #[tauri::command]
-async fn export_session_markdown(path: String, output_path: String, conversation_only: bool) -> Result<(), String> {
+async fn export_session_markdown(
+    path: String,
+    output_path: String,
+    conversation_only: bool,
+) -> Result<(), String> {
     use std::io::{BufRead, Write};
     let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open session: {}", e))?;
     let reader = std::io::BufReader::new(file);
@@ -3040,7 +4608,9 @@ async fn export_session_markdown(path: String, output_path: String, conversation
                                         text_buf.push_str(text);
                                         text_buf.push_str("\n\n");
                                     }
-                                } else if !conversation_only && block["type"].as_str() == Some("tool_use") {
+                                } else if !conversation_only
+                                    && block["type"].as_str() == Some("tool_use")
+                                {
                                     let name = block["name"].as_str().unwrap_or("Tool");
                                     text_buf.push_str(&format!("**Tool: {}**\n\n", name));
                                     if let Some(input) = block.get("input") {
@@ -3096,23 +4666,26 @@ async fn export_session_json(path: String, output_path: String) -> Result<(), St
 
 /// List recent projects by scanning ~/.claude/projects/ directory names
 #[tauri::command]
-async fn list_recent_projects() -> Result<Vec<Value>, String> {
-    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-    let projects_dir = home.join(".claude").join("projects");
-
-    if !projects_dir.exists() {
-        return Ok(vec![]);
-    }
+async fn list_recent_projects(
+    backends: State<'_, docker_backend::BackendManager>,
+) -> Result<Vec<Value>, String> {
+    // Host `~/.claude/projects` first, then any mounted container history dirs.
+    let roots = claude_projects_dirs(&backends).await;
 
     let mut projects: HashMap<String, u64> = HashMap::new();
 
-    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+    for projects_dir in &roots {
+        if !projects_dir.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(projects_dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 let dir_name = entry.file_name().to_string_lossy().to_string();
-                let _decoded = decode_project_name(&dir_name);
-                // Get the actual path (not the shortened ~/ version)
-                let actual_path = dir_name.replace('-', "/");
+                // S16 (v3 §4.3): use the filesystem-aware decoder instead of
+                // `dir_name.replace('-', "/")` which silently mangles any
+                // project whose folder name contains a hyphen (e.g. ppt-maker).
+                let actual_path = decode_project_name(&dir_name);
 
                 // Find the most recent session file in this project
                 let mut latest: u64 = 0;
@@ -3128,11 +4701,16 @@ async fn list_recent_projects() -> Result<Vec<Value>, String> {
                     }
                 }
 
-                // Only include if the actual directory exists
-                if std::path::Path::new(&actual_path).exists() {
+                // Only include if the actual directory exists. `actual_path` may be
+                // a container path (e.g. /workspace); translate it to its host
+                // path via the backend mapper before probing so mounted docker
+                // projects are recognised. Local paths pass through unchanged.
+                let host_path = backends.to_host_or_passthrough(&actual_path).await;
+                if host_path.exists() {
                     projects.insert(actual_path.clone(), latest);
                 }
             }
+        }
         }
     }
 
@@ -3181,9 +4759,17 @@ async fn list_recent_projects() -> Result<Vec<Value>, String> {
 async fn watch_directory(
     app: AppHandle,
     state: State<'_, WatcherManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
 ) -> Result<(), String> {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
+
+    // The frontend-supplied `path` (container space) stays the map key and the
+    // "root" reported in events so unwatch_directory with the same key works.
+    // notify watches the translated host path; the callback remaps event paths
+    // back to container space using a synchronous snapshot of the mapper.
+    let host_path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let mapper = backends.mapper_for_container_path(&path).await;
 
     // Stop existing watcher for this path if any
     {
@@ -3218,18 +4804,16 @@ async fn watch_directory(
                 .paths
                 .iter()
                 .filter(|p| {
-                    !p.components().any(|c| {
-                        IGNORED_SEGMENTS
-                            .iter()
-                            .any(|seg| c.as_os_str() == *seg)
-                    })
+                    !p.components()
+                        .any(|c| IGNORED_SEGMENTS.iter().any(|seg| c.as_os_str() == *seg))
                 })
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|p| docker_backend::remap_path_out(&mapper, &p.to_string_lossy()))
                 .collect();
             if paths.is_empty() {
                 return;
             }
-            let _ = app_clone.emit(
+            let _ = emit_to_frontend(
+                &app_clone,
                 "fs:change",
                 serde_json::json!({
                     "kind": kind,
@@ -3242,7 +4826,7 @@ async fn watch_directory(
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
     watcher
-        .watch(std::path::Path::new(&path), RecursiveMode::Recursive)
+        .watch(std::path::Path::new(&host_path), RecursiveMode::Recursive)
         .map_err(|e| format!("Failed to watch: {}", e))?;
 
     let mut watchers = state.watchers.lock().await;
@@ -3260,38 +4844,96 @@ async fn unwatch_directory(state: State<'_, WatcherManager>, path: String) -> Re
 
 /// Get file size in bytes for a given path
 #[tauri::command]
-async fn get_file_size(path: String) -> Result<u64, String> {
+async fn get_file_size(
+    path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    tab_id: Option<String>,
+) -> Result<u64, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Read,
+        )
+        .await?;
     let metadata =
-        std::fs::metadata(&path).map_err(|e| format!("Cannot read file metadata: {}", e))?;
+        std::fs::metadata(&p).map_err(|e| format!("Cannot read file metadata: {}", e))?;
     Ok(metadata.len())
+}
+
+/// Ensure `{dir}/.tokenicode/tmp/` exists and `.tokenicode` is gitignored,
+/// returning the tmp dir. Shared by `save_temp_file` and `stage_external_file`
+/// so the dir-creation + gitignore logic lives in one place.
+fn ensure_tokenicode_tmp(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let tmp = dir.join(".tokenicode").join("tmp");
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+    // Ensure .tokenicode is gitignored in the user's project.
+    let gitignore = dir.join(".tokenicode").join(".gitignore");
+    if !gitignore.exists() {
+        let _ = std::fs::write(&gitignore, "*\n");
+    }
+    Ok(tmp)
+}
+
+/// Copy an external (host) file dragged in from the OS into the docker project's
+/// bind-mounted `.tokenicode/tmp/` so the in-container CLI can read it, returning
+/// the CONTAINER-space path. `cwd` is the container working dir; `src` is a host
+/// OS path.
+#[tauri::command]
+async fn stage_external_file(
+    backends: State<'_, docker_backend::BackendManager>,
+    path_access: State<'_, PathAccessManager>,
+    cwd: String,
+    src: String,
+) -> Result<String, String> {
+    // Translate the container cwd to its host mount so the copy lands in the
+    // bind-mounted project directory that the container sees.
+    let host_cwd = backends.to_host_or_passthrough(&cwd).await;
+    let tmp = ensure_tokenicode_tmp(&host_cwd)?;
+
+    // Dragging a file in from the OS is an explicit authorization — register it
+    // so follow-up frontend reads of the same path are permitted.
+    path_access.register_cwd(std::path::Path::new(&src)).await;
+
+    let filename = std::path::Path::new(&src)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    // uuid prefix keeps concurrent drops of same-named files from colliding.
+    let stamp = uuid::Uuid::new_v4().to_string();
+    let dest = tmp.join(format!("{}-{}", stamp, filename));
+    std::fs::copy(&src, &dest).map_err(|e| format!("Failed to stage file: {}", e))?;
+
+    Ok(docker_backend::staged_attachment_container_path(&cwd, &filename, &stamp))
 }
 
 /// Save a file to a temp directory and return its path.
 /// Uses a unique suffix to avoid name collisions (e.g. multiple pasted images all named "image.png").
 #[tauri::command]
 async fn save_temp_file(
+    backends: State<'_, docker_backend::BackendManager>,
     name: String,
     data: Vec<u8>,
     cwd: Option<String>,
 ) -> Result<String, String> {
+    // Translate the container cwd to a host path so the file lands in the
+    // bind-mounted project dir; snapshot the mapper so the returned path can be
+    // mapped back to container space (the frontend forwards it to the CLI).
+    let mapper = match cwd {
+        Some(ref c) => backends.mapper_for_container_path(c).await,
+        None => None,
+    };
+    let cwd = match cwd {
+        Some(c) => Some(backends.to_host_or_passthrough(&c).await.to_string_lossy().to_string()),
+        None => None,
+    };
     // If a working directory is provided, save inside it so Claude CLI can access the file.
     // Falls back to system temp if cwd is not set.
     let tmp = if let Some(ref dir) = cwd {
-        let p = std::path::PathBuf::from(dir)
-            .join(".tokenicode")
-            .join("tmp");
-        if std::fs::create_dir_all(&p).is_ok() {
-            // Ensure .tokenicode is gitignored in user's project
-            let gitignore = std::path::PathBuf::from(dir)
-                .join(".tokenicode")
-                .join(".gitignore");
-            if !gitignore.exists() {
-                let _ = std::fs::write(&gitignore, "*\n");
-            }
-            p
-        } else {
-            std::env::temp_dir().join("tokenicode")
-        }
+        ensure_tokenicode_tmp(std::path::Path::new(dir))
+            .unwrap_or_else(|_| std::env::temp_dir().join("tokenicode"))
     } else {
         std::env::temp_dir().join("tokenicode")
     };
@@ -3320,7 +4962,9 @@ async fn save_temp_file(
     let unique_name = format!("{}_{}{}{}", stem, ts, count, ext);
     let path = tmp.join(&unique_name);
     std::fs::write(&path, &data).map_err(|e| format!("Failed to write temp file: {}", e))?;
-    Ok(path.to_string_lossy().to_string())
+    // When the cwd was container-mapped, return the container-space path so the
+    // frontend can hand it to the in-container CLI.
+    Ok(docker_backend::remap_path_out(&mapper, &path.to_string_lossy()))
 }
 
 // ── Slash Commands & Skills ──────────────────────────────────────────────
@@ -3655,25 +5299,58 @@ async fn list_skills(cwd: Option<String>) -> Result<Vec<SkillInfo>, String> {
 
 /// Read a skill file and return its content
 #[tauri::command]
-async fn read_skill(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| format!("Cannot read skill file: {}", e))
+async fn read_skill(
+    path_access: State<'_, PathAccessManager>,
+    path: String,
+    tab_id: Option<String>,
+) -> Result<String, String> {
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Read,
+        )
+        .await?;
+    std::fs::read_to_string(&p).map_err(|e| format!("Cannot read skill file: {}", e))
 }
 
 /// Write content to a skill file, creating parent directories if needed
 #[tauri::command]
-async fn write_skill(path: String, content: String) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
+async fn write_skill(
+    path_access: State<'_, PathAccessManager>,
+    path: String,
+    content: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create directories: {}", e))?;
     }
-    std::fs::write(&path, &content).map_err(|e| format!("Cannot write skill file: {}", e))
+    std::fs::write(&p, &content).map_err(|e| format!("Cannot write skill file: {}", e))
 }
 
 /// Delete a skill file; remove the parent directory if it becomes empty
 #[tauri::command]
-async fn delete_skill(path: String) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
+async fn delete_skill(
+    path_access: State<'_, PathAccessManager>,
+    path: String,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Delete,
+        )
+        .await?;
+    let p = p.as_path();
     std::fs::remove_file(p).map_err(|e| format!("Failed to delete skill file: {}", e))?;
 
     // If the parent directory is now empty, remove it too
@@ -3909,9 +5586,21 @@ async fn list_all_commands(cwd: Option<String>) -> Result<Vec<UnifiedCommand>, S
 /// Toggle a skill's enabled/disabled state by writing/removing
 /// `disable-model-invocation` in its YAML frontmatter.
 #[tauri::command]
-async fn toggle_skill_enabled(path: String, enabled: bool) -> Result<(), String> {
+async fn toggle_skill_enabled(
+    path_access: State<'_, PathAccessManager>,
+    path: String,
+    enabled: bool,
+    tab_id: Option<String>,
+) -> Result<(), String> {
+    let p = path_access
+        .validate(
+            std::path::Path::new(&path),
+            tab_id.as_deref(),
+            PathCapability::Write,
+        )
+        .await?;
     let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Cannot read skill file: {}", e))?;
+        std::fs::read_to_string(&p).map_err(|e| format!("Cannot read skill file: {}", e))?;
     let new_content = if enabled {
         // Remove disable-model-invocation (or set to false)
         update_frontmatter_field(&content, "disable-model-invocation", None)
@@ -3919,7 +5608,7 @@ async fn toggle_skill_enabled(path: String, enabled: bool) -> Result<(), String>
         // Set disable-model-invocation: true
         update_frontmatter_field(&content, "disable-model-invocation", Some("true"))
     };
-    std::fs::write(&path, &new_content).map_err(|e| format!("Cannot write skill file: {}", e))
+    std::fs::write(&p, &new_content).map_err(|e| format!("Cannot write skill file: {}", e))
 }
 
 // --- Git / Shell helpers for Rewind code restore ---
@@ -4083,14 +5772,17 @@ async fn rewind_files(
     let enriched_path = build_enriched_path();
 
     let mut rewind_cmd = tokio::process::Command::new(&claude_bin);
-    rewind_cmd.args(&["--resume", &session_id, "--rewind-files", &checkpoint_uuid])
+    rewind_cmd
+        .args(&["--resume", &session_id, "--rewind-files", &checkpoint_uuid])
         .current_dir(&cwd)
         .env("PATH", &enriched_path)
         .env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1")
         .env_remove("CLAUDECODE");
     // Disable MSYS2 auto path conversion on Windows (Chinese path fix)
     #[cfg(target_os = "windows")]
-    rewind_cmd.env("MSYS_NO_PATHCONV", "1").env("MSYS2_ARG_CONV_EXCL", "*");
+    rewind_cmd
+        .env("MSYS_NO_PATHCONV", "1")
+        .env("MSYS2_ARG_CONV_EXCL", "*");
 
     let output = rewind_cmd
         .stdout(std::process::Stdio::piped())
@@ -4152,7 +5844,8 @@ async fn run_claude_command(subcommand: String, cwd: Option<String>) -> Result<S
     {
         cmd.creation_flags(0x08000000);
         // Disable MSYS2 auto path conversion on Windows (Chinese path fix)
-        cmd.env("MSYS_NO_PATHCONV", "1").env("MSYS2_ARG_CONV_EXCL", "*");
+        cmd.env("MSYS_NO_PATHCONV", "1")
+            .env("MSYS2_ARG_CONV_EXCL", "*");
     }
     if let Some(ref dir) = cwd {
         cmd.current_dir(dir);
@@ -4174,6 +5867,46 @@ async fn run_claude_command(subcommand: String, cwd: Option<String>) -> Result<S
     } else {
         let combined = format!("{}\n{}", stdout, stderr);
         Err(combined.trim().to_string())
+    }
+}
+
+/// Remove a claude.exe that Windows refuses to execute (error 193 / "16-bit application").
+///
+/// This covers the full set of known CLI locations, not just `~/.claude/local/`:
+///   - The AppLocal native-install dir (`cli_download_dir()`)
+///   - The app's npm-global prefix (where `@anthropic-ai/claude-code` lives)
+///
+/// For the npm case we also purge the `@anthropic-ai/claude-code` package dir
+/// so a subsequent scan falls back to the working `claude.cmd` shim (or triggers
+/// a clean reinstall), instead of re-discovering the same bad exe on the next run.
+#[cfg(target_os = "windows")]
+fn remove_corrupt_claude_exe(suspect_path: &str) {
+    let suspect = std::path::Path::new(suspect_path);
+    if suspect.exists() {
+        match std::fs::remove_file(suspect) {
+            Ok(()) => eprintln!("[cli_repair] removed corrupt exe: {}", suspect.display()),
+            Err(e) => eprintln!("[cli_repair] failed to remove {}: {}", suspect.display(), e),
+        }
+    }
+
+    // If the suspect lives inside our npm-global prefix, purge the pkg dir
+    // so find_claude_binary doesn't re-discover the same bad exe.
+    if let Ok(npm_dir) = npm_global_dir() {
+        let npm_dir_str = npm_dir.to_string_lossy().to_string();
+        if suspect_path.starts_with(npm_dir_str.as_str()) {
+            let pkg = npm_dir
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code");
+            if pkg.exists() {
+                match std::fs::remove_dir_all(&pkg) {
+                    Ok(()) => eprintln!("[cli_repair] removed corrupt pkg: {}", pkg.display()),
+                    Err(e) => {
+                        eprintln!("[cli_repair] failed to remove pkg {}: {}", pkg.display(), e)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4213,7 +5946,9 @@ async fn check_claude_cli() -> Result<CliStatus, String> {
                             "[check_claude_cli] --version timed out for '{}', trying fallback...",
                             path
                         );
-                        let fallback = find_claude_binary_ordered().into_iter().find(|p| p != &path);
+                        let fallback = find_claude_binary_ordered()
+                            .into_iter()
+                            .find(|p| p != &path);
                         let git_bash_missing = find_git_bash().is_none();
                         return match fallback {
                             Some(alt_path) => {
@@ -4252,7 +5987,9 @@ async fn check_claude_cli() -> Result<CliStatus, String> {
                         path
                     );
                     // The app-local binary is hanging; try to find an alternative via system PATH
-                    let fallback = find_claude_binary_ordered().into_iter().find(|p| p != &path);
+                    let fallback = find_claude_binary_ordered()
+                        .into_iter()
+                        .find(|p| p != &path);
                     let git_bash_missing = false;
                     return match fallback {
                         Some(alt_path) => {
@@ -4282,26 +6019,32 @@ async fn check_claude_cli() -> Result<CliStatus, String> {
                     if raw.is_empty() {
                         None
                     } else {
-                        // `claude --version` outputs "2.1.92 (Claude Code)" — extract just the semver
-                        let ver = raw.split_whitespace().next().unwrap_or(&raw).to_string();
-                        Some(ver)
+                        // NEW-Q: use a digit-scan parser so prefixed warnings
+                        // (node deprecation, ANSI leftovers, "Claude Code v")
+                        // don't cause us to drop the version entirely.
+                        extract_semver(&raw)
+                            .or_else(|| raw.split_whitespace().next().map(|s| s.to_string()))
                     }
                 }
                 Ok(_) => None,
                 Err(ref e) => {
                     eprintln!("check_claude_cli: failed to execute '{}': {}", path, e);
-                    // On Windows, error 193 means the binary is corrupt/incompatible.
-                    // Delete it and try to find a working alternative.
+                    // On Windows, error 193 means the binary is corrupt/incompatible
+                    // ("不支持的 16 位应用程序"). Covers two known failure modes:
+                    //   1. Native download truncated/corrupted in ~/.claude/local/
+                    //   2. npm-installed @anthropic-ai/claude-code shipped a broken
+                    //      Windows binary (upstream regression or optionalDep miss)
+                    // In both cases, delete the corrupt file at the exact path that
+                    // just failed, and for the npm case also purge the pkg so
+                    // find_claude_binary falls back to the working .cmd shim.
                     #[cfg(target_os = "windows")]
                     {
                         if e.raw_os_error() == Some(193) {
-                            eprintln!("error 193: removing corrupt binary and re-searching...");
-                            if let Some(cli_dir) = cli_download_dir() {
-                                let suspect = cli_dir.join("claude.exe");
-                                if suspect.exists() {
-                                    let _ = std::fs::remove_file(&suspect);
-                                }
-                            }
+                            eprintln!(
+                                "error 193: removing corrupt binary at '{}' and re-searching...",
+                                path
+                            );
+                            remove_corrupt_claude_exe(&path);
                             let alt = find_claude_binary();
                             let git_bash_missing = find_git_bash().is_none();
                             return match alt {
@@ -4406,19 +6149,27 @@ async fn diagnose_cli() -> Result<Vec<commands::cli_resolver::CliCandidate>, Str
                 let raw = strip_ansi(&String::from_utf8_lossy(&output.stdout))
                     .trim()
                     .to_string();
-                let ver = raw.split_whitespace().next().unwrap_or(&raw).to_string();
-                if !ver.is_empty() {
-                    candidate.version = Some(ver);
+                // NEW-Q: robust semver parse (same as check_claude_cli)
+                if let Some(ver) = extract_semver(&raw)
+                    .or_else(|| raw.split_whitespace().next().map(|s| s.to_string()))
+                {
+                    if !ver.is_empty() {
+                        candidate.version = Some(ver);
+                    }
                 }
             }
             Ok(Ok(_)) => {
-                candidate.issues.push("--version returned non-zero exit".to_string());
+                candidate
+                    .issues
+                    .push("--version returned non-zero exit".to_string());
             }
             Ok(Err(e)) => {
                 candidate.issues.push(format!("failed to execute: {}", e));
             }
             Err(_) => {
-                candidate.issues.push("--version timed out (3s)".to_string());
+                candidate
+                    .issues
+                    .push("--version timed out (3s)".to_string());
             }
         }
     }
@@ -4428,7 +6179,9 @@ async fn diagnose_cli() -> Result<Vec<commands::cli_resolver::CliCandidate>, Str
 
 /// Clean up selected CLI installations.
 #[tauri::command]
-async fn cleanup_old_cli(targets: Vec<String>) -> Result<commands::cli_resolver::CleanupResult, String> {
+async fn cleanup_old_cli(
+    targets: Vec<String>,
+) -> Result<commands::cli_resolver::CleanupResult, String> {
     Ok(commands::cli_resolver::cleanup(&targets))
 }
 
@@ -4455,6 +6208,86 @@ async fn inject_cli_path(path: String) -> Result<String, String> {
 #[tauri::command]
 async fn delete_cli(path: String) -> Result<String, String> {
     commands::cli_resolver::delete_cli(&path)
+}
+
+/// Result of a CLI repair scan: which binaries were probed, removed, kept.
+#[derive(serde::Serialize)]
+struct RepairReport {
+    scanned: Vec<String>,
+    removed: Vec<String>,
+    /// Non-fatal notes (e.g. "skipped non-app-local path").
+    notes: Vec<String>,
+}
+
+/// Scan all discoverable Claude CLI binaries, probe each by running
+/// `--version`, and remove any that fail with Windows error 193
+/// ("不支持的 16 位应用程序" / not-a-valid-Win32-application).
+///
+/// User-facing repair entry point — reached from the CLI settings tab.
+/// Safe to call on any platform (no-op on non-Windows, where error 193
+/// does not occur).
+#[tauri::command]
+async fn repair_cli() -> Result<RepairReport, String> {
+    let mut report = RepairReport {
+        scanned: Vec::new(),
+        removed: Vec::new(),
+        notes: Vec::new(),
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        report.notes.push(
+            "Repair is a Windows-specific operation (error 193 / 16-bit app). No-op here."
+                .to_string(),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let enriched_path = build_enriched_path();
+        let candidates = commands::cli_resolver::resolve_ordered();
+        for (path, _source) in candidates {
+            // Only probe .exe binaries — .cmd / .bat shims can't trigger error 193.
+            if !path.ends_with(".exe") {
+                continue;
+            }
+            report.scanned.push(path.clone());
+
+            let probe = Command::new(&path)
+                .arg("--version")
+                .env("PATH", &enriched_path)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(0x08000000)
+                .output();
+
+            let probe_result = tokio::time::timeout(std::time::Duration::from_secs(5), probe).await;
+
+            match probe_result {
+                // Timed out: leave it alone. Could be a hang, not corruption.
+                Err(_) => {
+                    report
+                        .notes
+                        .push(format!("timed out probing {} — skipped", path));
+                }
+                Ok(Ok(_)) => {
+                    // Exited (any status) — binary ran, not corrupt.
+                }
+                Ok(Err(ref e)) if e.raw_os_error() == Some(193) => {
+                    eprintln!("[repair_cli] error 193 on {} — removing", path);
+                    remove_corrupt_claude_exe(&path);
+                    report.removed.push(path);
+                }
+                Ok(Err(e)) => {
+                    report
+                        .notes
+                        .push(format!("spawn failed on {}: {}", path, e));
+                }
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 /// Detect whether the user is behind the GFW (China network).
@@ -4503,7 +6336,8 @@ async fn is_china_network() -> bool {
 /// Install Claude CLI via npm. Supports system npm or local Node.js npm.
 /// Uses --prefix to install into app-local directory when using local Node.js.
 async fn install_cli_via_npm(app: &AppHandle, china: bool) -> Result<(), String> {
-    let _ = app.emit(
+    let _ = emit_to_frontend(
+        app,
         "setup:download:progress",
         serde_json::json!({
             "downloaded": 0, "total": 0, "percent": 0, "phase": "npm_fallback"
@@ -4564,7 +6398,8 @@ async fn install_cli_via_npm(app: &AppHandle, china: bool) -> Result<(), String>
             cache_dir.display()
         );
 
-        let _ = app.emit(
+        let _ = emit_to_frontend(
+            app,
             "setup:download:progress",
             serde_json::json!({
                 "downloaded": 0, "total": 0, "percent": 50, "phase": "npm_fallback"
@@ -4605,7 +6440,8 @@ async fn install_cli_via_npm(app: &AppHandle, china: bool) -> Result<(), String>
         match result {
             Ok(Ok(output)) if output.status.success() => {
                 eprintln!("npm install succeeded via {}", registry);
-                let _ = app.emit(
+                let _ = emit_to_frontend(
+                    app,
                     "setup:download:progress",
                     serde_json::json!({
                         "downloaded": 0, "total": 0, "percent": 100, "phase": "installing"
@@ -4638,7 +6474,12 @@ async fn install_cli_via_npm(app: &AppHandle, china: bool) -> Result<(), String>
 fn version_gt(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
         // Take only the first whitespace-delimited token ("2.1.92 (Claude Code)" → "2.1.92")
-        let ver = s.trim().trim_start_matches('v').split_whitespace().next().unwrap_or("");
+        let ver = s
+            .trim()
+            .trim_start_matches('v')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
         ver.split('.')
             .filter_map(|p| p.parse::<u64>().ok())
             .collect()
@@ -4655,60 +6496,163 @@ fn version_gt(a: &str, b: &str) -> bool {
 /// Return the platform key matching the server manifest (e.g. "win32-x64").
 fn native_platform_key() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    { "win32-x64" }
+    {
+        "win32-x64"
+    }
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    { "win32-arm64" }
+    {
+        "win32-arm64"
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    { "darwin-arm64" }
+    {
+        "darwin-arm64"
+    }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    { "darwin-x64" }
+    {
+        "darwin-x64"
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    { "linux-x64" }
+    {
+        "linux-x64"
+    }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    { "linux-arm64" }
+    {
+        "linux-arm64"
+    }
 }
 
-/// Try to update the CLI by downloading a native binary from GCS.
-/// Only used for non-China users (GCS is fast globally; herear.cn bandwidth is too small
-/// for ~230MB binaries). China users go straight to npm fallback with version verification.
-async fn try_native_cli_update(china: bool) -> Result<String, String> {
-    // Skip native binary download for China — GCS may be blocked, herear.cn bandwidth too small
-    if china {
-        return Err("Native binary download skipped for China network".to_string());
+/// Probe a release base for `/latest` and return the version string.
+async fn fetch_latest_version(client: &reqwest::Client, base: &str) -> Option<String> {
+    let url = format!("{}/latest", base);
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
     }
+    let text = resp.text().await.ok()?;
+    let v = text.trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Order the two release bases, prefer the one with the highest version.
+///
+/// This protects against mirror lag: if `herear.cn` is several versions behind
+/// GCS (as happened 2026-04: GCS=2.1.114 vs mirror=2.1.92), we still serve the
+/// latest to users and log a warning. If one source is unreachable, the other
+/// is used unconditionally.
+///
+/// Returns `Vec<(base_url, version)>` in preferred order, empty if both fail.
+async fn choose_native_sources(china: bool) -> Vec<(&'static str, String)> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // China: probe both (mirror has lower latency, GCS has the freshest version).
+    // Non-China: GCS only — `herear.cn` is a China-oriented mirror with limited bandwidth.
+    let bases: Vec<&'static str> = if china {
+        vec![CLI_MIRROR_BASE, CLI_GCS_BASE]
+    } else {
+        vec![CLI_GCS_BASE]
+    };
+
+    let probes = futures_util::future::join_all(
+        bases
+            .iter()
+            .map(|b| async { (*b, fetch_latest_version(&client, b).await) }),
+    )
+    .await;
+
+    let mut available: Vec<(&'static str, String)> = probes
+        .into_iter()
+        .filter_map(|(b, v)| v.map(|v| (b, v)))
+        .collect();
+
+    if available.len() > 1 {
+        // Log lag if the china mirror is behind GCS so ops can notice.
+        if let (Some(mirror_v), Some(gcs_v)) = (
+            available
+                .iter()
+                .find(|(b, _)| *b == CLI_MIRROR_BASE)
+                .map(|(_, v)| v.clone()),
+            available
+                .iter()
+                .find(|(b, _)| *b == CLI_GCS_BASE)
+                .map(|(_, v)| v.clone()),
+        ) {
+            if version_gt(&gcs_v, &mirror_v) {
+                eprintln!(
+                    "[native_download] mirror lag detected: herear.cn={} < GCS={} — preferring GCS",
+                    mirror_v, gcs_v
+                );
+            }
+        }
+        // Sort descending by version — highest version first.
+        available.sort_by(|a, b| {
+            if version_gt(&a.1, &b.1) {
+                std::cmp::Ordering::Less
+            } else if version_gt(&b.1, &a.1) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+    }
+
+    available
+}
+
+/// Download and install a native CLI binary into `~/.claude/local/`.
+///
+/// Shared by both `install_claude_cli` (first-time install) and `update_claude_cli`
+/// (in-app update). Works for both China and non-China users:
+///   - China: probes both `herear.cn` mirror and GCS, serves whichever has the
+///     highest version (protects against mirror lag).
+///   - Non-China: GCS only.
+///
+/// Native binary install is the preferred path because it bypasses the npm
+/// optional-dependency fragility that caused TK-0.10.5's Windows install
+/// failure (bin/claude.exe shipped by `@anthropic-ai/claude-code` was corrupt,
+/// triggering Windows error 193 "16-bit application not supported").
+async fn try_native_cli_download(app: Option<&AppHandle>, china: bool) -> Result<String, String> {
+    let sources = choose_native_sources(china).await;
+    if sources.is_empty() {
+        return Err("No native release source reachable".to_string());
+    }
+    // All candidate sources agree on platform key + binary name; pick the winning
+    // version from the first source and fetch its manifest for the checksum.
+    let (primary_base, version) = sources[0].clone();
+    eprintln!(
+        "[native_download] selected source: {} @ v{}",
+        primary_base, version
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
-    let sources: Vec<&str> = vec![CLI_GCS_BASE];
-
-    // 1. Fetch latest version
-    let mut version: Option<String> = None;
-    for base in &sources {
-        let url = format!("{}/latest", base);
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    let v = text.trim().to_string();
-                    if !v.is_empty() {
-                        eprintln!("[native_update] latest version: {} (from {})", v, base);
-                        version = Some(v);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    let version = version.ok_or("Cannot fetch latest version from any source")?;
-
-    // 2. Fetch manifest for checksum
+    // 1. Fetch manifest for checksum + binary name (try sources in order).
     let platform = native_platform_key();
     let mut expected_checksum = String::new();
-    let mut binary_name = if cfg!(target_os = "windows") { "claude.exe" } else { "claude" }.to_string();
+    let mut binary_name = if cfg!(target_os = "windows") {
+        "claude.exe"
+    } else {
+        "claude"
+    }
+    .to_string();
+    let mut manifest_ok = false;
 
-    for base in &sources {
+    for (base, ver) in &sources {
+        if ver != &version {
+            continue; // skip stale mirrors — we already committed to `version`
+        }
         let url = format!("{}/{}/manifest.json", base, version);
         if let Ok(resp) = client.get(&url).send().await {
             if let Ok(manifest) = resp.json::<serde_json::Value>().await {
@@ -4719,13 +6663,20 @@ async fn try_native_cli_update(china: bool) -> Result<String, String> {
                     if let Some(bn) = info.get("binary").and_then(|v| v.as_str()) {
                         binary_name = bn.to_string();
                     }
+                    manifest_ok = true;
                     break;
                 }
             }
         }
     }
+    if !manifest_ok {
+        return Err(format!(
+            "Cannot fetch manifest for v{} on platform {}",
+            version, platform
+        ));
+    }
 
-    // 3. Determine install path: ~/.claude/local/ (same as official install.sh)
+    // 2. Install path: ~/.claude/local/ (same layout as official install.sh).
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     let install_dir = home.join(".claude").join("local");
     std::fs::create_dir_all(&install_dir)
@@ -4733,57 +6684,83 @@ async fn try_native_cli_update(china: bool) -> Result<String, String> {
     let dest_path = install_dir.join(&binary_name);
     let tmp_path = install_dir.join(format!("{}.tmp", binary_name));
 
-    // 4. Download binary (stream to disk, ~200MB)
+    // 3. Stream binary to tmp file (~200MB).
     let dl_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
 
     let mut downloaded = false;
-    for base in &sources {
+    for (base, ver) in &sources {
+        if ver != &version {
+            continue;
+        }
         let url = format!("{}/{}/{}/{}", base, version, platform, binary_name);
-        eprintln!("[native_update] downloading from {}", url);
+        eprintln!("[native_download] downloading from {}", url);
+        if let Some(h) = app {
+            let _ = emit_to_frontend(
+                h,
+                "setup:download:progress",
+                serde_json::json!({
+                    "downloaded": 0, "total": 0, "percent": 10, "phase": "native_download"
+                }),
+            );
+        }
 
         let resp = match dl_client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                eprintln!("[native_update] HTTP {} from {}", r.status(), base);
+                eprintln!("[native_download] HTTP {} from {}", r.status(), base);
                 continue;
             }
             Err(e) => {
-                eprintln!("[native_update] request failed: {} ({})", e, base);
+                eprintln!("[native_download] request failed: {} ({})", e, base);
                 continue;
             }
         };
 
+        let total_bytes = resp.content_length();
+        let mut written: u64 = 0;
         let mut stream = resp.bytes_stream();
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|e| format!("Cannot create tmp file: {e}"))?;
+        let mut file =
+            std::fs::File::create(&tmp_path).map_err(|e| format!("Cannot create tmp file: {e}"))?;
 
         use std::io::Write;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("Download stream error: {e}"))?;
             file.write_all(&chunk)
                 .map_err(|e| format!("Write error: {e}"))?;
+            written += chunk.len() as u64;
+            if let (Some(h), Some(total)) = (app, total_bytes) {
+                let percent = ((written as f64 / total as f64) * 80.0) as u64 + 10;
+                let _ = emit_to_frontend(
+                    h,
+                    "setup:download:progress",
+                    serde_json::json!({
+                        "downloaded": written, "total": total,
+                        "percent": percent.min(90), "phase": "native_download"
+                    }),
+                );
+            }
         }
         drop(file);
 
-        // 5. Verify SHA-256 checksum
+        // 4. Verify SHA-256 checksum.
         if !expected_checksum.is_empty() {
             use sha2::{Digest, Sha256};
-            let data = std::fs::read(&tmp_path)
-                .map_err(|e| format!("Cannot read tmp file: {e}"))?;
+            let data =
+                std::fs::read(&tmp_path).map_err(|e| format!("Cannot read tmp file: {e}"))?;
             let actual = format!("{:x}", Sha256::digest(&data));
             if actual != expected_checksum {
                 eprintln!(
-                    "[native_update] checksum mismatch: expected {}… got {}…",
+                    "[native_download] checksum mismatch: expected {}… got {}…",
                     &expected_checksum[..12.min(expected_checksum.len())],
                     &actual[..12.min(actual.len())]
                 );
                 let _ = std::fs::remove_file(&tmp_path);
                 continue;
             }
-            eprintln!("[native_update] checksum verified");
+            eprintln!("[native_download] checksum verified");
         }
 
         downloaded = true;
@@ -4792,43 +6769,52 @@ async fn try_native_cli_update(china: bool) -> Result<String, String> {
 
     if !downloaded {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err("All download sources failed".to_string());
+        return Err("All native download sources failed".to_string());
     }
 
-    // 6. Set executable permission and move to final location
+    // 5. Set executable permission and move to final location.
     #[cfg(not(target_os = "windows"))]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    // On Windows the running binary may be locked; try rename, then copy+delete
-    if let Err(_) = std::fs::rename(&tmp_path, &dest_path) {
-        std::fs::copy(&tmp_path, &dest_path)
-            .map_err(|e| format!("Cannot install binary: {e}"))?;
+    // On Windows the running binary may be locked; try rename, then copy+delete.
+    if std::fs::rename(&tmp_path, &dest_path).is_err() {
+        std::fs::copy(&tmp_path, &dest_path).map_err(|e| format!("Cannot install binary: {e}"))?;
         let _ = std::fs::remove_file(&tmp_path);
     }
 
-    eprintln!("[native_update] installed {} -> {}", binary_name, dest_path.display());
+    eprintln!(
+        "[native_download] installed {} -> {}",
+        binary_name,
+        dest_path.display()
+    );
     Ok(version)
 }
 
 /// Update the Claude CLI to the latest version.
-/// Strategy:
-///   Non-China: native binary from GCS → npm fallback
-///   China: npm with multi-registry + version verification (npmmirror → npm official)
+/// Strategy (same for China and non-China):
+///   Phase 1: Native binary via GCS (and herear.cn mirror for China) with lag detection
+///   Phase 2: npm multi-registry fallback with version verification
 #[tauri::command]
 async fn update_claude_cli(app: AppHandle) -> Result<String, String> {
     let china = is_china_network().await;
 
-    // Phase 1: Try native binary download (non-China only, GCS CDN)
-    match try_native_cli_update(china).await {
+    // Phase 1: Try native binary download.
+    match try_native_cli_download(Some(&app), china).await {
         Ok(version) => {
-            eprintln!("[update_claude_cli] native binary update success: v{}", version);
+            eprintln!(
+                "[update_claude_cli] native binary update success: v{}",
+                version
+            );
             return Ok(version);
         }
         Err(e) => {
-            eprintln!("[update_claude_cli] native binary skipped/failed: {}, using npm", e);
+            eprintln!(
+                "[update_claude_cli] native binary skipped/failed: {}, using npm",
+                e
+            );
         }
     }
 
@@ -4863,7 +6849,10 @@ async fn update_claude_cli(app: AppHandle) -> Result<String, String> {
             .build()
             .unwrap_or_default();
         let urls = if china {
-            vec![format!("{}/latest", CLI_MIRROR_BASE), format!("{}/latest", CLI_GCS_BASE)]
+            vec![
+                format!("{}/latest", CLI_MIRROR_BASE),
+                format!("{}/latest", CLI_GCS_BASE),
+            ]
         } else {
             vec![format!("{}/latest", CLI_GCS_BASE)]
         };
@@ -4872,7 +6861,10 @@ async fn update_claude_cli(app: AppHandle) -> Result<String, String> {
             if let Ok(resp) = c.get(url).send().await {
                 if let Ok(text) = resp.text().await {
                     let v = text.trim().to_string();
-                    if !v.is_empty() { ver = Some(v); break; }
+                    if !v.is_empty() {
+                        ver = Some(v);
+                        break;
+                    }
                 }
             }
         }
@@ -4891,9 +6883,13 @@ async fn update_claude_cli(app: AppHandle) -> Result<String, String> {
     let mut last_err = String::new();
     for registry in &registries {
         eprintln!("[update_claude_cli] trying npm registry: {}", registry);
-        let _ = app.emit("setup:download:progress", serde_json::json!({
-            "downloaded": 0, "total": 0, "percent": 30, "phase": "npm_fallback"
-        }));
+        let _ = emit_to_frontend(
+            &app,
+            "setup:download:progress",
+            serde_json::json!({
+                "downloaded": 0, "total": 0, "percent": 30, "phase": "npm_fallback"
+            }),
+        );
 
         let args: Vec<String> = vec![
             "install".to_string(),
@@ -4926,14 +6922,23 @@ async fn update_claude_cli(app: AppHandle) -> Result<String, String> {
         match result {
             Ok(Ok(output)) if output.status.success() => {
                 let check = check_claude_cli().await.unwrap_or(CliStatus {
-                    installed: false, version: None,
-                    path: None, git_bash_missing: false,
+                    installed: false,
+                    version: None,
+                    path: None,
+                    git_bash_missing: false,
                 });
                 let version = check.version.unwrap_or_else(|| "unknown".to_string());
-                eprintln!("[update_claude_cli] npm installed v{} from {}", version, registry);
-                let _ = app.emit("setup:download:progress", serde_json::json!({
-                    "downloaded": 0, "total": 0, "percent": 100, "phase": "complete"
-                }));
+                eprintln!(
+                    "[update_claude_cli] npm installed v{} from {}",
+                    version, registry
+                );
+                let _ = emit_to_frontend(
+                    &app,
+                    "setup:download:progress",
+                    serde_json::json!({
+                        "downloaded": 0, "total": 0, "percent": 100, "phase": "complete"
+                    }),
+                );
 
                 // Version verification: if target is known and installed version is stale,
                 // try next registry (npmmirror may be behind)
@@ -4943,7 +6948,10 @@ async fn update_claude_cli(app: AppHandle) -> Result<String, String> {
                             "[update_claude_cli] v{} < target v{}, trying next registry",
                             version, target
                         );
-                        last_err = format!("Mirror {} has v{} but latest is v{}", registry, version, target);
+                        last_err = format!(
+                            "Mirror {} has v{} but latest is v{}",
+                            registry, version, target
+                        );
                         continue;
                     }
                 }
@@ -4952,7 +6960,11 @@ async fn update_claude_cli(app: AppHandle) -> Result<String, String> {
             }
             Ok(Ok(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                last_err = format!("npm install failed ({}): {}", registry, stderr.chars().take(500).collect::<String>());
+                last_err = format!(
+                    "npm install failed ({}): {}",
+                    registry,
+                    stderr.chars().take(500).collect::<String>()
+                );
                 eprintln!("[update_claude_cli] {}", last_err);
             }
             Ok(Err(e)) => {
@@ -5027,7 +7039,10 @@ async fn check_cli_update() -> Result<CliUpdateCheck, String> {
             .await
         {
             let json: serde_json::Value = resp.json().await.unwrap_or_default();
-            latest = json.get("version").and_then(|v| v.as_str()).map(String::from);
+            latest = json
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(String::from);
         }
     }
 
@@ -5036,7 +7051,11 @@ async fn check_cli_update() -> Result<CliUpdateCheck, String> {
         _ => false,
     };
 
-    Ok(CliUpdateCheck { current, latest, update_available })
+    Ok(CliUpdateCheck {
+        current,
+        latest,
+        update_available,
+    })
 }
 
 /// Install the Claude CLI via npm with network-aware mirror selection:
@@ -5055,7 +7074,8 @@ async fn install_claude_cli(app: AppHandle) -> Result<(), String> {
     let can_skip_install = existing_cli.is_some();
     if can_skip_install {
         eprintln!("CLI already found on system, skipping installation");
-        let _ = app.emit(
+        let _ = emit_to_frontend(
+            &app,
             "setup:download:progress",
             serde_json::json!({
                 "downloaded": 0, "total": 0, "percent": 100, "phase": "complete"
@@ -5089,7 +7109,38 @@ async fn install_claude_cli(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    // Phase 2: Ensure npm is available
+    // Phase 2: Try native binary download first.
+    // Preferred over npm because:
+    //   (a) Binary is served directly by Anthropic's GCS bucket — no npm
+    //       optional-dependency machinery that can silently skip the
+    //       Windows-specific package (TK-0.10.5 field report).
+    //   (b) No Node.js dependency on the happy path. Node.js install is
+    //       still triggered below if native fails, so npm can take over.
+    match try_native_cli_download(Some(&app), china).await {
+        Ok(version) => {
+            eprintln!(
+                "[install_claude_cli] native binary install success: v{}",
+                version
+            );
+            finalize_cli_install_paths(&app);
+            let _ = emit_to_frontend(
+                &app,
+                "setup:download:progress",
+                serde_json::json!({
+                    "downloaded": 0, "total": 0, "percent": 100, "phase": "complete"
+                }),
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!(
+                "[install_claude_cli] native binary unavailable: {}, falling back to npm",
+                e
+            );
+        }
+    }
+
+    // Phase 3: Ensure npm is available for the fallback path.
     let has_npm = is_system_npm_available().await || get_local_node_bin().is_some();
 
     if !has_npm {
@@ -5102,7 +7153,7 @@ async fn install_claude_cli(app: AppHandle) -> Result<(), String> {
         })?;
     }
 
-    // Phase 3: Install CLI via npm
+    // Phase 4: Install CLI via npm (fallback).
     install_cli_via_npm(&app, china)
         .await
         .map_err(|npm_err| format!("CLI installation failed via npm: {}", npm_err))?;
@@ -5247,7 +7298,8 @@ fn finalize_cli_install_paths(app: &AppHandle) {
         let _ = app;
     }
 
-    let _ = app.emit(
+    let _ = emit_to_frontend(
+        app,
         "setup:download:progress",
         serde_json::json!({
             "downloaded": 0, "total": 0, "percent": 100, "phase": "complete"
@@ -5501,7 +7553,8 @@ async fn install_node_env_inner(app: &AppHandle, china: bool) -> Result<(), Stri
 
     for (i, url) in sources.iter().enumerate() {
         eprintln!("Trying Node.js download: {}", url);
-        let _ = app.emit(
+        let _ = emit_to_frontend(
+            app,
             "setup:download:progress",
             serde_json::json!({
                 "downloaded": 0, "total": 0, "percent": 0, "phase": "node_downloading"
@@ -5525,7 +7578,8 @@ async fn install_node_env_inner(app: &AppHandle, china: bool) -> Result<(), Stri
         .ok_or_else(|| format!("All Node.js download sources failed: {}", last_err))?;
 
     // Extract
-    let _ = app.emit(
+    let _ = emit_to_frontend(
+        app,
         "setup:download:progress",
         serde_json::json!({
             "downloaded": 0, "total": 0, "percent": 85, "phase": "node_extracting"
@@ -5551,7 +7605,8 @@ async fn install_node_env_inner(app: &AppHandle, china: bool) -> Result<(), Stri
         }
     }
 
-    let _ = app.emit(
+    let _ = emit_to_frontend(
+        app,
         "setup:download:progress",
         serde_json::json!({
             "downloaded": 0, "total": 0, "percent": 100, "phase": "node_complete"
@@ -5647,7 +7702,8 @@ async fn install_git_bash_inner(app: &AppHandle, china: bool) -> Result<(), Stri
 
     for url in &sources {
         eprintln!("Trying PortableGit download: {}", url);
-        let _ = app.emit(
+        let _ = emit_to_frontend(
+            app,
             "setup:download:progress",
             serde_json::json!({
                 "downloaded": 0, "total": 0, "percent": 0, "phase": "git_downloading"
@@ -5675,7 +7731,8 @@ async fn install_git_bash_inner(app: &AppHandle, china: bool) -> Result<(), Stri
     std::fs::write(&temp_path, &bytes)
         .map_err(|e| format!("Failed to write PortableGit archive: {}", e))?;
 
-    let _ = app.emit(
+    let _ = emit_to_frontend(
+        app,
         "setup:download:progress",
         serde_json::json!({
             "downloaded": 0, "total": 0, "percent": 85, "phase": "git_extracting"
@@ -5722,7 +7779,8 @@ async fn install_git_bash_inner(app: &AppHandle, china: bool) -> Result<(), Stri
         return Err("bash.exe not found after PortableGit extraction".to_string());
     }
 
-    let _ = app.emit(
+    let _ = emit_to_frontend(
+        app,
         "setup:download:progress",
         serde_json::json!({
             "downloaded": 0, "total": 0, "percent": 100, "phase": "git_complete"
@@ -5765,7 +7823,8 @@ async fn download_with_progress(
         } else {
             0
         };
-        let _ = app.emit(
+        let _ = emit_to_frontend(
+            app,
             "setup:download:progress",
             serde_json::json!({
                 "downloaded": downloaded, "total": total, "percent": percent, "phase": phase
@@ -5854,15 +7913,6 @@ fn extract_node_archive(
 /// Start the Claude OAuth login flow by running `claude login`.
 #[tauri::command]
 async fn start_claude_login(app: AppHandle) -> Result<(), String> {
-    fn emit_to_frontend(app: &AppHandle, event: &str, payload: Value) -> Result<(), String> {
-        if let Err(e1) = app.emit_to("main", event, payload.clone()) {
-            if let Err(e2) = app.emit(event, payload) {
-                return Err(format!("emit_to failed: {}, emit failed: {}", e1, e2));
-            }
-        }
-        Ok(())
-    }
-
     let claude_bin = find_claude_binary().ok_or_else(|| {
         "Claude CLI not found. Please install it first via the Setup Wizard.".to_string()
     })?;
@@ -6141,15 +8191,51 @@ async fn save_archived_sessions(data: Value) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| format!("Failed to write archived sessions: {}", e))
 }
 
+/// Load session groups (the grouping ledger) from disk.
+#[tauri::command]
+async fn load_session_groups() -> Result<Value, String> {
+    let path = tokenicode_data_path("groups.json")?;
+    if !path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read session groups: {}", e))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse session groups: {}", e))
+}
+
+/// Save session groups (the grouping ledger) to disk.
+#[tauri::command]
+async fn save_session_groups(data: Value) -> Result<(), String> {
+    let path = tokenicode_data_path("groups.json")?;
+    let content = serde_json::to_string_pretty(&data)
+        .map_err(|e| format!("Failed to serialize session groups: {}", e))?;
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write session groups: {}", e))
+}
+
+/// Max wall-clock time the title-gen spawn may run. Beyond this we return
+/// `Ok(None)` — the frontend shows a default title and the user can rename
+/// later. Chosen for two reasons:
+///   1. Title gen is best-effort cosmetic metadata; hanging the main stream on
+///      it (v0.5.2-era regression) is never acceptable.
+///   2. Haiku round-trips complete in ~2–4s typical. 10s covers cold TLS +
+///      provider warmup without tolerating outright hangs.
+const TITLE_GEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Generate a short AI title for a session by spawning a separate Claude CLI process.
 /// Uses Haiku model for fast, cheap title generation. Completely isolated from the
 /// main conversation channel — spawns a new process that exits after one response.
+///
+/// Returns:
+///   - `Ok(Some(title))` — successful, usable title
+///   - `Ok(None)` — timeout, empty/unparseable output, or provider missing haiku
+///     mapping. Caller should fall back to default title. Never blocks the UI.
+///   - `Err(msg)` — hard failure worth surfacing (binary missing, bad input).
 #[tauri::command]
 async fn generate_session_title(
     user_message: String,
     assistant_message: String,
     provider_id: Option<String>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     // Safe UTF-8 truncation (don't slice mid-character)
     fn safe_truncate(s: &str, max_bytes: usize) -> &str {
         if s.len() <= max_bytes {
@@ -6172,7 +8258,7 @@ async fn generate_session_title(
 
     // Resolve model and env vars for provider
     let (provider_env, provider_keys_to_remove, model_name) = if let Some(ref pid) = provider_id {
-        let (env, keys, _args) = resolve_provider_env(Some(pid))?;
+        let (env, keys, _args, _caps) = resolve_provider_env(Some(pid))?;
         // Find haiku tier mapping from provider
         let providers_file = load_providers()?;
         let provider = providers_file.providers.iter().find(|p| p.id == *pid);
@@ -6184,7 +8270,14 @@ async fn generate_session_title(
         });
         match haiku_model {
             Some(m) => (env, keys, m),
-            None => return Err("SKIP: no haiku mapping for provider".to_string()),
+            None => {
+                // Provider has no haiku mapping — degrade silently, don't error.
+                eprintln!(
+                    "[title-gen] provider {} has no haiku mapping, skipping",
+                    pid
+                );
+                return Ok(None);
+            }
         }
     } else {
         (
@@ -6200,7 +8293,7 @@ async fn generate_session_title(
     let enriched_path = build_enriched_path();
 
     // Spawn a one-shot CLI process: -p for single prompt, --output-format json for structured output
-    let args = vec![
+    let mut args = vec![
         "-p".to_string(),
         prompt,
         "--model".to_string(),
@@ -6211,55 +8304,80 @@ async fn generate_session_title(
         "1".to_string(),
         "--dangerously-skip-permissions".to_string(),
     ];
-
-    let mut cmd = tokio::process::Command::new(&claude_bin);
-    cmd.args(&args)
-        .env("PATH", &enriched_path)
-        .env_remove("CLAUDECODE") // Allow nested CLI launch
-        .env_remove("CLAUDE_CODE_ENTRY") // Remove any other nesting guards
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    // Disable MSYS2 auto path conversion on Windows (Chinese path fix)
-    #[cfg(target_os = "windows")]
-    cmd.env("MSYS_NO_PATHCONV", "1").env("MSYS2_ARG_CONV_EXCL", "*");
-
-    // Inject provider env vars
-    for (k, v) in &provider_env {
-        cmd.env(k, v);
-    }
-    for k in &provider_keys_to_remove {
-        cmd.env_remove(k);
+    // Title generation is a throwaway one-shot; for third-party providers limit
+    // setting sources to avoid pulling user settings into the helper call.
+    if provider_id.is_some() {
+        args.extend(["--setting-sources".to_string(), "project,local".to_string()]);
     }
 
-    // Inject proxy env vars from login shell for GUI apps
+    // Build the unified env config. Replaces ~20 lines of scattered .env /
+    // .env_remove calls with a single grep-able "ClaudeEnvConfig" site.
+    let auth_mode = if provider_id.is_some() {
+        env_manager::AuthMode::ThirdParty
+    } else {
+        env_manager::AuthMode::Native
+    };
+    let mut extra = provider_env.clone();
+
+    // Inject proxy env vars from login shell for GUI apps (macOS/Linux only)
     #[cfg(not(target_os = "windows"))]
     {
         let proxy_env = login_shell_proxy_env();
         for (k, v) in proxy_env {
-            if std::env::var(k).is_err() && !provider_env.contains_key(k) {
-                cmd.env(k, v);
+            if std::env::var(k).is_err() && !extra.contains_key(k) {
+                extra.insert(k.clone(), v.clone());
             }
         }
     }
+
+    let cfg = env_manager::ClaudeEnvConfig {
+        auth_mode,
+        enriched_path: Some(enriched_path),
+        extra,
+        extra_remove: provider_keys_to_remove,
+    };
+
+    let mut cmd = tokio::process::Command::new(&claude_bin);
+    cmd.args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    env_manager::apply_to_command(&mut cmd, &cfg);
 
     // Suppress console window on Windows
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
-    let output = cmd
+    // Spawn + wait under a timeout. If the child hangs (e.g. 401-retry loop
+    // inside the Haiku CLI when ANTHROPIC_AUTH_TOKEN was set to ""),
+    // `tokio::time::timeout` fires and we degrade instead of blocking the
+    // main streaming loop forever.
+    let child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn claude for title gen: {}", e))?
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("Failed to wait for title gen process: {}", e))?;
+        .map_err(|e| format!("Failed to spawn claude for title gen: {}", e))?;
+
+    let output = match tokio::time::timeout(TITLE_GEN_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return Err(format!("Failed to wait for title gen process: {}", e));
+        }
+        Err(_) => {
+            eprintln!(
+                "[title-gen] timed out after {}s, returning default title",
+                TITLE_GEN_TIMEOUT.as_secs()
+            );
+            return Ok(None);
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Title gen process failed: {}",
+        eprintln!(
+            "[title-gen] process failed (status={:?}): {}",
+            output.status.code(),
             stderr.chars().take(200).collect::<String>()
-        ));
+        );
+        return Ok(None);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -6275,17 +8393,17 @@ async fn generate_session_title(
             .trim_matches('"')
             .to_string();
         if title.is_empty() {
-            return Err("Empty title generated".to_string());
+            return Ok(None);
         }
-        return Ok(title);
+        return Ok(Some(title));
     }
 
     // Fallback: if not valid JSON, try to use raw stdout as title
     let raw = stdout.trim().trim_matches('"').to_string();
     if raw.is_empty() || raw.len() > 200 {
-        return Err("Could not parse title from CLI output".to_string());
+        return Ok(None);
     }
-    Ok(raw)
+    Ok(Some(raw))
 }
 
 /// Open a native terminal window to run `claude login`.
@@ -6293,14 +8411,26 @@ async fn generate_session_title(
 /// On Linux: tries common terminal emulators.
 /// On Windows: opens cmd.exe with enriched PATH.
 #[tauri::command]
-async fn open_terminal_login() -> Result<(), String> {
-    let claude_bin = find_claude_binary().ok_or_else(|| {
-        "Claude CLI not found. Please install it first via the Setup Wizard.".to_string()
-    })?;
+async fn open_terminal_login(container: Option<String>) -> Result<(), String> {
+    // Only the local (None) login needs a host `claude` binary. A container
+    // login runs `docker exec ... claude login` inside the container, so hosts
+    // without claude installed must not be blocked by find_claude_binary.
+    let claude_bin: Option<String> = match container {
+        Some(_) => None,
+        None => Some(find_claude_binary().ok_or_else(|| {
+            "Claude CLI not found. Please install it first via the Setup Wizard.".to_string()
+        })?),
+    };
 
     #[cfg(target_os = "macos")]
     {
-        let command = format!("{} login", shell_single_quote(&claude_bin));
+        let command = match container {
+            Some(ref c) => format!("docker exec -it {} claude login", shell_single_quote(c)),
+            None => format!(
+                "{} login",
+                shell_single_quote(claude_bin.as_deref().unwrap_or_default())
+            ),
+        };
         let script = format!(
             r#"tell application "Terminal"
     activate
@@ -6317,10 +8447,25 @@ end tell"#,
     #[cfg(target_os = "linux")]
     {
         // Try common terminal emulators in order of preference
-        let xterm_cmd = format!("{} login", shell_single_quote(&claude_bin));
+        let xterm_cmd = match container {
+            Some(ref c) => format!("docker exec -it {} claude login", shell_single_quote(c)),
+            None => format!(
+                "{} login",
+                shell_single_quote(claude_bin.as_deref().unwrap_or_default())
+            ),
+        };
+        // Argv fragment for the emulators that exec the program directly.
+        let prog_args: Vec<&str> = match container {
+            Some(ref c) => vec!["docker", "exec", "-it", c.as_str(), "claude", "login"],
+            None => vec![claude_bin.as_deref().unwrap_or_default(), "login"],
+        };
+        let gnome_args: Vec<&str> =
+            std::iter::once("--").chain(prog_args.iter().copied()).collect();
+        let konsole_args: Vec<&str> =
+            std::iter::once("-e").chain(prog_args.iter().copied()).collect();
         let terminals = [
-            ("gnome-terminal", vec!["--", &claude_bin, "login"]),
-            ("konsole", vec!["-e", &claude_bin, "login"]),
+            ("gnome-terminal", gnome_args),
+            ("konsole", konsole_args),
             ("xterm", vec!["-e", xterm_cmd.as_str()]),
         ];
         let mut opened = false;
@@ -6344,9 +8489,13 @@ end tell"#,
         // Spawn cmd /k with CREATE_NEW_CONSOLE to open a visible terminal window.
         // This avoids the `start` command's tricky quoting rules.
         let enriched_path = build_enriched_path();
+        let win_cmd = match container {
+            Some(ref c) => format!("docker exec -it {} claude login", c),
+            None => format!("\"{}\" login", claude_bin.as_deref().unwrap_or_default()),
+        };
         std::process::Command::new("cmd")
             .arg("/k")
-            .arg(&format!("\"{}\" login", claude_bin))
+            .arg(&win_cmd)
             .env("PATH", &enriched_path)
             .creation_flags(0x00000010) // CREATE_NEW_CONSOLE
             .spawn()
@@ -6409,7 +8558,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(ProcessManager::new())
         .manage(StdinManager::new())
+        .manage(BypassModeMap::new())
         .manage(WatcherManager::default())
+        .manage(PathAccessManager::new())
+        .manage(docker_backend::BackendManager::default())
+        .manage(wechat::runtime::WechatRuntimeHandle::new(
+            wechat::store::default_wechat_state_store(),
+        ))
+        .manage(wechat::poller::WechatPollingTask::default())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // titleBarStyle: "Overlay" in tauri.conf.json handles macOS traffic lights
@@ -6439,12 +8595,31 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
 
+            // Register test harness socket server (debug builds only).
+            // Provides a Unix socket that tokenicode-cli.mjs connects to for
+            // automated GUI testing. Release builds never include this.
+            #[cfg(debug_assertions)]
+            {
+                let mcp_config = tauri_plugin_mcp::PluginConfig::new("TOKENICODE".to_string())
+                    .start_socket_server(true)
+                    .socket_path(std::path::PathBuf::from("/tmp/tokenicode-test.sock"));
+                app.handle()
+                    .plugin(tauri_plugin_mcp::init_with_config(mcp_config))?;
+                eprintln!("[TOKENICODE] Test harness registered on /tmp/tokenicode-test.sock");
+            }
+
             #[cfg(not(desktop))]
             let _ = app;
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_docker_containers,
+            list_container_mounts,
+            connect_docker_project,
+            docker_preflight,
+            docker_history_available,
+            docker_start,
             start_claude_session,
             send_stdin,
             send_raw_stdin,
@@ -6455,6 +8630,9 @@ pub fn run() {
             list_sessions,
             search_sessions,
             load_session,
+            add_path_grant,
+            clear_path_grants,
+            decode_project_dir,
             read_file_tree,
             read_file_content,
             write_file_content,
@@ -6473,6 +8651,7 @@ pub fn run() {
             watch_directory,
             unwatch_directory,
             save_temp_file,
+            stage_external_file,
             get_file_size,
             check_file_access,
             read_file_base64,
@@ -6495,6 +8674,7 @@ pub fn run() {
             get_pinned_cli,
             inject_cli_path,
             delete_cli,
+            repair_cli,
             install_claude_cli,
             update_claude_cli,
             check_cli_update,
@@ -6509,12 +8689,25 @@ pub fn run() {
             save_pinned_sessions,
             load_archived_sessions,
             save_archived_sessions,
+            load_session_groups,
+            save_session_groups,
             generate_session_title,
             load_providers,
             save_providers,
             test_provider_connection,
             respond_permission,
             send_control_request,
+            commands::feedback::submit_feedback,
+            commands::feedback::feedback_is_configured,
+            wechat::commands::wechat_get_status,
+            wechat::commands::wechat_get_preferences,
+            wechat::commands::wechat_set_preferences,
+            wechat::commands::wechat_start_qr_login,
+            wechat::commands::wechat_poll_qr_login,
+            wechat::commands::wechat_disconnect,
+            wechat::commands::wechat_start_polling,
+            wechat::commands::wechat_stop_polling,
+            wechat::commands::wechat_set_desktop_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -6523,29 +8716,72 @@ pub fn run() {
 #[cfg(test)]
 mod decode_tests {
     use super::decode_project_name;
+    use tempfile::TempDir;
 
-    #[test]
-    fn test_simple_path() {
-        let result = decode_project_name("-Users-tinyzhuang-Documents-FocusZone");
-        assert_eq!(result, "/Users/tinyzhuang/Documents/FocusZone");
+    /// Encode a Unix absolute path the way Claude CLI encodes project dirs:
+    /// `/` → `-`, `.` before a path component → empty part (so `/.foo` → `--foo`).
+    fn encode_path(path: &str) -> String {
+        // Replace leading `/` with `-`, then all remaining `/` with `-`.
+        // Dots at the start of a component become empty parts between dashes.
+        let mut encoded = String::new();
+        for ch in path.chars() {
+            if ch == '/' {
+                encoded.push('-');
+            } else {
+                encoded.push(ch);
+            }
+        }
+        encoded
     }
 
     #[test]
-    fn test_hyphenated_dir() {
-        // ppt-maker exists on disk as a dir with hyphens in name
-        let result = decode_project_name("-Users-tinyzhuang-Desktop-ppt-maker");
-        assert_eq!(result, "/Users/tinyzhuang/Desktop/ppt-maker");
+    fn test_simple_no_ambiguity() {
+        // When no filesystem probing is needed (all parts are unambiguous
+        // single-segment names), the decoder just replaces `-` with `/`.
+        // Use a path prefix that definitely does NOT exist so the decoder
+        // falls back to segment-per-dash.
+        let result = decode_project_name("-nonexistent9999-aaa-bbb-ccc");
+        assert_eq!(result, "/nonexistent9999/aaa/bbb/ccc");
     }
 
     #[test]
-    fn test_hidden_dir_double_dash() {
-        // FocusZone/.claude-worktrees/condescending-brown
-        // "/" → "-", "." → empty part making "--"
-        let result = decode_project_name(
-            "-Users-tinyzhuang-Documents-FocusZone--claude-worktrees-condescending-brown",
+    fn test_hyphenated_dir_with_tempdir() {
+        // Create a real directory structure with a hyphenated leaf name so
+        // the filesystem probe can disambiguate.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("sub");
+        let hyphenated = base.join("ppt-maker");
+        std::fs::create_dir_all(&hyphenated).unwrap();
+
+        // Encode the path: e.g. /tmp/xxx/sub/ppt-maker
+        let full_path = hyphenated.to_string_lossy().to_string();
+        let encoded = encode_path(&full_path);
+
+        let result = decode_project_name(&encoded);
+        assert_eq!(
+            result, full_path,
+            "Decoder should find the hyphenated dir on disk and keep the hyphen"
         );
-        println!("Result: {}", result);
-        // Should contain .claude somewhere
+    }
+
+    #[test]
+    fn test_hidden_dir_double_dash_with_tempdir() {
+        // Create .claude-worktrees/condescending-brown inside a temp dir
+        let tmp = TempDir::new().unwrap();
+        let hidden = tmp
+            .path()
+            .join(".claude-worktrees")
+            .join("condescending-brown");
+        std::fs::create_dir_all(&hidden).unwrap();
+
+        let full_path = hidden.to_string_lossy().to_string();
+        let encoded = encode_path(&full_path);
+        // The `.` in `.claude-worktrees` encodes as an empty part → `--claude-worktrees`
+        let encoded = encoded.replacen("-.", "--", 1);
+
+        let result = decode_project_name(&encoded);
+        println!("Encoded: {}", encoded);
+        println!("Result:  {}", result);
         assert!(
             result.contains(".claude"),
             "Expected .claude in path, got: {}",
@@ -6554,19 +8790,116 @@ mod decode_tests {
     }
 
     #[test]
-    fn test_nested_subdir() {
-        let result = decode_project_name("-Users-tinyzhuang-Desktop-test-NiCode");
-        // test/NiCode or test-NiCode — depends on what exists on disk
-        println!("Result: {}", result);
-        assert!(result.starts_with("/Users/tinyzhuang/Desktop/test"));
+    fn test_space_in_dir_name_with_tempdir() {
+        // Create a dir with a space in its name
+        let tmp = TempDir::new().unwrap();
+        let spaced = tmp.path().join("jd 设计");
+        std::fs::create_dir_all(&spaced).unwrap();
+
+        let full_path = spaced.to_string_lossy().to_string();
+        // Claude CLI encodes spaces as dashes too (same as `/`)
+        let encoded = encode_path(&full_path).replace(' ', "-");
+
+        let result = decode_project_name(&encoded);
+        assert_eq!(
+            result, full_path,
+            "Decoder should find the space-containing dir on disk"
+        );
     }
 
     #[test]
-    fn test_space_in_dir_name() {
-        // "jd 设计" exists at ~/Desktop/jd 设计
-        let result = decode_project_name("-Users-tinyzhuang-Desktop-jd-设计");
-        println!("Result: {}", result);
-        // Should decode to "/Users/tinyzhuang/Desktop/jd 设计"
-        assert_eq!(result, "/Users/tinyzhuang/Desktop/jd 设计");
+    fn test_no_false_positive_without_dir() {
+        // When the hyphenated path does NOT exist on disk, the decoder
+        // should fall back to treating each dash as a separator.
+        let result = decode_project_name("-nonexistent9999-sub-ppt-maker");
+        assert_eq!(result, "/nonexistent9999/sub/ppt/maker");
+    }
+}
+
+#[cfg(test)]
+mod strip_thinking_tests {
+    use super::strip_thinking_from_value;
+    use serde_json::json;
+
+    #[test]
+    fn test_strip_thinking_removes_thinking_blocks() {
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "private thoughts"},
+                    {"type": "text", "text": "Hello!"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                ]
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, Some(2));
+        let content = value["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn test_strip_thinking_preserves_other_types() {
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Hello!"},
+                    {"type": "tool_use", "id": "t1", "name": "bash"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "output"},
+                ]
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, None);
+        assert_eq!(value["message"]["content"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_strip_thinking_user_message_unchanged() {
+        let mut value = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "What is 2+2?"
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, None);
+    }
+
+    #[test]
+    fn test_strip_thinking_empty_content() {
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": []
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, None);
+    }
+
+    #[test]
+    fn test_strip_thinking_only_thinking_blocks() {
+        // Edge case: all blocks are thinking — result is empty content array
+        let mut value = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "hmm"},
+                    {"type": "redacted_thinking", "data": "abc"},
+                ]
+            }
+        });
+        let stripped = strip_thinking_from_value(&mut value);
+        assert_eq!(stripped, Some(2));
+        assert_eq!(value["message"]["content"].as_array().unwrap().len(), 0);
     }
 }

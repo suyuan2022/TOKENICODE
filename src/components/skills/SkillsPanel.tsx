@@ -143,8 +143,7 @@ export function SkillsPanel() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2
-        border-b border-border-subtle">
+      <div className="flex items-center justify-between px-3 py-2">
         <div className="flex items-center gap-2 min-w-0">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
             stroke="currentColor" strokeWidth="1.5"
@@ -172,8 +171,8 @@ export function SkillsPanel() {
         </button>
       </div>
 
-      {/* Search bar */}
-      <div className="px-2 py-1.5 border-b border-border-subtle">
+      {/* Search bar — borderless, hover 较深底色 */}
+      <div className="px-2 py-1.5">
         <div className="relative">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
             stroke="currentColor" strokeWidth="1.5"
@@ -187,10 +186,10 @@ export function SkillsPanel() {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder={t('skills.search')}
-            className="w-full pl-7 pr-7 py-1 text-xs bg-bg-secondary/50
-              border border-border-subtle rounded-lg text-text-primary
+            className="w-full pl-7 pr-7 py-1.5 text-xs bg-transparent
+              rounded-lg text-text-primary
               placeholder:text-text-tertiary outline-none
-              focus:border-border-focus focus:bg-bg-input
+              hover:bg-bg-tertiary focus:bg-bg-tertiary
               transition-smooth"
           />
           {searchQuery && (

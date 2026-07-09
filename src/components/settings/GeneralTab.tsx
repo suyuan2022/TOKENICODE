@@ -1,17 +1,11 @@
 import { useRef, useCallback, useState } from 'react';
-import { useSettingsStore, MODEL_OPTIONS, ColorTheme } from '../../stores/settingsStore';
+import { useSettingsStore, ColorTheme } from '../../stores/settingsStore';
 import { useProviderStore } from '../../stores/providerStore';
 import { useT } from '../../lib/i18n';
 import { AiAvatar } from '../shared/AiAvatar';
 import { UserAvatar } from '../shared/UserAvatar';
 import { AvatarCropModal } from './AvatarCropModal';
-
-const TIER_MAP: Record<string, string> = {
-  'claude-opus-4-6': 'opus',
-  'claude-opus-4-6-1m': 'opus',
-  'claude-sonnet-4-6': 'sonnet',
-  'claude-haiku-4-5-20251001': 'haiku',
-};
+import { getModelDisplayOptions, getSelectedModelOptionId } from '../../lib/api-provider';
 
 const COLOR_THEMES: { id: ColorTheme; labelKey: string; preview: string; previewDark: string }[] = [
   {
@@ -27,10 +21,10 @@ const COLOR_THEMES: { id: ColorTheme; labelKey: string; preview: string; preview
     previewDark: '#6B9AFF',
   },
   {
-    id: 'orange',
-    labelKey: 'settings.orange',
-    preview: '#C47252',
-    previewDark: '#D4856A',
+    id: 'purple',
+    labelKey: 'settings.purple',
+    preview: '#9169BF',
+    previewDark: '#A684CC',
   },
   {
     id: 'green',
@@ -94,6 +88,8 @@ export function GeneralTab() {
   const userFileInputRef = useRef<HTMLInputElement>(null);
   const [cropFile, setCropFile] = useState<File | null>(null);
   const [cropTarget, setCropTarget] = useState<'ai' | 'user'>('ai');
+  const modelOptions = getModelDisplayOptions(activeProvider);
+  const selectedModelOptionId = getSelectedModelOptionId(selectedModel, modelOptions);
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>, target: 'ai' | 'user') => {
     const file = e.target.files?.[0];
@@ -285,29 +281,24 @@ export function GeneralTab() {
         <div>
           <h3 className="text-[13px] font-medium text-text-primary mb-2">{t('settings.defaultModel')}</h3>
           <div className="flex flex-wrap gap-2">
-            {MODEL_OPTIONS.map((model) => (
+            {modelOptions.map((model) => (
               <button
                 key={model.id}
                 onClick={() => setSelectedModel(model.id)}
                 className={`inline-flex items-center gap-1.5 px-3 py-2
                   rounded-lg text-[13px] font-medium transition-smooth
-                  ${selectedModel === model.id
+                  ${selectedModelOptionId === model.id
                     ? 'bg-accent/10 text-accent border border-accent/30'
                     : 'text-text-muted hover:bg-bg-secondary border border-border-subtle'
                   }`}
               >
-                {selectedModel === model.id && (
+                {selectedModelOptionId === model.id && (
                   <svg width="12" height="12" viewBox="0 0 16 16" fill="none"
                     stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
                     <path d="M3 8l4 4 6-7" />
                   </svg>
                 )}
-                {(() => {
-                  if (!activeProvider) return model.short;
-                  const tier = TIER_MAP[model.id];
-                  const mapping = activeProvider.modelMappings.find((mm) => mm.tier === tier);
-                  return mapping?.providerModel || model.short;
-                })()}
+                {model.label}
               </button>
             ))}
           </div>

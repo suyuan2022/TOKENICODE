@@ -2,6 +2,7 @@ import { memo, useState, useCallback, type ReactNode } from 'react';
 import { type ChatMessage } from '../../stores/chatStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { classifyPathToken, resolvePathToken } from '../../stores/fileReveal';
 import { useLightboxStore } from '../shared/ImageLightbox';
 import { useT } from '../../lib/i18n';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
@@ -58,32 +59,31 @@ function getFileExt(name: string): string {
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
 }
 
-/** Detect file paths in inline code — same regexes as MarkdownRenderer */
-const FILE_PATH_RE = /^(?:\/|\.\/|\.\.\/|[a-zA-Z]:[/\\]|src\/|lib\/|components\/|stores\/|hooks\/|utils\/|tests\/|__tests__\/)[\w.@/-]+\.\w{1,10}$/;
-const KNOWN_EXT_RE = /^[\w][\w.-]*\.(?:md|mdx|ts|tsx|js|jsx|mjs|cjs|json|jsonl|toml|yaml|yml|py|pyi|rs|go|html|htm|css|scss|sass|less|vue|svelte|sh|bash|zsh|fish|env|conf|cfg|ini|xml|sql|graphql|gql|proto|lock|log|txt|csv|rb|php|java|kt|swift|c|cpp|h|hpp|cs|r|lua|zig|ex|exs|erl|ml|mli|tf|hcl|dockerfile|makefile)$/i;
-
 /** Render a single backtick-inner segment: file path → clickable chip, else → inline code */
 function renderCodeSegment(inner: string, key: number): ReactNode {
-  if (FILE_PATH_RE.test(inner) || KNOWN_EXT_RE.test(inner)) {
+  const kind = classifyPathToken(inner);
+  if (kind) {
     const wd = useSettingsStore.getState().workingDirectory || '';
-    const resolved = inner.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(inner)
-      ? inner
-      : wd ? `${wd.replace(/\/$/, '')}/${inner}` : inner;
-    const fileName = inner.split(/[\\/]/).pop() || inner;
+    const resolved = resolvePathToken(inner, wd);
     return (
       <button
         key={key}
-        onClick={(e) => { e.stopPropagation(); useFileStore.getState().selectFile(resolved); }}
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5
-          bg-white/15 border border-white/25 rounded-md
+        onClick={(e) => {
+          e.stopPropagation();
+          // 纯定位：右侧文件区展开到该路径并高亮（不读内容、不预览）
+          useSettingsStore.getState().setSecondaryTab('files');
+          useFileStore.getState().revealPath(resolved);
+        }}
+        className="inline-flex items-center gap-1 px-2 py-0.5 mx-0.5
+          bg-white/15 border border-white/40 rounded-full
           text-xs font-medium cursor-pointer
-          hover:bg-white/25 hover:border-white/40
+          hover:bg-white/25 hover:border-white/60
           transition-all duration-150 select-none
           align-baseline leading-normal whitespace-nowrap inline-block"
         title={resolved}
       >
-        <span className="text-[10px]">📄</span>
-        <span className="max-w-[180px] truncate">{fileName}</span>
+        <span className="text-[10px] leading-none">{kind === 'folder' ? '📁' : '📄'}</span>
+        <span className="max-w-[240px] truncate">{inner}</span>
       </button>
     );
   }
@@ -138,7 +138,7 @@ function UserMsg({ message }: Props) {
   }, [content]);
 
   return (
-    <div className="flex justify-end gap-2.5 group/user relative">
+    <div className="flex justify-end gap-3 group/user relative">
       {/* Copy button — visible on hover */}
       <button
         onClick={handleCopy}
@@ -415,6 +415,8 @@ function AssistantMsg({ message, isFirstInGroup = true }: Props) {
       <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
         <MarkdownRenderer content={safeContent(message.content)} />
       </div>
+      {/* Right gutter mirrors the avatar so assistant text aligns with the user bubble's right edge */}
+      <div className="w-8 flex-shrink-0" />
     </div>
   );
 }
@@ -669,6 +671,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
     ? message.toolResultContent
     : message.toolResultContent ? JSON.stringify(message.toolResultContent) : '';
   const hasResult = resultContent.length > 0;
+  const isCompleted = message.toolCompleted || hasResult;
 
   // Render the expanded detail section
   /** Render a side-by-side diff view for Edit tool old_string → new_string */
@@ -823,7 +826,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const depth = message.subAgentDepth ?? 0;
 
   return (
-    <div className={depth > 0 ? 'ml-16 pl-3 border-l-2 border-accent/15' : 'ml-11'}>
+    <div className={depth > 0 ? 'ml-16 mr-11 pl-3 border-l-2 border-accent/15' : 'ml-11 mr-11'}>
       <button
         onClick={() => canExpand && setExpanded(!expanded)}
         className={`flex items-center gap-1.5 py-1 text-left group
@@ -842,8 +845,22 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
         <ToolIcon name={toolName} />
         <span className="text-xs font-medium text-text-muted">{label}</span>
         {renderPreview()}
+        {/* In-progress indicator: typing dots — result text is optional, completion is explicit. */}
+        {!isCompleted && (
+          <span
+            className="inline-flex items-center gap-[3px] ml-1.5 flex-shrink-0"
+            title={t('msg.toolRunning')}
+          >
+            <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot"
+              style={{ animationDelay: '0ms' }} />
+            <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot"
+              style={{ animationDelay: '200ms' }} />
+            <span className="w-1 h-1 rounded-full bg-accent animate-typing-dot"
+              style={{ animationDelay: '400ms' }} />
+          </span>
+        )}
         {/* Show a small result indicator when collapsed with result */}
-        {!expanded && hasResult && (
+        {!expanded && isCompleted && (
           <svg width="10" height="10" viewBox="0 0 12 12" fill="none"
             stroke="currentColor" strokeWidth="1.5" className="text-success flex-shrink-0 ml-0.5">
             <path d="M2.5 6l2.5 2.5 4.5-4.5" />
@@ -874,7 +891,7 @@ function ToolResultMsg({ message }: Props) {
     : '';
 
   return (
-    <div className={depth > 0 ? 'ml-16 pl-3 border-l-2 border-accent/15' : 'ml-11'}>
+    <div className={depth > 0 ? 'ml-16 mr-11 pl-3 border-l-2 border-accent/15' : 'ml-11 mr-11'}>
       <button
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-1.5 py-0.5 cursor-pointer group"
@@ -913,7 +930,7 @@ function ToolResultMsg({ message }: Props) {
 function ThinkingMsg({ message }: Props) {
   const t = useT();
   return (
-    <div className="ml-11">
+    <div className="ml-11 mr-11">
       <details className="group">
         <summary className="flex items-center gap-1.5 py-1
           cursor-pointer text-[11px] text-text-tertiary list-none select-none">
@@ -945,7 +962,7 @@ function PlanMsg({ message }: Props) {
   const items = message.planItems || (typeof message.content === 'string' ? message.content.split('\n').filter(Boolean) : []);
 
   return (
-    <div className="ml-11">
+    <div className="ml-11 mr-11">
       <button
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-1.5 py-1 cursor-pointer"
@@ -992,7 +1009,7 @@ function TodoMsg({ message }: Props) {
   const inProgressItem = items.find((i) => i.status === 'in_progress');
 
   return (
-    <div className="ml-11">
+    <div className="ml-11 mr-11">
       {/* Header — collapsible */}
       <button
         onClick={() => setExpanded(!expanded)}

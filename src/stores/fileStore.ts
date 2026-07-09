@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { bridge, FileNode, RecentProject } from '../lib/tauri-bridge';
+import { computeRevealExpansions, findNodeByPath, reconcilePathToRoot } from './fileReveal';
 
 export type FileChangeKind = 'created' | 'modified' | 'removed';
 export type PreviewMode = 'preview' | 'source' | 'edit';
@@ -16,6 +17,11 @@ interface FileState {
   isLoadingContent: boolean;
   previewMode: PreviewMode;
   rootPath: string;
+
+  // 文件树展开状态（提到全局：让「聊天点击路径 → 定位」能驱动文件树展开）
+  expandedFolders: Set<string>;
+  // 当前被定位高亮的路径（文件或文件夹，与「预览选中」解耦）
+  revealTarget: string | null;
 
   // Editing state
   editContent: string | null;     // buffer for edits (null = not dirty)
@@ -63,6 +69,10 @@ interface FileState {
   createFolder: (parentDir: string, name: string) => Promise<void>;
   // External drag state
   setDragOverTree: (v: boolean) => void;
+  // 展开/折叠单个文件夹
+  toggleFolder: (path: string) => void;
+  // 定位到某路径：展开其所有父目录（文件夹则连自身）并高亮
+  revealPath: (path: string) => void;
 }
 
 export const useFileStore = create<FileState>()((set, get) => ({
@@ -82,6 +92,8 @@ export const useFileStore = create<FileState>()((set, get) => ({
   changedFiles: new Map(),
   directoryMissing: false,
   isDragOverTree: false,
+  expandedFolders: new Set<string>(),
+  revealTarget: null,
 
   loadTree: async (path: string) => {
     if (!path) return;
@@ -138,9 +150,9 @@ export const useFileStore = create<FileState>()((set, get) => ({
 
     // Toggle selection: click again to deselect
     if (selectedFile === path) {
-      set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null });
+      set({ selectedFile: null, fileContent: null, isLoadingContent: false, editContent: null, revealTarget: null });
     } else {
-      set({ selectedFile: path, fileContent: null, isLoadingContent: true, previewMode: 'preview', editContent: null });
+      set({ selectedFile: path, fileContent: null, isLoadingContent: true, previewMode: 'preview', editContent: null, revealTarget: path });
 
       // Binary-preview files: skip text reading, render with file:// URL in FilePreview
       const ext = path.split('.').pop()?.toLowerCase() || '';
@@ -170,7 +182,25 @@ export const useFileStore = create<FileState>()((set, get) => ({
             set({ fileContent: content, isLoadingContent: false });
           }
         } catch {
-          if (get().selectedFile === path) {
+          // File read failed — might be a directory. Try common index files.
+          const dirPath = path.replace(/\/$/, '');
+          const candidates = ['SKILL.md', 'README.md', 'index.md', 'index.html', 'index.ts', 'index.tsx', 'index.js'];
+          let found = false;
+          for (const file of candidates) {
+            if (get().selectedFile !== path) break; // user navigated away
+            try {
+              const indexPath = `${dirPath}/${file}`;
+              const content = await bridge.readFileContent(indexPath);
+              if (get().selectedFile === path) {
+                set({ selectedFile: indexPath, fileContent: content, isLoadingContent: false });
+              }
+              found = true;
+              break;
+            } catch {
+              // try next candidate
+            }
+          }
+          if (!found && get().selectedFile === path) {
             set({ fileContent: '// Error loading file', isLoadingContent: false });
           }
         }
@@ -310,4 +340,27 @@ export const useFileStore = create<FileState>()((set, get) => ({
   // --- External drag state ---
 
   setDragOverTree: (v: boolean) => set({ isDragOverTree: v }),
+
+  // --- 文件树展开 / 定位 ---
+
+  toggleFolder: (path: string) => {
+    const next = new Set(get().expandedFolders);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    set({ expandedFolders: next });
+  },
+
+  revealPath: (path: string) => {
+    const { tree, rootPath, expandedFolders } = get();
+    // 容错：AI 给的绝对全路径前缀可能和真实文件系统不一致（iCloud 的
+    // com~apple~CloudDocs 常被写成 com-apple-CloudDocs 或整段缺失）→ 按工作区名对齐回真实 rootPath。
+    const target = reconcilePathToRoot(path, rootPath);
+    // 判断目标是文件还是文件夹：先在已加载的树里查，查不到回退到「末尾斜杠」
+    const node = findNodeByPath(tree, target);
+    const isDir = node ? node.is_dir : /\/$/.test(path);
+    const toExpand = computeRevealExpansions(target, rootPath, isDir);
+    const next = new Set(expandedFolders);
+    for (const p of toExpand) next.add(p);
+    set({ expandedFolders: next, revealTarget: target });
+  },
 }));

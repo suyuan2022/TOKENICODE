@@ -218,7 +218,7 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
         style={{ width: showSidebar ? `${sidebarWidth}px` : '0px' }}
       >
         <div
-          className="h-full overflow-y-auto overflow-x-hidden bg-bg-sidebar"
+          className="h-full overflow-hidden bg-bg-sidebar"
           style={{ width: `${sidebarWidth}px` }}
         >
           {sidebar}
@@ -228,10 +228,11 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
       {showSidebar && (
         <div
           onMouseDown={handleSidebarMouseDown}
-          className="w-[9px] -ml-px -mr-px h-full flex-shrink-0 relative cursor-col-resize z-10
-            flex items-center justify-center group"
+          className="w-px h-full flex-shrink-0 relative cursor-col-resize z-20
+            bg-border-subtle hover:bg-accent/40 transition-colors group"
         >
-          <div className="w-px h-full bg-border-subtle group-hover:bg-accent/40 transition-colors" />
+          {/* 拖拽热区：向两侧各扩 4px，绝对定位不占布局宽度 → 侧栏紧贴聊天区，只留 1px 分隔线 */}
+          <div className="absolute inset-y-0 -left-1 -right-1 cursor-col-resize" />
         </div>
       )}
 
@@ -240,14 +241,15 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
         {main}
       </div>
 
-      {/* File Preview resize handle — outside overflow-hidden */}
+      {/* File Preview resize handle — w-px 分隔线本体 + 悬浮热区，与侧栏手柄一致，避免 7px 透明缝隙露出背景 */}
       {isFilePreviewMode && (
         <div
           onMouseDown={handleRightMouseDown}
-          className="w-[9px] -ml-px -mr-px h-full flex-shrink-0 relative cursor-col-resize z-10
-            flex items-center justify-center group"
+          className="w-px h-full flex-shrink-0 relative cursor-col-resize z-10
+            bg-border-subtle hover:bg-accent/40 transition-colors group"
         >
-          <div className="w-px h-full bg-border-subtle group-hover:bg-accent/40 transition-colors" />
+          {/* 拖拽热区：向两侧各扩 4px，绝对定位不占布局宽度 */}
+          <div className="absolute inset-y-0 -left-1 -right-1 cursor-col-resize" />
         </div>
       )}
       {/* File Preview Panel — animates in/out */}
@@ -261,14 +263,15 @@ export function AppShell({ sidebar, main, secondary }: AppShellProps) {
         </div>
       </div>
 
-      {/* Secondary Panel resize handle — outside overflow-hidden */}
+      {/* Secondary Panel resize handle — 同上：w-px 分隔线本体 + 悬浮热区，三处分隔线统一 */}
       {secondary && showSecondary && (
         <div
           onMouseDown={handleRightMouseDown}
-          className="w-[9px] -ml-px -mr-px h-full flex-shrink-0 relative cursor-col-resize z-10
-            flex items-center justify-center group"
+          className="w-px h-full flex-shrink-0 relative cursor-col-resize z-10
+            bg-border-subtle hover:bg-accent/40 transition-colors group"
         >
-          <div className="w-px h-full bg-border-subtle group-hover:bg-accent/40 transition-colors" />
+          {/* 拖拽热区：向两侧各扩 4px，绝对定位不占布局宽度 */}
+          <div className="absolute inset-y-0 -left-1 -right-1 cursor-col-resize" />
         </div>
       )}
       {/* Secondary Panel — animates to w-0 when hidden or preview mode */}

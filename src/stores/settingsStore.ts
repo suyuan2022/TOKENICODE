@@ -1,12 +1,22 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { settingsEvents } from '../lib/settingsEvents';
+import type { WorkspaceBackend } from '../lib/tauri-bridge';
 
 // --- Types ---
 
 export type Theme = 'light' | 'dark' | 'system';
-export type ColorTheme = 'black' | 'blue' | 'orange' | 'green';
+export type ColorTheme = 'black' | 'blue' | 'purple' | 'green';
 export type SecondaryPanelTab = 'files' | 'skills';
-export type ModelId = 'claude-opus-4-6' | 'claude-opus-4-6-1m' | 'claude-sonnet-4-6' | 'claude-haiku-4-5-20251001';
+export type ModelId =
+  | 'claude-fable-5'
+  | 'claude-fable-5-1m'
+  | 'claude-opus-4-8'
+  | 'claude-opus-4-8-1m'
+  | 'claude-opus-4-6'
+  | 'claude-opus-4-6-1m'
+  | 'claude-sonnet-4-6'
+  | 'claude-haiku-4-5-20251001';
 export type SessionMode = 'code' | 'ask' | 'plan' | 'bypass';
 /** CLI permission mode for the SDK control protocol */
 export type CliPermissionMode = 'acceptEdits' | 'default' | 'plan' | 'bypassPermissions';
@@ -25,11 +35,18 @@ export type ThinkingLevel = 'off' | 'low' | 'medium' | 'high' | 'max';
 
 // --- Model options (display mapping) ---
 
+// UI display rule: each Opus generation exposes a standard (200K) and a 1M
+// variant so users can pick the larger context window explicitly. The 1M id is
+// translated to the CLI's `[1m]` model name in api-provider.ts (CLI_MODEL_MAP).
 export const MODEL_OPTIONS: { id: ModelId; label: string; short: string }[] = [
-  { id: 'claude-opus-4-6', label: 'Claude Opus 4.6', short: 'Opus 4.6' },
-  { id: 'claude-opus-4-6-1m', label: 'Claude Opus 4.6 (1M)', short: 'Opus 4.6 1M' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', short: 'Sonnet 4.6' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', short: 'Haiku 4.5' },
+  { id: 'claude-fable-5', label: 'Fable 5', short: 'Fable 5' },
+  { id: 'claude-fable-5-1m', label: 'Fable 5 (1M)', short: 'Fable 5 (1M)' },
+  { id: 'claude-opus-4-8', label: 'Opus 4.8', short: 'Opus 4.8' },
+  { id: 'claude-opus-4-8-1m', label: 'Opus 4.8 (1M)', short: 'Opus 4.8 (1M)' },
+  { id: 'claude-opus-4-6', label: 'Opus 4.6', short: 'Opus 4.6' },
+  { id: 'claude-opus-4-6-1m', label: 'Opus 4.6 (1M)', short: 'Opus 4.6 (1M)' },
+  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', short: 'Sonnet 4.6' },
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', short: 'Haiku 4.5' },
 ];
 
 // --- Store State & Actions ---
@@ -43,6 +60,9 @@ interface SettingsState {
   secondaryPanelWidth: number;
   settingsOpen: boolean;
   workingDirectory: string;
+  /** Backend hosting the current working project: local filesystem or a Docker container. */
+  workingBackend: WorkspaceBackend;
+  wechatWorkspacePath: string;
   selectedModel: string;
   sessionMode: SessionMode;
   locale: Locale;
@@ -87,7 +107,11 @@ interface SettingsState {
   setSecondaryTab: (tab: SecondaryPanelTab) => void;
   setSecondaryPanelWidth: (width: number) => void;
   toggleSettings: () => void;
+  /** Set a local-filesystem working directory; always resets backend to local. */
   setWorkingDirectory: (dir: string) => void;
+  /** Set the working project together with its backend (local or docker). */
+  setWorkingProject: (dir: string, backend: WorkspaceBackend) => void;
+  setWechatWorkspacePath: (dir: string) => void;
   setSelectedModel: (model: string) => void;
   setSessionMode: (mode: SessionMode) => void;
   setLocale: (locale: Locale) => void;
@@ -120,7 +144,7 @@ function nextTheme(current: Theme): Theme {
 
 export const useSettingsStore = create<SettingsState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       theme: 'system',
       colorTheme: 'black',
       sidebarOpen: true,
@@ -130,6 +154,8 @@ export const useSettingsStore = create<SettingsState>()(
       settingsOpen: false,
       agentPanelOpen: false,
       workingDirectory: '',
+      workingBackend: { kind: 'local' },
+      wechatWorkspacePath: '',
       selectedModel: 'claude-sonnet-4-6',
       sessionMode: 'bypass',
       locale: 'zh',
@@ -183,13 +209,25 @@ export const useSettingsStore = create<SettingsState>()(
         })),
 
       setWorkingDirectory: (dir) =>
-        set(() => ({ workingDirectory: dir })),
+        set(() => ({ workingDirectory: dir, workingBackend: { kind: 'local' } })),
 
-      setSelectedModel: (model) =>
-        set(() => ({ selectedModel: model })),
+      setWorkingProject: (dir, backend) =>
+        set(() => ({ workingDirectory: dir, workingBackend: backend })),
 
-      setSessionMode: (mode) =>
-        set(() => ({ sessionMode: mode })),
+      setWechatWorkspacePath: (dir) =>
+        set(() => ({ wechatWorkspacePath: dir.trim() })),
+
+      setSelectedModel: (model) => {
+        const old = get().selectedModel;
+        set(() => ({ selectedModel: model }));
+        if (old !== model) settingsEvents.emit('model-changed', { old, next: model });
+      },
+
+      setSessionMode: (mode) => {
+        const old = get().sessionMode;
+        set(() => ({ sessionMode: mode }));
+        if (old !== mode) settingsEvents.emit('session-mode-changed', { old, next: mode });
+      },
 
       setLocale: (locale) =>
         set(() => ({ locale })),
@@ -212,8 +250,11 @@ export const useSettingsStore = create<SettingsState>()(
       setSetupCompleted: (completed) =>
         set(() => ({ setupCompleted: completed })),
 
-      setThinkingLevel: (level) =>
-        set(() => ({ thinkingLevel: level })),
+      setThinkingLevel: (level) => {
+        const old = get().thinkingLevel;
+        set(() => ({ thinkingLevel: level }));
+        if (old !== level) settingsEvents.emit('thinking-changed', { old, next: level });
+      },
 
       setUpdateAvailable: (available, version) =>
         set(() => ({
@@ -241,13 +282,13 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'tokenicode-settings',
-      version: 6,
+      version: 8,
       migrate: (persistedState: unknown, version: number) => {
         const persisted = persistedState as Record<string, unknown>;
         if (version === 0) {
           // Migrate legacy model IDs to current ones
           const legacyMap: Record<string, ModelId> = {
-            'claude-opus-4-0': 'claude-opus-4-6',
+            'claude-opus-4-0': 'claude-opus-4-8',
             'claude-sonnet-4-0': 'claude-sonnet-4-6',
             'claude-haiku-3-5': 'claude-haiku-4-5-20251001',
           };
@@ -284,6 +325,23 @@ export const useSettingsStore = create<SettingsState>()(
             persisted.selectedModel = 'claude-haiku-4-5-20251001';
           }
         }
+        // v7 migration removed (Phase 2 §2.5 / §5.1): users are free to pick
+        // 4.6 / 4.6-1m / 4.7 / 4.7-1m. The earlier migration forcibly rewrote
+        // 4.6 selections to 4.7, which silently broke old-CLI users.
+        if (version < 8) {
+          // 4.7 is retired in favor of 4.8. Only remap the two existing 4.7
+          // selections to their 4.8 equivalents — never force-rewrite any other
+          // model (4.8 is a CLI-supported model, so this is a same-tier upgrade,
+          // not the v7-style unconditional rewrite that broke old-CLI users).
+          const opusUpgradeMap: Record<string, ModelId> = {
+            'claude-opus-4-7': 'claude-opus-4-8',
+            'claude-opus-4-7-1m': 'claude-opus-4-8-1m',
+          };
+          const current = persisted.selectedModel as string;
+          if (current && opusUpgradeMap[current]) {
+            persisted.selectedModel = opusUpgradeMap[current];
+          }
+        }
         return persisted;
       },
       partialize: (state) => ({
@@ -291,12 +349,16 @@ export const useSettingsStore = create<SettingsState>()(
         colorTheme: state.colorTheme,
         sidebarOpen: state.sidebarOpen,
         secondaryPanelWidth: state.secondaryPanelWidth,
-        // workingDirectory intentionally NOT persisted — app starts at WelcomeScreen
+        // workingDirectory intentionally NOT persisted — app starts at WelcomeScreen.
+        // workingBackend is likewise NOT persisted: BackendManager is in-memory,
+        // so a persisted docker backend would be a phantom after restart (wrong
+        // badge, wrong history banner, misrouted spawn).
         selectedModel: state.selectedModel,
         sessionMode: state.sessionMode,
         locale: state.locale,
         fontSize: state.fontSize,
         sidebarWidth: state.sidebarWidth,
+        wechatWorkspacePath: state.wechatWorkspacePath,
         setupCompleted: state.setupCompleted,
         thinkingLevel: state.thinkingLevel,
         updateAvailable: state.updateAvailable,
@@ -342,6 +404,14 @@ export function setSessionModeLocal(mode: SessionMode): void {
   useSettingsStore.getState().setSessionMode(mode);
 }
 
+// Phase 2 §2.3 runtime sync policy:
+//
+// - sessionMode change → SDK control protocol `set_permission_mode` on the
+//   live session (no kill). Handled here.
+// - selectedModel / thinkingLevel / activeProviderId change → DO NOT kill.
+//   InputBar.handleSubmit detects the spawnConfigHash mismatch on the next
+//   user send and handles teardown + resume spawn. Killing here would drop
+//   in-flight turns and cross-tab races between the sidebar and pre-warm.
 useSettingsStore.subscribe((state, prevState) => {
   if (state.sessionMode === prevState.sessionMode) return;
 

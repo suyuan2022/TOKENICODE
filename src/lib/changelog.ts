@@ -19,6 +19,433 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.11.0',
+    date: '2026-06-10',
+    highlights: {
+      zh: [
+        '新增「会话分组」：左侧会话可以建组收纳，拖拽排序、右键管理',
+        '新增 Claude Fable 5 模型（最强档位），可选标准版和 1M 大上下文版',
+        '主题新增紫色（替换原橘色），界面细节整体打磨',
+        'HTML 文件支持实时预览，聊天里的文件路径识别更聪明',
+      ],
+      en: [
+        'New session groups: organize sessions into groups with drag-to-reorder and right-click management',
+        'Added Claude Fable 5 (the most capable tier) — standard and 1M-context variants',
+        'New purple theme (replaces orange) with overall UI polish',
+        'HTML live preview, plus smarter file-path detection in chat',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新增', en: 'New' },
+        items: {
+          zh: [
+            '会话分组 — 工作区下可建「组」收纳会话：组卡片拖拽重排、右键归组/移出/重命名/删除、组内直接新建会话；会话文件永不移动，归组换组不影响续聊',
+            'Claude Fable 5 模型支持 — 列表新增 Fable 5 标准版和 1M 上下文版并置顶，默认模型仍是 Sonnet 4.6',
+            'HTML 实时预览 — 预览 HTML 文件时脚本可执行，交互页面直接看到运行效果',
+          ],
+          en: [
+            'Session groups — create groups under a workspace to organize sessions: drag group cards to reorder, right-click to assign/remove/rename/delete, create sessions inside a group; session files never move, so resuming is never affected',
+            'Claude Fable 5 support — standard and 1M-context variants added at the top of the model list; default stays Sonnet 4.6',
+            'HTML live preview — scripts run inside the HTML preview so interactive pages render for real',
+          ],
+        },
+      },
+      {
+        label: { zh: '改进', en: 'Improved' },
+        items: {
+          zh: [
+            '紫主题替换橘色 — 原来选橘色的会自动切换，气泡对齐、圆角、深色卡片配色整体打磨',
+            '文件路径识别更聪明 — 隐藏目录（.claude/）、无扩展名路径（src/build）、中文文件名都能点击定位，正文里的裸路径自动可点',
+            '旧版 CLI 选 Fable 5 时给出明确的「请升级 CLI」提示，不再误导你去换模型',
+          ],
+          en: [
+            'Purple theme replaces orange — existing orange users switch automatically; bubble alignment, radii and dark-card colors polished throughout',
+            'Smarter file-path detection — hidden dirs (.claude/), extension-less paths (src/build) and CJK filenames are all clickable; bare paths in messages become clickable too',
+            'Selecting Fable 5 on an outdated CLI now shows a clear "please update your CLI" hint instead of suggesting a model switch',
+          ],
+        },
+      },
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '流式内容不再被缓存清理误伤 — 有未投递流式文本的会话不会被后台清理，已经看到的内容不再静默丢失（发现自 @suyuan2022）',
+            '新建会话掉组 — 新会话拿到正式 id 后仍留在原来的组里',
+          ],
+          en: [
+            'Streaming content protected from cache eviction — sessions with undelivered streamed text are never evicted, so what you saw never silently disappears (originally reported by @suyuan2022)',
+            'New sessions no longer fall out of their group once they receive a real session id',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.8',
+    date: '2026-05-29',
+    highlights: {
+      zh: [
+        '新增 Claude Opus 4.8 模型，可选标准版和 1M 大上下文版',
+        '原来用 Opus 4.7 的会自动切到 4.8，不用手动改',
+        '修复拖拽文件落点和微信分享的几个问题',
+      ],
+      en: [
+        'Added Claude Opus 4.8 — choose the standard or 1M-context variant',
+        'Existing Opus 4.7 selections migrate to Opus 4.8 automatically',
+        'Fixed file drag-and-drop positioning and WeChat sharing',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新增', en: 'New' },
+        items: {
+          zh: [
+            'Claude Opus 4.8 模型支持 — 列表新增 Opus 4.8 标准版和 1M 上下文版并置顶，默认模型仍是 Sonnet 4.6',
+            '原来选 Opus 4.7 的设置会自动迁移到 Opus 4.8',
+          ],
+          en: [
+            'Claude Opus 4.8 support — standard and 1M-context variants added at the top of the model list; default stays Sonnet 4.6',
+            'Existing Opus 4.7 selections are migrated to Opus 4.8 automatically',
+          ],
+        },
+      },
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '拖拽文件落点更准 — 拖拽改用 Webview API + DPR 感知坐标，高分屏下识别更准（从 Her 同步，#209）',
+            '微信分享更可靠 — 增加剪贴板 + URL scheme 兜底（从 Her 同步，#214）',
+          ],
+          en: [
+            'More accurate file drag-and-drop — switched to the Webview drag API with DPR-aware coordinates for high-DPI displays (synced from Her, #209)',
+            'More reliable WeChat sharing — added clipboard + URL scheme fallback (synced from Her, #214)',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.7',
+    date: '2026-04-27',
+    highlights: {
+      zh: [
+        '会话生命周期和流式体验稳定性大修，切会话 / 切模型更稳',
+        'API 重试和限流状态会直接显示在对话活动区',
+        '移除外部 Web Font 依赖，改用本地系统字体栈',
+      ],
+      en: [
+        'Session lifecycle and streaming stability overhaul for safer session/model switching',
+        'API retry and rate-limit status now appears directly in the activity area',
+        'Removed external web font dependency and switched to the local system font stack',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '会话生命周期和流式体验稳定性大修 — 切会话 / 切 Provider / 切 Model 时的清理统一走 lifecycle 入口，减少 stdin 路由串台',
+            '子进程隐性退出时界面会正确收尾，不会一直转圈',
+            'Stop 之后再发消息继续走当前会话，Thinking 计时器不再闪负数',
+            'Provider 流式体验贴近原生 CLI，减少重复 thinking 块，stop / interrupt 后能恢复',
+            '本地系统字体栈 — 移除外部 Web Font 依赖，离线或网络不稳定时界面字体也能稳定加载',
+          ],
+          en: [
+            'Session lifecycle and streaming stability overhaul — cleanup now goes through the lifecycle path when switching sessions, providers, or models, reducing stdin route cross-talk',
+            'Hidden child-process exits now finalize the UI correctly instead of spinning forever',
+            'Sending after Stop stays in the current session, and the thinking timer no longer flashes negative values',
+            'Provider streaming is closer to the native CLI, with fewer duplicate thinking blocks and recovery after stop / interrupt',
+            'Local system font stack — removed the external web font dependency so typography stays stable offline or on poor networks',
+          ],
+        },
+      },
+      {
+        label: { zh: '新增', en: 'New' },
+        items: {
+          zh: [
+            '能力边界加固 — Markdown 图片 / HTML/SVG 预览 / 文件系统授权走后端路径校验',
+            'Opus 4.7 规范化 — CLI 模型名统一到明确的 1M variant',
+            '.test CLI 测试框架 — 覆盖 lifecycle / routing / provider / interrupt / streaming 多组回归场景',
+          ],
+          en: [
+            'Capability boundary hardening — Markdown images, HTML/SVG preview, and filesystem access now go through backend path validation',
+            'Opus 4.7 normalization — CLI model names now map to the explicit 1M variant',
+            '.test CLI framework — regression coverage for lifecycle, routing, provider, interrupt, and streaming flows',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.6',
+    date: '2026-04-18',
+    highlights: {
+      zh: [
+        'Windows 装不上 Claude CLI 的问题修好了（「不支持的 16 位应用程序」）',
+        '一批切会话、中断消息、卡「运行中」的老毛病都修了',
+        '跟 CC Switch 共存时会给出友好提示',
+      ],
+      en: [
+        'Fixed Windows Claude CLI install failure ("16-bit application not supported")',
+        'Batch of fixes for workspace switching, interrupted messages, and stuck "running" sessions',
+        'Friendly notice when CC Switch is installed alongside',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新增', en: 'New' },
+        items: {
+          zh: [
+            '跟 CC Switch 共存时的友好提示 — 检测到同时装了 CC Switch，设置里会直接告诉你它俩怎么配合，不用自己琢磨',
+          ],
+          en: [
+            'CC Switch coexistence notice — when both are installed, Settings tells you how they work together',
+          ],
+        },
+      },
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            'Windows 装不上 Claude CLI — 之前装完打开会弹「不支持的 16 位应用程序」完全没法用。这版改成从官方直接下载绕开问题包，遇到坏掉的 CLI 会自动识别清理；设置 → CLI 新增「修复」按钮一键清理重装；国内用户自动挑版本最新的下载源',
+            '连续切换会话偶尔串流 / 丢流 — 刚切过去的会话看到别人的内容，或者自己发的消息直接没了。修好',
+            '中断消息后再发，容易绑错位置 — 重发的消息会误贴到上一条被中断的记录上。修好',
+            '重启后有会话卡在「运行中」 — 明明已经结束，界面上还一直转圈。修好',
+            '改完设置要刷新才生效 — 现在改完立即响应',
+            '标题生成偶尔卡住 — 加了 10 秒超时，不会再无限等待',
+          ],
+          en: [
+            'Windows Claude CLI install — previously crashed with "16-bit application not supported" and was unusable. Now downloads from the official source directly, self-heals corrupt installs, and Settings → CLI has a one-click Repair button. Mainland users auto-select the most up-to-date mirror',
+            'Occasional stream cross-talk / missing messages when switching sessions quickly — fixed',
+            'Sending after interrupting a message could attach the new message to the wrong record — fixed',
+            'Sessions stuck spinning as "running" after restart — fixed',
+            'Settings changes required a refresh to take effect — now instant',
+            'Title generation occasionally hung — now has a 10 s timeout',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.5',
+    date: '2026-04-17',
+    highlights: {
+      zh: [
+        '紧急修复：第三方 Provider 在 v0.10.3+ 下不响应',
+        '紧急修复：频繁切换工作区后界面整体冻结',
+      ],
+      en: [
+        'Hot-fix: third-party providers unresponsive since v0.10.3',
+        'Hot-fix: UI freeze after frequent workspace switches',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '第三方 Provider 发消息不响应 — v0.10.3 对 ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN 写入空字符串让 CLI 进入 OAuth 路径触发 oauth_token_refresh 死锁；--setting-sources project,local 又让 CLI 对第三方 endpoint 构造错误请求 → 429。去掉两处后，env_remove 路径仍保留防 CCswitch 继承',
+            '频繁切换工作区后 CLI 管理 / 文件树 / chat 整体冻结 — read_dir_recursive 的 sort_by closure 在比较时调 is_dir() 文件系统 syscall，CLI 同时写 SDK checkpoint 文件导致同一 entry 两次返回不同值，Rust 1.81+ 严格 total-order 检查 panic tokio worker，所有 async command 挂起。改为预先缓存 is_dir() 再排序',
+          ],
+          en: [
+            'Third-party providers unresponsive — v0.10.3 wrote empty strings to ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN pushing the CLI onto the OAuth path which deadlocked via oauth_token_refresh; --setting-sources project,local also caused the CLI to build bad requests against third-party endpoints → 429. Both removed; env_remove path retained to still block CCswitch inheritance',
+            'UI freeze after workspace switches — read_dir_recursive\'s sort_by closure called is_dir() per comparison; concurrent SDK checkpoint writes made the same entry return inconsistent values, violating Rust 1.81+\'s strict total-order check, panicking tokio worker and hanging all async tauri commands. Now caches is_dir() before sorting',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.4',
+    date: '2026-04-17',
+    highlights: {
+      zh: [
+        'Opus 4.7 支持 — 默认 1M 上下文，老版本号自动迁移',
+        '滚动条改成自动隐藏 — 鼠标悬停时才浮现',
+      ],
+      en: [
+        'Opus 4.7 support — 1M context by default, legacy model IDs auto-migrated',
+        'Auto-hide scrollbars — fade in on hover, invisible otherwise',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新功能', en: 'New' },
+        items: {
+          zh: [
+            'Claude Opus 4.7 模型支持 — 默认 1M 上下文窗口，无需额外 beta flag；老用户的 claude-opus-4-6 / -1m 设置会自动迁移到 claude-opus-4-7',
+          ],
+          en: [
+            'Claude Opus 4.7 model support — 1M context by default, no beta flag needed; legacy claude-opus-4-6 / -1m settings auto-migrate to claude-opus-4-7',
+          ],
+        },
+      },
+      {
+        label: { zh: '改进', en: 'Improved' },
+        items: {
+          zh: [
+            '滚动条改成自动隐藏 — 默认不可见，指针移入可滚动区域时才淡入；粗细从 5px 调到 6px，视觉更轻盈',
+          ],
+          en: [
+            'Auto-hide scrollbars — invisible by default, fade in on hover over scrollable regions; width tuned from 5px to 6px',
+          ],
+        },
+      },
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '标题生成命令 401 错误 — Claude Desktop 注入的 OAuth token 通过环境变量污染第三方 Provider 的 title gen，三层防御：env 清除 + --setting-sources + args 可变声明',
+          ],
+          en: [
+            'Title-gen 401 errors — Claude Desktop\'s OAuth token polluted title-gen for third-party providers; fixed with env cleanup + --setting-sources + mutable args declaration',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.3',
+    date: '2026-04-16',
+    highlights: {
+      zh: [
+        'Cmd+F 页内文本查找',
+        'CCswitch + Claude Desktop 共存 — 第三方 Provider 不再 401',
+      ],
+      en: [
+        'Cmd+F find in page',
+        'CCswitch + Claude Desktop coexistence — third-party providers no longer 401',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新功能', en: 'New' },
+        items: {
+          zh: ['Cmd+F / Ctrl+F 页内文本查找 — 实时高亮 + 上下跳转'],
+          en: ['Cmd+F / Ctrl+F find in page — live highlighting + navigation'],
+        },
+      },
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            'Claude Desktop 启动时继承的 CLAUDE_CODE_OAUTH_TOKEN 覆盖第三方 Provider API Key 导致 401 — env 清除 + 空字符串覆盖 + gateway 拦截 oauth_token_refresh',
+            'hook_started/progress/response/status/api_retry 事件导致控制台大量警告 — 静默处理',
+          ],
+          en: [
+            'CLAUDE_CODE_OAUTH_TOKEN inherited from Claude Desktop overrides third-party API Key causing 401 — env cleanup + empty string override + gateway blocks oauth_token_refresh',
+            'hook_started/progress/response/status/api_retry events flooding console — silently handled',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.2',
+    date: '2026-04-11',
+    highlights: {
+      zh: [
+        '新增用户反馈通道，设置里一键提交',
+        '流式输出卡死大修 — 孤儿缓冲、停滞看门狗、打断保留一整套',
+        '切换模型不再 400 报错',
+        '/compact 在后台 tab 完成时不再卡住转圈',
+        '工具调用有运行中动画，消息可排队发送',
+      ],
+      en: [
+        'New in-app feedback channel in Settings',
+        'Stream stuck fixes — orphan buffer, stall watchdog, interrupt preservation',
+        'Model switching no longer hits 400 errors',
+        '/compact no longer freezes when it completes on a background tab',
+        'Tool calls animate while running, new messages can queue up',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新功能', en: 'New' },
+        items: {
+          zh: [
+            '提交反馈 — 设置里新增「反馈」tab，可以直接给开发者发问题或建议，支持粘贴截图，会自动带上应用版本、系统、Provider、Model 等诊断信息，无需打开 GitHub',
+          ],
+          en: [
+            'Submit Feedback — a new "Feedback" tab in Settings lets you send bug reports or suggestions directly to the developer, with screenshot paste support; app version, OS, provider, and model are attached automatically — no GitHub account needed',
+          ],
+        },
+      },
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '流式输出偶尔卡住、结尾漏字 — 新增孤儿缓冲队列 + 3 秒停滞看门狗，路由失效时缓冲不再被静默清空',
+            '按停止按钮后已流出的文字丢失 — 现在会作为一条消息保留在对话里',
+            '切换模型后 400 "invalid thinking signature" 报错 — 改为在 resume 前直接清理 JSONL 中的 thinking 块',
+            '切换 Provider 后的 signature 不匹配 — 同步清理本地 thinking 历史',
+            '/compact 在后台 tab 完成时卡片一直转圈 — 前后台的 pending command 状态现在都会在 result/assistant 到达时清理',
+            '切换 tab 时 thinking 内容丢失 — 后台 tab 的 stream handler 现在也处理 thinking_delta',
+            '子 agent 请求权限时锁住主输入框 — 权限请求现在携带 parent_tool_use_id / agent_id 以区分层级',
+            '从 Finder 拖文件到输入框会同时插入文件 chip 和原始文本路径 — 新增 drop 拦截',
+            'Rewind 后事件偶尔路由到错误 tab — killProcess 现在会清理 stdin → tab 映射',
+            '流式缓冲区对中文字符使用字节切片导致 panic，进而杀死整个 stdout 读取任务 — 改为安全的字符边界检查',
+            '"注入 PATH" 之前写的是错误的 marker 且反复点击会累积多个块（#79）— 现在会拒绝无效 CLI 候选（broken symlink / 空目录 / 非可执行文件），marker 正名为 `# Added by TOKENICODE`，每次注入前先剥离自己的历史块',
+          ],
+          en: [
+            'Stream output occasionally stalled or dropped trailing characters — added orphan buffer queue + 3-second stall watchdog; flushes are no longer silently discarded when routing is unresolved',
+            'Streamed text was lost when the Stop button was pressed — it is now preserved as a regular message in the transcript',
+            '"Invalid thinking signature" 400 errors after switching model — JSONL thinking blocks are now stripped before --resume',
+            'Provider switch signature mismatch — local thinking history is cleaned on provider change as well',
+            '/compact command card spun forever when it completed on a background tab — pendingCommand state is now cleared from both foreground and background handlers',
+            'Thinking content disappeared after tab switching — background stream handler now processes thinking_delta',
+            'Sub-agent permission requests locked the main input bar — requests now carry parent_tool_use_id / agent_id to identify their layer',
+            'Finder file drag inserted both a file chip and a raw text path — added drop interception',
+            'Events occasionally routed to the wrong tab after Rewind — killProcess now cleans up the stdin → tab mapping',
+            'Stream buffer byte-slicing panicked on Chinese characters and killed the entire stdout reader task — now uses safe char-boundary checks',
+            '"Inject PATH" wrote a wrong marker and accumulated duplicate blocks on repeat clicks (#79) — now rejects invalid CLI candidates (broken symlinks, empty dirs, non-executable files), marker renamed to `# Added by TOKENICODE`, and each inject strips its own historical blocks first',
+          ],
+        },
+      },
+      {
+        label: { zh: '改进', en: 'Improved' },
+        items: {
+          zh: [
+            '工具调用运行中会显示 3 个跳动的圆点动画，长任务不再像死机',
+            '当前 AI 正在回复时按 Enter 发送的新消息会进入排队队列，等回复完成后自动合并发送',
+            'ModelSelector 下拉和底部按钮现在都显示实际调用的 provider 模型名（如 mimo-v2-pro），而非 Claude tier 名',
+            '重连状态下 ActivityIndicator 会显示明确的"重连中"提示',
+          ],
+          en: [
+            'Running tool calls now show a 3-dot typing animation so long tasks no longer look frozen',
+            'Messages sent while AI is still replying now queue up and merge into a single follow-up when the reply finishes',
+            'ModelSelector dropdown and collapsed button now both show the actual provider model name (e.g. mimo-v2-pro) instead of the Claude tier label',
+            'Reconnecting state is now explicitly shown in the ActivityIndicator',
+          ],
+        },
+      },
+    ],
+  },
+  {
+    version: '0.10.1',
+    date: '2026-04-09',
+    highlights: {
+      zh: ['修复输出偶尔卡住的问题', '同名文件夹不再混淆'],
+      en: ['Fix occasional output freeze', 'Same-name folders now distinguishable'],
+    },
+    categories: [
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '流式输出偶尔卡死 — 新增定时兜底机制，长对话时输出不再停在某个字不动',
+            '不同路径的同名文件夹现在能正确区分 — 显示父级目录（如「A (桌面)」vs「A (坚果云)」）',
+          ],
+          en: [
+            'Streaming output freeze — added timer fallback so output never gets stuck mid-response',
+            'Same-name folders from different paths now show parent directory for disambiguation',
+          ],
+        },
+      },
+    ],
+  },
+  {
     version: '0.10.0',
     date: '2026-04-05',
     highlights: {
@@ -264,7 +691,6 @@ export const CHANGELOG: ChangelogEntry[] = [
         label: { zh: '修复', en: 'Fixed' },
         items: {
           zh: [
-            'macOS FD limit 崩溃 — 启动时抬高至 65536',
             'Markdown 渲染崩溃白屏 — MarkdownErrorBoundary 隔离',
             '切换模型后 SESSION_ALREADY_ACTIVE 报错',
             '后台 Agent Team 切换会话后静默终止',
@@ -278,7 +704,6 @@ export const CHANGELOG: ChangelogEntry[] = [
             'Agent Team 副代理不显示',
           ],
           en: [
-            'macOS FD limit crash — raise to 65536 at startup',
             'Markdown rendering crash — MarkdownErrorBoundary isolation',
             'SESSION_ALREADY_ACTIVE after model switch',
             'Background Agent Team silently terminated on tab switch',

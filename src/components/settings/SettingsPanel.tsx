@@ -8,8 +8,10 @@ import { GeneralTab } from './GeneralTab';
 import { ProviderTab } from './ProviderTab';
 import { CliTab } from './CliTab';
 import { McpTab } from './McpTab';
+import { FeedbackTab } from './FeedbackTab';
+import { WechatTab } from './WechatTab';
 
-type SettingsTab = 'general' | 'provider' | 'cli' | 'mcp';
+type SettingsTab = 'general' | 'provider' | 'cli' | 'mcp' | 'wechat' | 'feedback';
 
 const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
   general: (
@@ -39,6 +41,20 @@ const TAB_ICONS: Record<SettingsTab, React.ReactNode> = {
       <circle cx="4" cy="11" r="0.75" fill="currentColor" />
     </svg>
   ),
+  wechat: (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 7a4.5 4.5 0 018.2 2.6L13 12l-3.6-.8A4.8 4.8 0 017.8 12H7a5 5 0 01-5-5z" />
+      <path d="M9.5 4.2A4 4 0 0114 8a3.8 3.8 0 01-.9 2.5" />
+      <circle cx="5.7" cy="7" r=".45" fill="currentColor" />
+      <circle cx="8.3" cy="7" r=".45" fill="currentColor" />
+    </svg>
+  ),
+  feedback: (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 3h12a1 1 0 011 1v7a1 1 0 01-1 1H6l-3 3V4a1 1 0 011-1z" />
+      <path d="M5 6.5h6M5 9h4" />
+    </svg>
+  ),
 };
 
 const TAB_ITEMS: { id: SettingsTab; labelKey: string }[] = [
@@ -46,6 +62,8 @@ const TAB_ITEMS: { id: SettingsTab; labelKey: string }[] = [
   { id: 'provider', labelKey: 'settings.tab.provider' },
   { id: 'cli', labelKey: 'settings.tab.cli' },
   { id: 'mcp', labelKey: 'settings.tab.mcp' },
+  { id: 'wechat', labelKey: 'settings.tab.wechat' },
+  { id: 'feedback', labelKey: 'settings.tab.feedback' },
 ];
 
 export function SettingsPanel() {
@@ -73,7 +91,8 @@ export function SettingsPanel() {
       {/* Panel */}
       <div className="relative w-[min(90vw,960px)] max-h-[85vh] min-h-[500px]
         rounded-2xl bg-bg-card border border-border-subtle shadow-2xl
-        overflow-hidden animate-fade-in flex flex-col">
+        overflow-hidden animate-fade-in flex flex-col"
+        {...(import.meta.env.DEV && { 'data-testid': 'settings-panel' })}>
 
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4
@@ -82,6 +101,7 @@ export function SettingsPanel() {
             {t('settings.title')}
           </h2>
           <button onClick={toggleSettings}
+            {...(import.meta.env.DEV && { 'data-testid': 'settings-close-button' })}
             className="p-1.5 rounded-lg hover:bg-bg-tertiary
               text-text-tertiary transition-smooth">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
@@ -99,6 +119,7 @@ export function SettingsPanel() {
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
+                {...(import.meta.env.DEV && { 'data-testid': `settings-tab-${tab.id}` })}
                 className={`w-full flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-[13px]
                   font-medium transition-smooth text-left whitespace-nowrap
                   ${activeTab === tab.id
@@ -121,6 +142,8 @@ export function SettingsPanel() {
             {activeTab === 'provider' && <ProviderTab />}
             {activeTab === 'cli' && <CliTab />}
             {activeTab === 'mcp' && <McpTab />}
+            {activeTab === 'wechat' && <WechatTab />}
+            {activeTab === 'feedback' && <FeedbackTab />}
           </div>
         </div>
 

@@ -1,5 +1,6 @@
 import { useMemo, useCallback, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import DOMPurify from 'dompurify';
 import CodeMirror from '@uiw/react-codemirror';
 import { javascript } from '@codemirror/lang-javascript';
 import { python } from '@codemirror/lang-python';
@@ -193,8 +194,8 @@ export function FilePreview() {
 
   return (
     <div className="flex flex-col h-full bg-bg-primary" onKeyDown={handleKeyDown}>
-      {/* Header bar — pt-6 for macOS traffic lights, z-10 above iframe content */}
-      <div className="flex items-center justify-between px-3 pt-6 pb-2
+      {/* Header bar — h-[68px]+pt-[20px] 与聊天顶栏完全一致，顶部分隔线对齐；z-10 above iframe content */}
+      <div className="flex items-center justify-between h-[68px] px-3 pt-[20px]
         border-b border-border-subtle bg-bg-secondary/50 flex-shrink-0 relative z-10">
         <div className="flex items-center gap-2 min-w-0 flex-1">
           <FileIcon name={fileName} size={16} className="flex-shrink-0 text-text-muted" />
@@ -386,19 +387,26 @@ export function FilePreview() {
             }}
           />
         ) : previewMode === 'preview' && isHtml && fileContent !== null && selectedFile ? (
-          /* HTML preview: inject <base> tag so relative CSS/JS/images resolve correctly */
-          <iframe
-            srcDoc={injectBaseTag(fileContent, selectedFile)}
-            sandbox="allow-same-origin allow-scripts"
-            className="w-full h-full bg-white border-0"
-            title={fileName}
-          />
+          /* HTML live preview — local desktop files, full scripts allowed */
+          <div className="w-full h-full flex flex-col bg-white">
+            <iframe
+              srcDoc={injectBaseTag(fileContent, selectedFile)}
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+              className="flex-1 w-full bg-white border-0"
+              title={fileName}
+            />
+          </div>
         ) : previewMode === 'preview' && isSvg && fileContent !== null ? (
-          /* SVG preview: render inline */
+          /* SVG preview — v3 Phase 3 §3.4: sanitize via DOMPurify to strip
+             <script>, javascript: URLs, event handlers, and other XSS vectors. */
           <div className="flex items-center justify-center h-full p-4 overflow-auto">
             <div
               className="max-w-full max-h-full selectable"
-              dangerouslySetInnerHTML={{ __html: fileContent }}
+              dangerouslySetInnerHTML={{
+                __html: DOMPurify.sanitize(fileContent, {
+                  USE_PROFILES: { svg: true, svgFilters: true },
+                }),
+              }}
             />
           </div>
         ) : previewMode === 'preview' && isMarkdown && fileContent !== null ? (

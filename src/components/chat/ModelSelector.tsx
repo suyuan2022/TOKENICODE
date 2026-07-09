@@ -1,26 +1,9 @@
 import { useState, useRef, useEffect, useMemo, Fragment } from 'react';
-import { useSettingsStore, MODEL_OPTIONS } from '../../stores/settingsStore';
+import { useSettingsStore } from '../../stores/settingsStore';
 import { useChatStore, generateMessageId } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useProviderStore } from '../../stores/providerStore';
-
-/** Tier mapping from official ModelId to provider tier key */
-const TIER_MAP: Record<string, 'opus' | 'sonnet' | 'haiku'> = {
-  'claude-opus-4-6': 'opus',
-  'claude-opus-4-6-1m': 'opus',
-  'claude-sonnet-4-6': 'sonnet',
-  'claude-haiku-4-5-20251001': 'haiku',
-};
-
-const FIXED_TIERS = new Set(['opus', 'sonnet', 'haiku']);
-
-interface DisplayOption {
-  id: string;
-  label: string;
-  short: string;
-  mapped: boolean;
-  isExtra: boolean;
-}
+import { getModelDisplayOptions, getSelectedModelOptionId, type ModelDisplayOption } from '../../lib/api-provider';
 
 export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
   const selectedModel = useSettingsStore((s) => s.selectedModel);
@@ -44,46 +27,19 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
     return () => document.removeEventListener('mousedown', handler);
   }, [open]);
 
-  // Build display options: official Claude models + extra models from provider.
-  // Deduplicate: if multiple Claude models map to the same provider model, keep only the first.
-  const displayOptions = useMemo((): DisplayOption[] => {
-    if (!activeProvider || activeProvider.modelMappings.length === 0) {
-      return MODEL_OPTIONS.map((m) => ({ id: m.id, label: m.label, short: m.short, mapped: false, isExtra: false }));
-    }
-
-    // Official models with tier mapping.
-    // When multiple Claude models map to the same provider model (e.g. Opus and Opus 1M
-    // both map to "mimo-v2-pro"), keep both entries with their original labels so the user
-    // can still distinguish them — the 1M variant uses a higher context window (#139 port).
-    const official = MODEL_OPTIONS.map((m) => {
-      const tier = TIER_MAP[m.id];
-      const mapping = activeProvider.modelMappings.find((mm) => mm.tier === tier);
-      if (mapping?.providerModel) {
-        return { id: m.id, label: `${m.short} → ${mapping.providerModel}`, short: m.short, mapped: true, isExtra: false };
-      }
-      return { id: m.id, label: m.label, short: m.short, mapped: false, isExtra: false };
-    });
-
-    // Extra models (non-tier mappings added by user)
-    const extras: DisplayOption[] = activeProvider.modelMappings
-      .filter((m) => !FIXED_TIERS.has(m.tier) && m.tier && m.providerModel)
-      .map((m) => {
-        const short = m.providerModel.includes('/')
-          ? m.providerModel.split('/').pop()!
-          : m.providerModel;
-        return { id: m.tier, label: m.providerModel, short, mapped: true, isExtra: true };
-      });
-
-    return [...official, ...extras];
+  const displayOptions = useMemo((): ModelDisplayOption[] => {
+    return getModelDisplayOptions(activeProvider);
   }, [activeProvider]);
+  const selectedOptionId = getSelectedModelOptionId(selectedModel, displayOptions);
 
-  const current = displayOptions.find((m) => m.id === selectedModel) || displayOptions[0];
+  const current = displayOptions.find((m) => m.id === selectedOptionId) || displayOptions[0];
 
   return (
     <div ref={ref} className="relative">
       <button
         onClick={() => !disabled && setOpen(!open)}
         disabled={disabled}
+        {...(import.meta.env.DEV && { 'data-testid': 'model-selector' })}
         className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg
           text-xs text-text-muted hover:text-text-primary
           hover:bg-bg-secondary transition-smooth
@@ -111,8 +67,9 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
                 <div className="border-t border-border-subtle my-1" />
               )}
               <button
+                {...(import.meta.env.DEV && { 'data-testid': `model-option-${option.id}` })}
                 onClick={() => {
-                  if (option.id !== selectedModel) {
+                  if (option.id !== selectedOptionId) {
                     const oldShort = current.short;
                     const newShort = option.short;
                     setSelectedModel(option.id);
@@ -133,7 +90,7 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
                 }}
                 className={`w-full text-left px-3 py-2 text-xs
                   transition-smooth flex items-center justify-between
-                  ${option.id === selectedModel
+                  ${option.id === selectedOptionId
                     ? 'text-accent bg-accent/5'
                     : 'text-text-muted hover:text-text-primary hover:bg-bg-secondary'
                   }`}
@@ -141,7 +98,7 @@ export function ModelSelector({ disabled = false }: { disabled?: boolean }) {
                 <div className="min-w-0">
                   <div className={`font-medium truncate ${option.mapped ? 'font-mono' : ''}`}>{option.label}</div>
                 </div>
-                {option.id === selectedModel && (
+                {option.id === selectedOptionId && (
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none"
                     stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="shrink-0 ml-2">
                     <path d="M3 8l3.5 3.5L13 5" />

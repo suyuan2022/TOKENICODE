@@ -115,7 +115,7 @@ pub fn is_native_binary(path: &Path) -> bool {
                     | [0xFE, 0xED, 0xFA, 0xCF]  // Mach-O 64-bit BE
                     | [0xFE, 0xED, 0xFA, 0xCE]  // Mach-O 32-bit BE
                     | [0xCA, 0xFE, 0xBA, 0xBE]  // Universal/fat binary
-                    | [0x7F, 0x45, 0x4C, 0x46]   // ELF
+                    | [0x7F, 0x45, 0x4C, 0x46] // ELF
                 );
             }
         }
@@ -163,9 +163,12 @@ pub fn is_valid_executable(path: &Path) -> bool {
                 // Native binary
                 if matches!(
                     magic,
-                    [0xCF, 0xFA, 0xED, 0xFE] | [0xCE, 0xFA, 0xED, 0xFE]
-                    | [0xFE, 0xED, 0xFA, 0xCF] | [0xFE, 0xED, 0xFA, 0xCE]
-                    | [0xCA, 0xFE, 0xBA, 0xBE] | [0x7F, 0x45, 0x4C, 0x46]
+                    [0xCF, 0xFA, 0xED, 0xFE]
+                        | [0xCE, 0xFA, 0xED, 0xFE]
+                        | [0xFE, 0xED, 0xFA, 0xCF]
+                        | [0xFE, 0xED, 0xFA, 0xCE]
+                        | [0xCA, 0xFE, 0xBA, 0xBE]
+                        | [0x7F, 0x45, 0x4C, 0x46]
                 ) {
                     return true;
                 }
@@ -305,7 +308,10 @@ fn cmd_with_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> String {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    eprintln!("[cli_resolver] cmd_with_timeout: '{}' timed out ({}s)", cmd, timeout_secs);
+                    eprintln!(
+                        "[cli_resolver] cmd_with_timeout: '{}' timed out ({}s)",
+                        cmd, timeout_secs
+                    );
                     return String::new();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -524,10 +530,7 @@ fn collect_tiered_dirs() -> Vec<TieredDir> {
                         .collect();
                     version_dirs.sort_by(|a, b| {
                         let parse_ver = |p: &Path| -> (u32, u32, u32) {
-                            let name = p
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy();
+                            let name = p.file_name().unwrap_or_default().to_string_lossy();
                             let s = name.strip_prefix('v').unwrap_or(&name);
                             let parts: Vec<u32> =
                                 s.split('.').filter_map(|x| x.parse().ok()).collect();
@@ -834,17 +837,17 @@ pub fn cleanup(targets: &[String]) -> CleanupResult {
                         removed.push(claude_pkg.to_string_lossy().to_string());
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[cli_resolver] failed to remove npm package: {}",
-                            e
-                        );
+                        eprintln!("[cli_resolver] failed to remove npm package: {}", e);
                     }
                 }
             }
             // Windows: npm_global_dir is flat, no lib/node_modules
             #[cfg(target_os = "windows")]
             {
-                let claude_pkg_win = npm_dir.join("node_modules").join("@anthropic-ai").join("claude-code");
+                let claude_pkg_win = npm_dir
+                    .join("node_modules")
+                    .join("@anthropic-ai")
+                    .join("claude-code");
                 if claude_pkg_win.exists() {
                     let _ = std::fs::remove_dir_all(&claude_pkg_win);
                 }
@@ -865,7 +868,10 @@ fn classify_path(path: &str) -> CliSource {
     if let Some(npm_bin) = crate::get_npm_global_bin() {
         app_local_prefixes.push(npm_bin.to_string_lossy().to_string());
     }
-    if app_local_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
+    if app_local_prefixes
+        .iter()
+        .any(|p| path.starts_with(p.as_str()))
+    {
         return CliSource::AppLocal;
     }
 
@@ -897,7 +903,10 @@ pub fn find_binary() -> Option<String> {
         if is_native_binary(p) || is_valid_executable(p) {
             return Some(pinned);
         }
-        eprintln!("[cli_resolver] pinned CLI '{}' is no longer valid, falling back", pinned);
+        eprintln!(
+            "[cli_resolver] pinned CLI '{}' is no longer valid, falling back",
+            pinned
+        );
     }
     resolve().map(|(path, _)| path)
 }
@@ -930,14 +939,13 @@ pub fn get_pinned_cli() -> Option<String> {
 pub fn pin_cli(path: &str) -> Result<(), String> {
     let pin_path = pin_file_path().ok_or("Cannot determine home directory")?;
     if let Some(parent) = pin_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create dir: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create dir: {}", e))?;
     }
-    let pin = CliPin { path: path.to_string() };
-    let json = serde_json::to_string_pretty(&pin)
-        .map_err(|e| format!("JSON error: {}", e))?;
-    std::fs::write(&pin_path, json)
-        .map_err(|e| format!("Failed to write pin file: {}", e))?;
+    let pin = CliPin {
+        path: path.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&pin).map_err(|e| format!("JSON error: {}", e))?;
+    std::fs::write(&pin_path, json).map_err(|e| format!("Failed to write pin file: {}", e))?;
     eprintln!("[cli_resolver] pinned CLI: {}", path);
     Ok(())
 }
@@ -956,10 +964,69 @@ pub fn unpin_cli() -> Result<(), String> {
 
 // ─── PATH Injection ────────────────────────────────────────
 
+/// Marker used to identify TOKENICODE-injected blocks in shell profile files.
+#[cfg(not(target_os = "windows"))]
+const APP_PATH_MARKER: &str = "# Added by TOKENICODE";
+
+/// Strip all `# Added by TOKENICODE\nexport PATH=...` blocks from a shell profile.
+///
+/// Only removes two-line sequences where the marker is immediately followed
+/// by an `export PATH=` line. A marker line followed by something else is
+/// preserved unchanged — defensive against user hand-edits.
+#[cfg(not(target_os = "windows"))]
+fn strip_app_blocks(content: &str, marker: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim() == marker {
+            if let Some(next) = lines.get(i + 1) {
+                if next.trim_start().starts_with("export PATH=") {
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(line);
+        i += 1;
+    }
+    // Preserve a trailing newline if the input had one
+    let mut result = out.join("\n");
+    if content.ends_with('\n') && !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
 /// Inject a CLI's directory into the user's shell PATH profile.
-/// Returns the shell profile file that was modified.
+///
+/// Behavior:
+/// 1. Reject invalid `cli_path` upfront (broken symlinks, empty directories,
+///    non-executable files) — writing PATH entries that don't contain a
+///    working `claude` binary is worse than failing visibly.
+/// 2. Find the first existing profile from a prioritized list (.zshrc first).
+/// 3. Strip all previous TOKENICODE blocks from that profile to prevent
+///    accumulation when users click through different candidates.
+/// 4. Append a fresh block with the new export.
+/// 5. Write back atomically.
+///
+/// Returns a human-readable status string on success.
 #[cfg(not(target_os = "windows"))]
 pub fn inject_path(cli_path: &str) -> Result<String, String> {
+    // Gate: reject non-executable CLI targets before touching any files.
+    // Without this, users can inject a PATH entry pointing at a broken
+    // symlink or a cleanup-emptied dir and the shell still says
+    // `command not found`, with no signal that the injection was useless.
+    if !is_valid_executable(Path::new(cli_path)) {
+        return Err(format!(
+            "CLI at '{}' is not a valid executable (broken symlink, \
+             empty directory, or stale install). Refusing to inject \
+             a PATH entry that won't resolve `claude`.",
+            cli_path
+        ));
+    }
+
     let dir = Path::new(cli_path)
         .parent()
         .ok_or("Cannot determine CLI directory")?
@@ -968,8 +1035,7 @@ pub fn inject_path(cli_path: &str) -> Result<String, String> {
 
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     let export_line = format!("export PATH=\"{}:$PATH\"", dir);
-    let marker = "# Added by Her";
-    let block = format!("\n{}\n{}\n", marker, export_line);
+    let new_block = format!("\n{}\n{}\n", APP_PATH_MARKER, export_line);
 
     let profiles = [
         home.join(".zshrc"),
@@ -978,35 +1044,56 @@ pub fn inject_path(cli_path: &str) -> Result<String, String> {
         home.join(".profile"),
     ];
 
-    // Check if already injected
-    for p in &profiles {
-        if let Ok(c) = std::fs::read_to_string(p) {
-            if c.contains(&export_line) {
-                return Ok(format!("Already in {}", p.display()));
-            }
-        }
+    // Target: first existing profile, or ~/.zshrc as the fallback for
+    // first-time users with no shell config at all.
+    let target = profiles
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .unwrap_or_else(|| home.join(".zshrc"));
+
+    // Read (may not exist yet — empty string is the correct default)
+    let existing = std::fs::read_to_string(&target).unwrap_or_default();
+
+    // Strip all historical TOKENICODE blocks. This fixes two bugs at once:
+    // 1. The old literal-contains idempotency check let different `dir`
+    //    values stack up across clicks, polluting the profile.
+    // 2. Users who clicked through several stale candidates accumulated
+    //    dead PATH entries pointing at directories without claude.
+    let cleaned = strip_app_blocks(&existing, APP_PATH_MARKER);
+
+    // Defensive idempotency: if the identical export line somehow
+    // survived the strip (e.g. user-edited without our marker),
+    // don't duplicate it.
+    if cleaned.contains(&export_line) {
+        return Ok(format!("Already in {}", target.display()));
     }
 
-    // Append to the first existing profile
-    for p in &profiles {
-        if p.exists() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(p) {
-                use std::io::Write;
-                f.write_all(block.as_bytes())
-                    .map_err(|e| format!("Write failed: {}", e))?;
-                return Ok(format!("Injected into {}", p.display()));
-            }
-        }
-    }
+    // Compose final content: cleaned old content + fresh block.
+    let final_content = if cleaned.trim().is_empty() {
+        new_block.trim_start().to_string()
+    } else {
+        format!("{}{}", cleaned.trim_end(), new_block)
+    };
 
-    // None exist — create ~/.zshrc
-    std::fs::write(home.join(".zshrc"), block)
-        .map_err(|e| format!("Failed to create .zshrc: {}", e))?;
-    Ok("Created ~/.zshrc with PATH".to_string())
+    std::fs::write(&target, final_content)
+        .map_err(|e| format!("Failed to write {}: {}", target.display(), e))?;
+
+    Ok(format!("Injected into {}", target.display()))
 }
 
 #[cfg(target_os = "windows")]
 pub fn inject_path(cli_path: &str) -> Result<String, String> {
+    // Gate: same rationale as the Unix branch — don't inject a PATH entry
+    // that points at a directory without a working `claude.exe`.
+    if !is_valid_executable(Path::new(cli_path)) {
+        return Err(format!(
+            "CLI at '{}' is not a valid executable. Refusing to inject \
+             a PATH entry that won't resolve `claude`.",
+            cli_path
+        ));
+    }
+
     let dir = Path::new(cli_path)
         .parent()
         .ok_or("Cannot determine CLI directory")?
@@ -1045,7 +1132,10 @@ pub fn delete_cli(path: &str) -> Result<String, String> {
     let source = classify_path(path);
 
     if source == CliSource::Official {
-        return Err("Cannot delete Official Anthropic installation. Uninstall via Claude Desktop.".to_string());
+        return Err(
+            "Cannot delete Official Anthropic installation. Uninstall via Claude Desktop."
+                .to_string(),
+        );
     }
 
     let p = Path::new(path);
@@ -1053,8 +1143,7 @@ pub fn delete_cli(path: &str) -> Result<String, String> {
         return Err(format!("File not found: {}", path));
     }
 
-    std::fs::remove_file(p)
-        .map_err(|e| format!("Delete failed: {}", e))?;
+    std::fs::remove_file(p).map_err(|e| format!("Delete failed: {}", e))?;
 
     // If pinned CLI was deleted, unpin it
     if let Some(pinned) = get_pinned_cli() {
@@ -1092,7 +1181,9 @@ mod tests {
             CliSource::Official
         );
         assert_eq!(
-            classify_path("/Users/test/Library/Application Support/Claude/claude-code/1.0.0/claude"),
+            classify_path(
+                "/Users/test/Library/Application Support/Claude/claude-code/1.0.0/claude"
+            ),
             CliSource::Official
         );
     }
@@ -1136,7 +1227,13 @@ mod tests {
     #[test]
     fn test_cleanup_refuses_version_manager() {
         let tmp = TempDir::new().unwrap();
-        let nvm_dir = tmp.path().join(".nvm").join("versions").join("node").join("v22").join("bin");
+        let nvm_dir = tmp
+            .path()
+            .join(".nvm")
+            .join("versions")
+            .join("node")
+            .join("v22")
+            .join("bin");
         fs::create_dir_all(&nvm_dir).unwrap();
         let fake_cli = nvm_dir.join("claude");
         fs::write(&fake_cli, b"fake").unwrap();

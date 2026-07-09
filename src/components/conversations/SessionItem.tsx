@@ -65,6 +65,9 @@ interface SessionItemProps {
   searchQuery?: string;
   triggerRename?: boolean;
   onRenameDone?: () => void;
+  /** Left-indent preset: 'normal' aligns with the workspace path (pl-7);
+   *  'group' is the compact inset used inside a task-group card. */
+  inset?: 'normal' | 'group';
 }
 
 export function SessionItem({
@@ -85,6 +88,7 @@ export function SessionItem({
   onToggleCheck,
   triggerRename,
   onRenameDone,
+  inset = 'normal',
 }: SessionItemProps) {
   const t = useT();
   const [isRenaming, setIsRenaming] = useState(false);
@@ -138,6 +142,7 @@ export function SessionItem({
 
   return (
     <button
+      {...(import.meta.env.DEV && { 'data-testid': `session-item-${session.id}` })}
       onClick={(e) => {
         if (multiSelect && onToggleCheck) {
           onToggleCheck(session.id, e.shiftKey);
@@ -155,14 +160,14 @@ export function SessionItem({
         startRename();
       }}
       onContextMenu={(e) => onContextMenu(e, session)}
-      className={`w-full text-left pl-7 pr-3 py-1.5 rounded-xl
-        transition-smooth group
-        ${isArchived ? 'opacity-50' : ''}
-        ${isSelected
-          ? 'bg-accent/10 ring-1 ring-accent/20'
-          : 'hover:bg-bg-secondary'
-        }`}
+      className={`relative w-full text-left ${inset === 'group' ? 'pl-5' : 'pl-7'} pr-3 py-1.5 rounded-xl
+        transition-smooth group hover:bg-bg-secondary
+        ${isArchived ? 'opacity-50' : ''}`}
     >
+      {isSelected && (
+        <span className="absolute left-1.5 top-1/2 -translate-y-1/2 w-1 h-4 rounded-[2px]
+          bg-accent" />
+      )}
       <div className="flex items-center gap-2">
         {multiSelect && (
           <input

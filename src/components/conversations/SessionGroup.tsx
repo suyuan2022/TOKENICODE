@@ -1,7 +1,21 @@
 import { useMemo } from 'react';
+import {
+  DndContext,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { SessionListItem } from '../../lib/tauri-bridge';
 import { SessionItem } from './SessionItem';
+import { TaskGroup } from './TaskGroup';
+import { partitionWorkspaceSessions } from '../../stores/groupSelectors';
+import { reorderByDragEnd } from '../../stores/groupDnd';
+import type { SessionGroup as GroupData } from '../../stores/groupStore';
 import { useT } from '../../lib/i18n';
+import { WECHAT_REMOTE_SESSION_TITLE, isWechatRemoteSessionId } from '../../lib/wechat-session';
 
 /** Determine date category for a timestamp */
 function getDateCategory(ms: number): 'today' | 'yesterday' | 'thisWeek' | 'earlier' {
@@ -9,7 +23,6 @@ function getDateCategory(ms: number): 'today' | 'yesterday' | 'thisWeek' | 'earl
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
   const yesterdayStart = todayStart - 86400000;
 
-  // Calculate start of current week (Monday)
   const dayOfWeek = now.getDay();
   const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
   const weekStart = todayStart - daysToMonday * 86400000;
@@ -42,6 +55,16 @@ interface SessionGroupProps {
   onToggleCheck: (sessionId: string, shiftKey?: boolean) => void;
   renamingSessionId?: string | null;
   onRenameDone?: () => void;
+  // --- Session grouping ---
+  workspaceGroups: GroupData[];
+  collapsedGroups: Set<string>;
+  onToggleGroupCollapse: (groupId: string) => void;
+  onGroupContextMenu: (e: React.MouseEvent, groupId: string) => void;
+  renamingGroupId?: string | null;
+  onRenameGroupCommit: (groupId: string, label: string) => void;
+  onRenameGroupCancel: () => void;
+  onReorderGroups: (workspace: string, orderedGroupIds: string[]) => void;
+  onNewSessionInGroup: (groupId: string) => void;
 }
 
 export function SessionGroup({
@@ -66,52 +89,69 @@ export function SessionGroup({
   onToggleCheck,
   renamingSessionId,
   onRenameDone,
+  workspaceGroups,
+  collapsedGroups,
+  onToggleGroupCollapse,
+  onGroupContextMenu,
+  renamingGroupId,
+  onRenameGroupCommit,
+  onRenameGroupCancel,
+  onReorderGroups,
+  onNewSessionInGroup,
 }: SessionGroupProps) {
   const t = useT();
 
-  // Split into pinned and unpinned, then group unpinned by date
-  const { pinnedItems, dateGroups } = useMemo(() => {
+  // Split this workspace's sessions into task groups + ungrouped, then within
+  // ungrouped: global-pinned first, the rest grouped by date.
+  const { taskGroups, pinnedItems, dateGroups } = useMemo(() => {
+    const regularSessions = sessions.filter((session) => !isWechatRemoteSessionId(session.id));
+    const { groups, ungrouped } = partitionWorkspaceSessions(regularSessions, workspaceGroups);
+
     const pinned: SessionListItem[] = [];
     const unpinned: SessionListItem[] = [];
-
-    for (const s of sessions) {
-      if (pinnedSessions.has(s.id)) {
-        pinned.push(s);
-      } else {
-        unpinned.push(s);
-      }
+    for (const s of ungrouped) {
+      if (pinnedSessions.has(s.id)) pinned.push(s);
+      else unpinned.push(s);
     }
 
-    // Group unpinned by date category
-    const groups: { category: string; label: string; items: SessionListItem[] }[] = [];
     const categoryMap = new Map<string, SessionListItem[]>();
-
     for (const s of unpinned) {
       const cat = getDateCategory(s.modifiedAt);
       if (!categoryMap.has(cat)) categoryMap.set(cat, []);
       categoryMap.get(cat)!.push(s);
     }
-
-    // Define order
     const categoryOrder: Array<{ key: string; label: string }> = [
       { key: 'today', label: t('conv.today') },
       { key: 'yesterday', label: t('conv.yesterday') },
       { key: 'thisWeek', label: t('conv.thisWeek') },
       { key: 'earlier', label: t('conv.older') },
     ];
-
-    for (const { key, label } of categoryOrder) {
+    const dGroups: { category: string; label: string; items: SessionListItem[] }[] = [];
+    for (const { key, label: catLabel } of categoryOrder) {
       const items = categoryMap.get(key);
-      if (items && items.length > 0) {
-        groups.push({ category: key, label, items });
-      }
+      if (items && items.length > 0) dGroups.push({ category: key, label: catLabel, items });
     }
 
-    return { pinnedItems: pinned, dateGroups: groups };
-  }, [sessions, pinnedSessions, t]);
+    return { taskGroups: groups, pinnedItems: pinned, dateGroups: dGroups };
+  }, [sessions, workspaceGroups, pinnedSessions, t]);
+
+  const wechatRemoteSession = sessions.find((session) => isWechatRemoteSessionId(session.id));
 
   const getDisplayName = (session: SessionListItem) =>
     customPreviews[session.id] || session.preview || '';
+
+  // Drag-to-reorder groups within this workspace. Each workspace renders its own
+  // DndContext, so a drag can never cross workspaces (mp-review constraint).
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+  );
+  const handleGroupDragEnd = (e: DragEndEvent) => {
+    const { active, over } = e;
+    if (!over || active.id === over.id) return;
+    const currentOrder = taskGroups.map((tg) => tg.group.id);
+    const next = reorderByDragEnd(currentOrder, String(active.id), String(over.id));
+    onReorderGroups(projectKey, next);
+  };
 
   return (
     <div className="mb-1">
@@ -162,8 +202,30 @@ export function SessionGroup({
 
       {/* Sessions */}
       {isExpanded && (
-        <div>
-          {/* Pinned sessions */}
+        <div className="pt-2">
+          {wechatRemoteSession && (
+            <div className="mb-1">
+              <SessionItem
+                session={wechatRemoteSession}
+                isSelected={selectedId === wechatRemoteSession.id}
+                isRunning={runningSessions.has(wechatRemoteSession.id)}
+                isPinned={false}
+                isArchived={false}
+                displayName={WECHAT_REMOTE_SESSION_TITLE}
+                multiSelect={false}
+                isChecked={false}
+                onSelect={onLoadSession}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onRename={() => {}}
+                onToggleCheck={() => {}}
+              />
+            </div>
+          )}
+
+          {/* Global-pinned sessions (cross-group, top of workspace) */}
           {pinnedItems.length > 0 && (
             <>
               {pinnedItems.map((session) => (
@@ -185,13 +247,54 @@ export function SessionGroup({
                   onRenameDone={onRenameDone}
                 />
               ))}
-              {dateGroups.length > 0 && (
-                <div className="my-1 mx-7 border-t border-border-subtle/50" />
-              )}
             </>
           )}
 
-          {/* Date-grouped sessions */}
+          {/* Task groups — drag the six-dot handle to reorder (within workspace) */}
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleGroupDragEnd}
+          >
+            <SortableContext
+              items={taskGroups.map((tg) => tg.group.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              {taskGroups.map(({ group, sessions: groupSessions }) => (
+                <TaskGroup
+                  key={group.id}
+                  group={group}
+                  sessions={groupSessions}
+                  isExpanded={!collapsedGroups.has(group.id)}
+                  selectedId={selectedId}
+                  runningSessions={runningSessions}
+                  archivedSessions={archivedSessions}
+                  customPreviews={customPreviews}
+                  multiSelect={multiSelect}
+                  selectedIds={selectedIds}
+                  renamingSessionId={renamingSessionId}
+                  onLoadSession={onLoadSession}
+                  onSessionContextMenu={onContextMenu}
+                  onRenameSession={onRename}
+                  onToggleCheck={onToggleCheck}
+                  onRenameDone={onRenameDone}
+                  onToggleCollapse={onToggleGroupCollapse}
+                  onGroupContextMenu={onGroupContextMenu}
+                  isRenaming={renamingGroupId === group.id}
+                  onRenameGroupCommit={onRenameGroupCommit}
+                  onRenameCancel={onRenameGroupCancel}
+                  onNewSessionInGroup={onNewSessionInGroup}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
+
+          {/* Ungrouped — date-grouped sessions */}
+          {dateGroups.length > 0 && taskGroups.length > 0 && (
+            <div className="px-7 pt-1.5 pb-0.5 text-[10px] text-text-tertiary/80 select-none">
+              未归类
+            </div>
+          )}
           {dateGroups.map(({ category, label: dateLabel, items }) => (
             <div key={category}>
               <div className="text-[11px] text-text-tertiary font-medium px-7 py-1 mt-1
