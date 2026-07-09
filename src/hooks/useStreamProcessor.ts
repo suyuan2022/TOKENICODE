@@ -2960,6 +2960,28 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               });
             }
           }
+
+          // Docker backend: an unexpected exit while the session was running may
+          // mean the container was stopped out from under the CLI (e.g. `docker
+          // stop`). Probe the container before surfacing anything so we never
+          // false-alarm on a user-initiated stop or a normal crash — dockerPreflight
+          // rejects with CONTAINER_NOT_RUNNING only when the container is truly gone.
+          const exitBackend = useSettingsStore.getState().workingBackend;
+          if (exitBackend.kind === 'docker') {
+            const container = exitBackend.container;
+            void bridge.dockerPreflight(container).catch((err) => {
+              const emsg = typeof err === 'string' ? err : (err?.message ?? String(err));
+              if (emsg.startsWith('CONTAINER_NOT_RUNNING')) {
+                useChatStore.getState().addMessage(tabId, {
+                  id: generateMessageId(),
+                  role: 'system',
+                  type: 'text',
+                  content: t('docker.containerStopped'),
+                  timestamp: Date.now(),
+                });
+              }
+            });
+          }
         }
 
         // Delegate full finalization to the lifecycle module (idempotent)

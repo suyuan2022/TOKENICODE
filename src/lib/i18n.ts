@@ -179,6 +179,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'docker.connecting': '连接中...',
     'docker.refresh': '刷新',
     'docker.back': '返回',
+    'docker.containerStopped': '容器已停止，会话已中断。请重新启动容器后再连接。',
 
     // Error classification
     'error.technicalSummary': '遇到了一个技术问题，通常重试即可解决。',
@@ -954,6 +955,7 @@ const messages: Record<Locale, Record<string, string>> = {
     'docker.connecting': 'Connecting...',
     'docker.refresh': 'Refresh',
     'docker.back': 'Back',
+    'docker.containerStopped': 'The container has stopped and the session was interrupted. Please restart the container and reconnect.',
 
     // Error classification
     'error.technicalSummary': 'A technical issue occurred. Retrying usually resolves it.',

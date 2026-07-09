@@ -145,32 +145,40 @@ interrupt）不受影响，无需改动。
 
 ## 5. 聊天记录（容器内 `~/.claude`）
 
-会话 JSONL 由容器内 claude 写入容器的 `~/.claude/projects/…`。TOKENICODE 本机侧
-所有 `home.join(".claude")` 的读取点（会话历史扫描 lib.rs:1517、最近项目
-lib.rs:4448、tracking 重建 lib.rs:2862、commands/skills 列表等）收口为一个
-辅助函数 `resolve_claude_read(backend, relative_path)`：
+会话 JSONL 由容器内 claude 写入容器的 `~/.claude/projects/…`。
+
+**v1 实现（挂载直读）**：会话历史扫描（`find_session_jsonl` / `read_session_jsonl`，
+lib.rs:1522 起）接受一组 `extra_roots`。当容器 `~/.claude/projects` 恰好落在某个
+bind mount 下时，`BackendManager::extra_claude_projects_dirs()` 把它翻译成本机路径
+并作为额外根传入——本机 `~/.claude/projects` 始终先搜，再依次搜每个 extra root，
+先命中者胜。
 
 | 情况 | 读取方式 |
 |---|---|
 | local 后端 | 本机 `~/.claude`（现状，不变） |
-| docker 后端，容器 `~/.claude` 恰好在某 bind mount 下 | PathMapper 翻译后直读本机（快路径） |
-| docker 后端，未挂载 | `docker exec cat / ls` 读取（慢路径，功能完整） |
+| docker 后端，容器 `~/.claude` 恰好在某 bind mount 下 | PathMapper 翻译后直读本机，作为 `extra_roots` 传入历史扫描（已实现） |
+| docker 后端，未挂载 | 本机看不到历史；前端 `docker_history_available(container)` 返回 `false`，会话列表显示提示条（`docker.historyUnavailable`） |
 
-保证：历史列表、点开旧会话、继续上次会话（`--resume` 由容器内 claude 自行解析）
-在容器模式下全部可用。写入类操作（如删除历史 JSONL）同样经此辅助函数分派
-（未挂载时 `docker exec rm`，并保留现有"仅允许 `~/.claude/projects/` 内删除"的
-安全校验语义）。
+保证：容器 `~/.claude` 已挂载时，历史列表、点开旧会话、继续上次会话（`--resume`
+由容器内 claude 自行解析）全部可用。
+
+> **未挂载的 `docker exec cat / ls` 慢路径回退在 v1 未实现**，仅以提示条告知用户
+> 挂载家目录以获得历史。此项列为后续增强（future）。
 
 ## 6. 附件与项目外文件
 
 粘贴截图、从桌面/访达拖入的文件目前存于**本机**临时目录后把路径发给 CLI
-（`useFileAttachments.ts:15`）。容器看不到本机临时目录，因此容器模式下：
+（`save_temp_file`）。容器看不到本机临时目录，因此容器模式下：
 
-- 新增 command `copy_into_container(container, host_path) -> container_path`：
-  用 `docker cp` 将文件拷入容器内暂存目录（`/tmp/tokenicode-attachments/<uuid>/`），
-  返回容器内路径。
-- 附件流程在 docker 后端下先调用它，再把**容器内路径**注入消息。
-- 会话结束/应用退出时尽力清理该暂存目录（`docker exec rm -rf`，best-effort）。
+**v1 实现（项目内 `.tokenicode/tmp` 暂存，无 `docker cp`）**：
+
+- command `stage_external_file(cwd, src) -> host_path`（lib.rs:4866）把外部文件复制
+  到**项目根**下的 `.tokenicode/tmp/`。由于项目根本身就是容器的 bind mount，该文件
+  对容器立即可见，无需 `docker cp`。
+- 前端附件流程（`useFileAttachments.ts`）在 docker 后端下先调用 `stage_external_file`
+  拿到本机暂存路径，再经 PathMapper 翻译成**容器内路径**注入消息。
+- 粘贴内容走 `save_temp_file`，同样写入项目内 `.tokenicode/tmp/`（cwd 提供时），
+  与 `stage_external_file` 共用同一暂存目录辅助逻辑（lib.rs:4848）。
 - 来自项目文件树的拖拽不经此流程（本就是容器路径）。
 
 ## 7. UI 交互

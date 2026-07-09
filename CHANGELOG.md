@@ -6,6 +6,18 @@ All notable changes to TOKENICODE will be documented in this file.
 
 ---
 
+## [0.12.0] - Unreleased
+
+### 新增
+
+- **连接 Docker 容器后端**（Docker container backend）—— 工作区可以直接连上一个正在运行的 Docker 容器：选择容器 + 挑一个绑定挂载（bind-mount）目录作为项目根，文件树浏览 / 预览 / 编辑与本机改动自动刷新照常工作。发消息时 claude CLI 通过 `docker exec` 在容器内执行（容器内 `ps` 可见其进程），停止会话会精确结束容器内的 CLI 进程。
+  - **聊天记录**（session history）—— 容器 `~/.claude` 若被挂载到宿主机，历史会话可直接读取并显示；未挂载时给出提示条（`docker_history_available` hint）。
+  - **附件暂存**（attachment staging）—— 拖入 / 粘贴的外部文件通过项目内 `.tokenicode/tmp` 暂存目录中转（`stage_external_file`），CLI 以容器内路径读取，无需 `docker cp`。
+  - **容器中断提示**（container-stopped notice）—— 会话运行中容器被 `docker stop` 时，进程退出后自动探测容器状态并提示「容器已停止」。
+  - **容器内登录**（in-container login）—— 支持在容器内完成 `claude login`。
+
+---
+
 ## [0.11.0] - 2026-06-10
 
 ### 新增
