@@ -2972,6 +2972,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             void bridge.dockerPreflight(container).catch((err) => {
               const emsg = typeof err === 'string' ? err : (err?.message ?? String(err));
               if (emsg.startsWith('CONTAINER_NOT_RUNNING')) {
+                // The probe is async — the tab may have been closed while it ran.
+                if (!useChatStore.getState().getTab(tabId)) return;
                 useChatStore.getState().addMessage(tabId, {
                   id: generateMessageId(),
                   role: 'system',
