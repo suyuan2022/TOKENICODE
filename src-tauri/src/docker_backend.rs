@@ -5,6 +5,8 @@
 //! bind mount, so both address spaces refer to the same files on disk.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MountEntry {
@@ -137,6 +139,55 @@ pub fn parse_inspect_running(inspect_json: &str) -> Result<bool, String> {
         .pointer("/State/Running")
         .and_then(|b| b.as_bool())
         .unwrap_or(false))
+}
+
+#[derive(Debug, Clone)]
+pub struct DockerProject {
+    pub container: String,
+    pub mapper: PathMapper,
+    /// Container-side $HOME (for locating ~/.claude inside the container).
+    pub home: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct BackendManager {
+    pub projects: Arc<Mutex<Vec<DockerProject>>>,
+}
+
+impl BackendManager {
+    pub async fn register(&self, project: DockerProject) {
+        let mut projects = self.projects.lock().await;
+        projects.retain(|p| p.container != project.container);
+        projects.push(project);
+    }
+
+    /// Container path → host path; non-container paths pass through unchanged.
+    /// This is the single entry point used by every fs command, so local
+    /// projects keep working with zero behavioural change.
+    pub async fn to_host_or_passthrough(&self, path: &str) -> PathBuf {
+        let projects = self.projects.lock().await;
+        for p in projects.iter() {
+            if let Some(host) = p.mapper.to_host(path) {
+                return host;
+            }
+        }
+        PathBuf::from(path)
+    }
+
+    pub async fn to_container_for_host(&self, host: &Path) -> Option<(String, String)> {
+        let projects = self.projects.lock().await;
+        for p in projects.iter() {
+            if let Some(c) = p.mapper.to_container(host) {
+                return Some((p.container.clone(), c));
+            }
+        }
+        None
+    }
+
+    pub async fn backend_for_cwd(&self, cwd: &str) -> Option<DockerProject> {
+        let projects = self.projects.lock().await;
+        projects.iter().find(|p| p.mapper.to_host(cwd).is_some()).cloned()
+    }
 }
 
 /// Run `docker <args>` and capture stdout; Err carries a stderr summary.
@@ -277,5 +328,55 @@ mod tests {
     #[test]
     fn inspect_bad_json_is_err() {
         assert!(parse_inspect_mounts("[]").is_err()); // 空数组=容器不存在
+    }
+
+    fn docker_proj() -> DockerProject {
+        DockerProject {
+            container: "dev-box".into(),
+            mapper: PathMapper::new(vec![MountEntry {
+                source: "/Users/me/proj".into(), destination: "/workspace".into() }]),
+            home: Some("/root".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_for_local_paths() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await;
+        assert_eq!(mgr.to_host_or_passthrough("/tmp/x").await,
+            std::path::PathBuf::from("/tmp/x"));
+    }
+
+    #[tokio::test]
+    async fn container_path_maps_to_host() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await;
+        assert_eq!(mgr.to_host_or_passthrough("/workspace/a.rs").await,
+            std::path::PathBuf::from("/Users/me/proj/a.rs"));
+    }
+
+    #[tokio::test]
+    async fn host_path_reverse_maps() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await;
+        let (c, p) = mgr.to_container_for_host(std::path::Path::new("/Users/me/proj/a.rs")).await.unwrap();
+        assert_eq!(c, "dev-box");
+        assert_eq!(p, "/workspace/a.rs");
+    }
+
+    #[tokio::test]
+    async fn backend_for_cwd_matches_docker_project() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await;
+        assert_eq!(mgr.backend_for_cwd("/workspace").await.unwrap().container, "dev-box");
+        assert!(mgr.backend_for_cwd("/Users/me/other").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_same_container_replaces() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await;
+        mgr.register(docker_proj()).await;
+        assert_eq!(mgr.projects.lock().await.len(), 1);
     }
 }

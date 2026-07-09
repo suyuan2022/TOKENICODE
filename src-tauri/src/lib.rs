@@ -3994,6 +3994,56 @@ async fn decode_project_dir(encoded: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn list_docker_containers() -> Result<Vec<docker_backend::ContainerSummary>, String> {
+    let out = docker_backend::docker_capture(&["ps", "--format", "{{json .}}"]).await?;
+    Ok(docker_backend::parse_docker_ps(&out))
+}
+
+#[tauri::command]
+async fn connect_docker_project(
+    backends: State<'_, docker_backend::BackendManager>,
+    path_access: State<'_, PathAccessManager>,
+    container: String,
+    container_cwd: String,
+) -> Result<(), String> {
+    let inspect = docker_backend::docker_capture(&["inspect", &container]).await?;
+    if !docker_backend::parse_inspect_running(&inspect)? {
+        return Err(format!("CONTAINER_NOT_RUNNING:{}", container));
+    }
+    let mounts = docker_backend::parse_inspect_mounts(&inspect)?;
+    let mapper = docker_backend::PathMapper::new(mounts);
+    let host_cwd = mapper
+        .to_host(&container_cwd)
+        .ok_or_else(|| format!("PATH_NOT_MOUNTED:{}", container_cwd))?;
+    if !host_cwd.exists() {
+        return Err(format!("HOST_PATH_MISSING:{}", host_cwd.display()));
+    }
+    // Container-side $HOME, best-effort (used later for reading ~/.claude).
+    let home = docker_backend::docker_capture(&["exec", &container, "sh", "-c", "echo $HOME"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    path_access.register_cwd(&host_cwd).await;
+    backends
+        .register(docker_backend::DockerProject { container, mapper, home })
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn docker_preflight(container: String) -> Result<(), String> {
+    let inspect = docker_backend::docker_capture(&["inspect", &container]).await?;
+    if !docker_backend::parse_inspect_running(&inspect)? {
+        return Err(format!("CONTAINER_NOT_RUNNING:{}", container));
+    }
+    docker_backend::docker_capture(&["exec", &container, "sh", "-c", "command -v claude"])
+        .await
+        .map_err(|_| format!("CLAUDE_NOT_FOUND_IN_CONTAINER:{}", container))?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn read_file_tree(
     path_access: State<'_, PathAccessManager>,
     path: String,
@@ -8174,6 +8224,7 @@ pub fn run() {
         .manage(BypassModeMap::new())
         .manage(WatcherManager::default())
         .manage(PathAccessManager::new())
+        .manage(docker_backend::BackendManager::default())
         .manage(wechat::runtime::WechatRuntimeHandle::new(
             wechat::store::default_wechat_state_store(),
         ))
@@ -8226,6 +8277,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_docker_containers,
+            connect_docker_project,
+            docker_preflight,
             start_claude_session,
             send_stdin,
             send_raw_stdin,
