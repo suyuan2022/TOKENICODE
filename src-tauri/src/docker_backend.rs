@@ -189,6 +189,13 @@ impl BackendManager {
         projects.iter().find(|p| p.mapper.to_host(cwd).is_some()).cloned()
     }
 
+    /// Find a registered project by its container name. Used when the frontend
+    /// explicitly passes a container name for a session spawn.
+    pub async fn project_by_container(&self, name: &str) -> Option<DockerProject> {
+        let projects = self.projects.lock().await;
+        projects.iter().find(|p| p.container == name).cloned()
+    }
+
     /// Returns a clone of the mapper of whichever project maps the given
     /// container path, or None if no project owns it. Used by fs commands
     /// (file tree DFS, watcher callback) to remap host paths back to container
@@ -212,6 +219,54 @@ pub fn remap_path_out(mapper: &Option<PathMapper>, host: &str) -> String {
             .unwrap_or_else(|| host.to_string()),
         None => host.to_string(),
     }
+}
+
+/// A ready-to-spawn `docker exec` invocation: program plus full argv.
+#[derive(Debug)]
+pub struct DockerExecSpec {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Build a `docker exec` spec that runs claude inside the container, reporting
+/// its shell PID on stderr first so kill_session can target it directly.
+pub fn build_docker_exec(
+    container: &str,
+    container_cwd: &str,
+    env: &[(String, String)],
+    claude_bin: &str,
+    claude_args: &[String],
+) -> DockerExecSpec {
+    let mut args = vec![
+        "exec".to_string(),
+        "-i".to_string(),
+        "-w".to_string(),
+        container_cwd.to_string(),
+    ];
+    for (k, v) in env {
+        args.push("-e".to_string());
+        args.push(format!("{}={}", k, v));
+    }
+    args.push(container.to_string());
+    // Report the shell PID to stderr, then exec claude so it keeps that PID.
+    // kill_session uses this PID for an in-container `kill -TERM`.
+    let quoted: Vec<String> = claude_args.iter().map(|a| shell_quote(a)).collect();
+    let script = format!(
+        "echo \"__TOKENICODE_PID__$$\" >&2; exec {} {}",
+        claude_bin,
+        quoted.join(" ")
+    );
+    args.extend(["sh".to_string(), "-c".to_string(), script]);
+    DockerExecSpec { program: "docker".to_string(), args }
+}
+
+/// Recognise the `__TOKENICODE_PID__<n>` marker emitted by build_docker_exec.
+pub fn parse_pid_marker(line: &str) -> Option<u32> {
+    line.trim().strip_prefix("__TOKENICODE_PID__")?.parse().ok()
 }
 
 /// Run `docker <args>` and capture stdout; Err carries a stderr summary.
@@ -426,6 +481,48 @@ mod tests {
         }]);
         // Host path outside any mount stays as-is even with a mapper present.
         assert_eq!(remap_path_out(&Some(mapper), "/tmp/x"), "/tmp/x");
+    }
+
+    #[test]
+    fn docker_exec_command_shape() {
+        let spec = build_docker_exec(
+            "dev-box", "/workspace",
+            &[("ANTHROPIC_BASE_URL".into(), "https://x".into())],
+            "claude",
+            &["--input-format".into(), "stream-json".into()],
+        );
+        assert_eq!(spec.program, "docker");
+        assert_eq!(spec.args[..6], ["exec".to_string(), "-i".into(), "-w".into(),
+            "/workspace".into(), "-e".into(), "ANTHROPIC_BASE_URL=https://x".into()]);
+        assert_eq!(spec.args[6], "dev-box");
+        // 包 sh -c 以回报 PID；exec 保证 claude 沿用同一 PID
+        assert_eq!(spec.args[7], "sh");
+        assert_eq!(spec.args[8], "-c");
+        let script = &spec.args[9];
+        assert!(script.starts_with("echo \"__TOKENICODE_PID__$$\" >&2; exec claude"));
+        assert!(script.contains("'--input-format' 'stream-json'"));
+    }
+
+    #[test]
+    fn shell_quoting_escapes_single_quotes() {
+        let spec = build_docker_exec("c", "/w", &[], "claude", &["it's".into()]);
+        // Empty env → script is the final arg (index 7): exec -i -w /w c sh -c <script>.
+        // (Brief's literal `args[9]` assumed the one-env-var layout; corrected here.)
+        assert!(spec.args[7].contains(r#"'it'\''s'"#));
+    }
+
+    #[test]
+    fn pid_marker_parses() {
+        assert_eq!(parse_pid_marker("__TOKENICODE_PID__1234"), Some(1234));
+        assert_eq!(parse_pid_marker("random stderr"), None);
+    }
+
+    #[tokio::test]
+    async fn project_by_container_finds_by_name() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await;
+        assert_eq!(mgr.project_by_container("dev-box").await.unwrap().container, "dev-box");
+        assert!(mgr.project_by_container("nope").await.is_none());
     }
 
     #[tokio::test]

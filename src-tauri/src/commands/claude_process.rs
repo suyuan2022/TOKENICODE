@@ -33,6 +33,11 @@ pub struct ManagedProcess {
     /// Signalled by the stdout reader after emitting process_exit.
     /// kill_session waits on this to avoid SESSION_ALREADY_ACTIVE races.
     pub exit_notify: Arc<Notify>,
+    /// Docker-backed sessions only: (container name, shared in-container PID).
+    /// The PID is filled asynchronously by the stderr reader once the
+    /// `__TOKENICODE_PID__` marker arrives. kill_session uses it for a
+    /// two-step in-container kill. `None` for local sessions.
+    pub container_kill: Option<(String, Arc<std::sync::atomic::AtomicU32>)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -116,6 +121,20 @@ impl ProcessManager {
         } else {
             None
         }
+    }
+
+    /// Read-only lookup of the in-container kill info for a session, without
+    /// removing the entry. kill_session calls this before `remove` so it can
+    /// signal the process inside the container.
+    pub async fn container_kill_info(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, Arc<std::sync::atomic::AtomicU32>)> {
+        let map = self.processes.lock().await;
+        let proc = map.get(session_id)?.clone();
+        drop(map);
+        let managed = proc.lock().await;
+        managed.container_kill.clone()
     }
 
     /// TK-329: List all active stdinIds so the frontend can detect orphaned processes
@@ -213,4 +232,9 @@ pub struct StartSessionParams {
     /// before resuming. This prevents "invalid thinking signature" 400 errors when switching
     /// to a different model that can't verify the old model's cryptographic signatures.
     pub model_switch: Option<bool>,
+    /// When set, spawn claude via `docker exec` inside this container instead of
+    /// locally. Absent (None) for local sessions — backward compatible with
+    /// existing frontend callers that don't pass the field.
+    #[serde(default)]
+    pub docker_container: Option<String>,
 }

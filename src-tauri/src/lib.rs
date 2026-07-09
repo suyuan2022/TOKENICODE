@@ -1786,13 +1786,25 @@ async fn start_claude_session(
     wechat_runtime: State<'_, wechat::runtime::WechatRuntimeHandle>,
     bypass_modes: State<'_, BypassModeMap>,
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     params: StartSessionParams,
 ) -> Result<SessionInfo, String> {
     // Phase 3 §3.1: register the per-session cwd as a fixed path-access root
     // so all file commands running in this working directory are allowed.
+    // For docker-backed sessions params.cwd is a container path; translate it
+    // to the host path that std::fs actually touches before registering.
     path_access
-        .register_cwd(std::path::Path::new(&params.cwd))
+        .register_cwd(&backends.to_host_or_passthrough(&params.cwd).await)
         .await;
+
+    // Resolve the docker backend for this session, if any. An explicit
+    // container name wins; otherwise infer from the (container) cwd. `None`
+    // means a normal local spawn.
+    let docker_backend_proj = match params.docker_container {
+        Some(ref c) => backends.project_by_container(c).await,
+        None => backends.backend_for_cwd(&params.cwd).await,
+    };
+
     let session_id = params
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1887,17 +1899,23 @@ async fn start_claude_session(
         args.push(r#"{"alwaysThinkingEnabled":true}"#.to_string());
     }
 
-    // Resolve claude binary — it may not be on the default PATH
-    let claude_bin = find_claude_binary().unwrap_or_else(|| {
-        #[cfg(target_os = "windows")]
-        {
-            "claude.cmd".to_string()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            "claude".to_string()
-        }
-    });
+    // Resolve claude binary — it may not be on the default PATH.
+    // For docker-backed sessions the binary runs inside the container, so the
+    // host path from find_claude_binary() is meaningless; use plain "claude".
+    let claude_bin = if docker_backend_proj.is_some() {
+        "claude".to_string()
+    } else {
+        find_claude_binary().unwrap_or_else(|| {
+            #[cfg(target_os = "windows")]
+            {
+                "claude.cmd".to_string()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                "claude".to_string()
+            }
+        })
+    };
 
     // Build an enriched PATH for the child process
     let enriched_path = build_enriched_path();
@@ -2059,11 +2077,39 @@ async fn start_claude_session(
         }
     }
 
-    // On Windows, .cmd/.bat files must be launched via cmd /C
-    #[cfg(target_os = "windows")]
-    let mut child = {
-        // Helper: build and spawn a Command for the given binary
-        let spawn_win = |bin: &str| {
+    // Docker-backed sessions spawn claude via `docker exec` (its own simple
+    // spawn — no PATH/EACCES/ENOEXEC handling, which only apply to host
+    // binaries). Local sessions keep the existing cfg-branched spawn verbatim.
+    let mut child = if let Some(ref proj) = docker_backend_proj {
+        let env_pairs: Vec<(String, String)> = resolved_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let spec = docker_backend::build_docker_exec(
+            &proj.container,
+            &params.cwd,
+            &env_pairs,
+            &claude_bin,
+            &args,
+        );
+        eprintln!(
+            "[TOKENICODE] docker exec spawn: container={} args={:?}",
+            proj.container, &spec.args
+        );
+        Command::new(&spec.program)
+            .args(&spec.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn docker exec: {}", e))?
+    } else {
+        // ── Local spawn: existing cfg-branched code, unchanged. ──
+        // On Windows, .cmd/.bat files must be launched via cmd /C
+        #[cfg(target_os = "windows")]
+        let local_child = {
+            // Helper: build and spawn a Command for the given binary
+            let spawn_win = |bin: &str| {
             let needs_cmd = bin.ends_with(".cmd")
                 || bin.ends_with(".bat")
                 || (!bin.contains('\\') && !bin.contains('/') && !bin.contains('.'));
@@ -2121,9 +2167,9 @@ async fn start_claude_session(
                 ));
             }
         }
-    };
-    #[cfg(not(target_os = "windows"))]
-    let mut child = {
+        };
+        #[cfg(not(target_os = "windows"))]
+        let local_child = {
         let spawn_unix = |bin: &str| -> std::io::Result<tokio::process::Child> {
             let mut cmd = Command::new(bin);
             cmd.args(&args)
@@ -2216,6 +2262,8 @@ async fn start_claude_session(
                 ));
             }
         }
+        };
+        local_child
     };
 
     let pid = child.id().unwrap_or(0);
@@ -2282,6 +2330,11 @@ async fn start_claude_session(
 
     let exit_notify = Arc::new(tokio::sync::Notify::new());
 
+    // Docker-backed sessions report their in-container PID asynchronously via a
+    // stderr marker (see build_docker_exec). The stderr reader fills this atomic
+    // once the marker arrives; kill_session reads it for an in-container kill.
+    let container_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     state
         .insert(
             sid.clone(),
@@ -2290,6 +2343,9 @@ async fn start_claude_session(
                 pid,
                 kill_tx: Some(kill_tx),
                 exit_notify: exit_notify.clone(),
+                container_kill: docker_backend_proj
+                    .as_ref()
+                    .map(|p| (p.container.clone(), container_pid.clone())),
             },
         )
         .await;
@@ -2638,10 +2694,17 @@ async fn start_claude_session(
     // Spawn stderr reader
     let app_clone2 = app.clone();
     let sid_clone2 = sid.clone();
+    let container_pid_clone = container_pid.clone();
     tokio::spawn(async move {
         let reader = BufReader::with_capacity(256 * 1024, stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            // Docker-backed sessions emit their in-container PID as the first
+            // stderr line. Capture it and swallow the marker — never forward it.
+            if let Some(pid) = docker_backend::parse_pid_marker(&line) {
+                container_pid_clone.store(pid, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
             let _ = emit_to_frontend(
                 &app_clone2,
                 &format!("claude:stderr:{}", sid_clone2),
@@ -2808,6 +2871,26 @@ async fn kill_session(
 ) -> Result<(), String> {
     stdin_mgr.remove(&session_id).await;
     bypass_modes.remove(&session_id).await;
+    // Docker-backed sessions: the host `docker exec` client has no signal path
+    // to the in-container process, so kill it inside the container first. Prefer
+    // the captured PID; fall back to pkill by command line if the marker never
+    // arrived (pid == 0).
+    if let Some((container, pid_atomic)) = state.container_kill_info(&session_id).await {
+        let pid = pid_atomic.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = if pid > 0 {
+            docker_backend::docker_capture(&["exec", &container, "kill", "-TERM", &pid.to_string()])
+                .await
+        } else {
+            docker_backend::docker_capture(&[
+                "exec",
+                &container,
+                "pkill",
+                "-f",
+                "claude --input-format stream-json",
+            ])
+            .await
+        };
+    }
     if let Some(notify) = state.remove(&session_id).await {
         // Wait for the stdout reader to confirm process exit before returning.
         // Without this, the frontend can send a new message before the old process
