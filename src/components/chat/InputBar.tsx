@@ -1075,14 +1075,10 @@ export function InputBar() {
               stdinReady = false;
             } else {
               // ===== Send via stdin to existing persistent process (pre-warmed or follow-up) =====
-              if (!stdinReady) {
-                setSessionMeta(tabId, {
-                  pendingReadyMessage: { stdinId, text },
-                });
-                console.log('[TOKENICODE] pre-warm process not ready yet — holding first message until system:init');
-                return;
-              }
               try {
+                if (!stdinReady) {
+                  console.log('[TOKENICODE] sending first message to pre-warmed process before system:init');
+                }
                 markTurnThinking();
                 await bridge.sendStdin(stdinId, text);
                 sentViaStdin = true;

@@ -20,6 +20,7 @@ import { bridge, onFileChange } from './lib/tauri-bridge';
 import { parseSessionMessages } from './lib/session-loader';
 import { hasRecoverableFrontendSession } from './lib/sessionLifecycle';
 import { useAutoUpdateCheck } from './hooks/useAutoUpdateCheck';
+import { useRemoteSession } from './hooks/useRemoteSession';
 import { useT } from './lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import './App.css';
@@ -104,6 +105,7 @@ function App() {
 
   // Auto-check for app updates on startup
   useAutoUpdateCheck();
+  useRemoteSession();
 
   // CLI update detection: check on startup + poll every 30 minutes
   useEffect(() => {

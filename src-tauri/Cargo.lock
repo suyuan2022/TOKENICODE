@@ -2486,6 +2486,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2532096657941c2fea9c289d370a250971c689d4f143798ff67113ec042024a5"
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3428,6 +3434,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"
@@ -5066,14 +5078,18 @@ dependencies = [
 name = "tokenicode"
 version = "0.11.0"
 dependencies = [
+ "aes",
  "base64 0.22.1",
  "cocoa",
  "dirs",
  "flate2",
  "futures-util",
  "libc",
+ "md5",
  "notify",
  "objc",
+ "parking_lot",
+ "qrcode",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "serde",

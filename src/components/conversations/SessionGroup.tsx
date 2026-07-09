@@ -15,6 +15,7 @@ import { partitionWorkspaceSessions } from '../../stores/groupSelectors';
 import { reorderByDragEnd } from '../../stores/groupDnd';
 import type { SessionGroup as GroupData } from '../../stores/groupStore';
 import { useT } from '../../lib/i18n';
+import { WECHAT_REMOTE_SESSION_TITLE, isWechatRemoteSessionId } from '../../lib/wechat-session';
 
 /** Determine date category for a timestamp */
 function getDateCategory(ms: number): 'today' | 'yesterday' | 'thisWeek' | 'earlier' {
@@ -103,7 +104,8 @@ export function SessionGroup({
   // Split this workspace's sessions into task groups + ungrouped, then within
   // ungrouped: global-pinned first, the rest grouped by date.
   const { taskGroups, pinnedItems, dateGroups } = useMemo(() => {
-    const { groups, ungrouped } = partitionWorkspaceSessions(sessions, workspaceGroups);
+    const regularSessions = sessions.filter((session) => !isWechatRemoteSessionId(session.id));
+    const { groups, ungrouped } = partitionWorkspaceSessions(regularSessions, workspaceGroups);
 
     const pinned: SessionListItem[] = [];
     const unpinned: SessionListItem[] = [];
@@ -132,6 +134,8 @@ export function SessionGroup({
 
     return { taskGroups: groups, pinnedItems: pinned, dateGroups: dGroups };
   }, [sessions, workspaceGroups, pinnedSessions, t]);
+
+  const wechatRemoteSession = sessions.find((session) => isWechatRemoteSessionId(session.id));
 
   const getDisplayName = (session: SessionListItem) =>
     customPreviews[session.id] || session.preview || '';
@@ -199,6 +203,28 @@ export function SessionGroup({
       {/* Sessions */}
       {isExpanded && (
         <div className="pt-2">
+          {wechatRemoteSession && (
+            <div className="mb-1">
+              <SessionItem
+                session={wechatRemoteSession}
+                isSelected={selectedId === wechatRemoteSession.id}
+                isRunning={runningSessions.has(wechatRemoteSession.id)}
+                isPinned={false}
+                isArchived={false}
+                displayName={WECHAT_REMOTE_SESSION_TITLE}
+                multiSelect={false}
+                isChecked={false}
+                onSelect={onLoadSession}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onRename={() => {}}
+                onToggleCheck={() => {}}
+              />
+            </div>
+          )}
+
           {/* Global-pinned sessions (cross-group, top of workspace) */}
           {pinnedItems.length > 0 && (
             <>

@@ -3,6 +3,7 @@ pub mod env_manager;
 mod events;
 pub mod path_access;
 mod protocol;
+pub mod wechat;
 // windows_ps compiles on all platforms so its pure-logic tests run on
 // non-Windows CI; it is only *invoked* from `#[cfg(target_os = "windows")]`
 // code paths.
@@ -756,6 +757,11 @@ struct ProvidersFile {
 }
 
 const PARTIAL_MESSAGES_OVERRIDE_ENV: &str = "TOKENICODE_INCLUDE_PARTIAL_MESSAGES";
+const DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV: &str =
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL";
+const CLAUDE_PLUGIN_CACHE_DIR_ENV: &str = "CLAUDE_CODE_PLUGIN_CACHE_DIR";
+const CLAUDE_PLUGIN_GIT_TIMEOUT_ENV: &str = "CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS";
+const INCLUDE_MCP_SERVERS_ENV: &str = "TOKENICODE_INCLUDE_MCP_SERVERS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProviderRuntimeCapabilities {
@@ -1225,6 +1231,33 @@ fn parse_bool_override(value: &str) -> Option<bool> {
     }
 }
 
+fn apply_claude_cli_runtime_defaults(env: &mut HashMap<String, String>) {
+    // TOKENICODE should not let Claude Code's official marketplace auto-install
+    // delay or block normal chat startup. Users can still override this through
+    // provider extra_env when they need that specific Claude Code behavior.
+    env.entry(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV.to_string())
+        .or_insert_with(|| "1".to_string());
+    if let Some(cache_dir) = tokenicode_claude_plugin_cache_dir() {
+        env.entry(CLAUDE_PLUGIN_CACHE_DIR_ENV.to_string())
+            .or_insert_with(|| cache_dir);
+    }
+    env.entry(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV.to_string())
+        .or_insert_with(|| "10000".to_string());
+}
+
+fn tokenicode_claude_plugin_cache_dir() -> Option<String> {
+    dirs::home_dir().map(|home| {
+        home.join(".tokenicode")
+            .join("claude-plugin-cache")
+            .to_string_lossy()
+            .to_string()
+    })
+}
+
+fn should_include_mcp_servers(value: Option<&str>) -> bool {
+    value.and_then(parse_bool_override).unwrap_or(false)
+}
+
 fn redacted_env_for_log(env: &HashMap<String, String>) -> BTreeMap<String, String> {
     env.iter()
         .map(|(key, value)| {
@@ -1260,8 +1293,10 @@ fn normalize_cli_model_id(model: &str) -> String {
 #[cfg(test)]
 mod provider_capability_tests {
     use super::{
-        normalize_cli_model_id, parse_bool_override, redacted_env_for_log,
-        resolve_provider_capabilities, ApiProvider, ModelMapping,
+        apply_claude_cli_runtime_defaults, normalize_cli_model_id, parse_bool_override,
+        redacted_env_for_log, resolve_provider_capabilities, should_include_mcp_servers,
+        ApiProvider, ModelMapping, CLAUDE_PLUGIN_CACHE_DIR_ENV, CLAUDE_PLUGIN_GIT_TIMEOUT_ENV,
+        DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV, INCLUDE_MCP_SERVERS_ENV,
         PARTIAL_MESSAGES_OVERRIDE_ENV,
     };
     use std::collections::HashMap;
@@ -1303,10 +1338,7 @@ mod provider_capability_tests {
     fn normalize_cli_model_id_passes_models_through_unchanged() {
         // Standard Opus passes through; the 1M form already arrives in `[1m]`
         // shape from the frontend, so it is also untouched.
-        assert_eq!(
-            normalize_cli_model_id("claude-opus-4-8"),
-            "claude-opus-4-8"
-        );
+        assert_eq!(normalize_cli_model_id("claude-opus-4-8"), "claude-opus-4-8");
         assert_eq!(
             normalize_cli_model_id("claude-opus-4-8[1m]"),
             "claude-opus-4-8[1m]"
@@ -1376,6 +1408,67 @@ mod provider_capability_tests {
         assert_eq!(parse_bool_override("false"), Some(false));
         assert_eq!(parse_bool_override("OFF"), Some(false));
         assert_eq!(parse_bool_override("maybe"), None);
+    }
+
+    #[test]
+    fn runtime_defaults_disable_official_marketplace_autoinstall() {
+        let mut env = HashMap::new();
+        apply_claude_cli_runtime_defaults(&mut env);
+        assert_eq!(
+            env.get(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV).map(String::as_str),
+            Some("10000")
+        );
+        assert!(env
+            .get(CLAUDE_PLUGIN_CACHE_DIR_ENV)
+            .is_some_and(|path| path.ends_with(".tokenicode/claude-plugin-cache")));
+    }
+
+    #[test]
+    fn runtime_defaults_do_not_override_provider_extra_env() {
+        let mut env = HashMap::from([
+            (
+                DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV.to_string(),
+                "0".to_string(),
+            ),
+            (
+                CLAUDE_PLUGIN_CACHE_DIR_ENV.to_string(),
+                "/custom/cache".to_string(),
+            ),
+            (
+                CLAUDE_PLUGIN_GIT_TIMEOUT_ENV.to_string(),
+                "2500".to_string(),
+            ),
+        ]);
+        apply_claude_cli_runtime_defaults(&mut env);
+        assert_eq!(
+            env.get(DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL_ENV)
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_CACHE_DIR_ENV).map(String::as_str),
+            Some("/custom/cache")
+        );
+        assert_eq!(
+            env.get(CLAUDE_PLUGIN_GIT_TIMEOUT_ENV).map(String::as_str),
+            Some("2500")
+        );
+    }
+
+    #[test]
+    fn mcp_servers_are_excluded_unless_explicitly_enabled() {
+        assert!(!should_include_mcp_servers(None));
+        assert!(!should_include_mcp_servers(Some("0")));
+        assert!(!should_include_mcp_servers(Some("false")));
+        assert!(!should_include_mcp_servers(Some("maybe")));
+        assert!(should_include_mcp_servers(Some("1")));
+        assert!(should_include_mcp_servers(Some("true")));
+        assert_eq!(INCLUDE_MCP_SERVERS_ENV, "TOKENICODE_INCLUDE_MCP_SERVERS");
     }
 
     #[test]
@@ -1592,13 +1685,17 @@ fn strip_thinking_from_value(value: &mut serde_json::Value) -> Option<usize> {
     }
 }
 
-/// Phase 4 §5.4 (S10): write a per-session MCP config scratch file so the
-/// CLI's `--strict-mcp-config` doesn't strip the user's configured servers.
+/// Write a per-session MCP config scratch file only when explicitly enabled.
 ///
-/// Reads `~/.claude.json`, extracts the `mcpServers` object, and writes
-/// `{"mcpServers": {...}}` into `~/.tokenicode/mcp-session-<stdin_id>.json`.
-/// Returns `None` when there are no servers to carry over (or on I/O error).
+/// TOKENICODE's default chat path uses `--strict-mcp-config` without copying
+/// global MCP servers because slow or unrelated servers can block the first
+/// desktop response. Advanced users can opt in with
+/// `TOKENICODE_INCLUDE_MCP_SERVERS=1`.
 fn build_mcp_scratch_config(stdin_id: &str) -> Option<std::path::PathBuf> {
+    if !should_include_mcp_servers(std::env::var(INCLUDE_MCP_SERVERS_ENV).ok().as_deref()) {
+        return None;
+    }
+
     let home = dirs::home_dir()?;
     let claude_json = home.join(".claude.json");
     let raw = std::fs::read_to_string(&claude_json).ok()?;
@@ -1661,11 +1758,31 @@ fn cleanup_mcp_scratch_config(stdin_id: &str) {
     }
 }
 
+async fn dispatch_wechat_stream_event(
+    runtime: &wechat::runtime::WechatRuntimeHandle,
+    stdin_mgr: &StdinManager,
+    source_session_id: &str,
+    event: &Value,
+) {
+    let effects = runtime
+        .process_stream_event_for_session(Some(source_session_id), event, wechat::now_ms())
+        .await;
+    if effects.is_empty() {
+        return;
+    }
+
+    let store = runtime.state_store().await;
+    if let Err(err) = wechat::executor::execute_turn_effects(stdin_mgr, &store, &effects).await {
+        eprintln!("[WeChat] stream fanout failed: {err}");
+    }
+}
+
 #[tauri::command]
 async fn start_claude_session(
     app: AppHandle,
     state: State<'_, ProcessManager>,
     stdin_mgr: State<'_, StdinManager>,
+    wechat_runtime: State<'_, wechat::runtime::WechatRuntimeHandle>,
     bypass_modes: State<'_, BypassModeMap>,
     path_access: State<'_, PathAccessManager>,
     params: StartSessionParams,
@@ -1702,13 +1819,9 @@ async fn start_claude_session(
         "--strict-mcp-config".to_string(),
     ];
 
-    // Phase 4 §5.4 (S10): build a per-session MCP scratch config file.
-    // The CLI is spawned with --strict-mcp-config to exclude global MCP
-    // servers from ~/.claude.json (they'd slow cold start by 20-30 seconds).
-    // BUT users also need their explicitly-configured MCP servers available
-    // inside the session. Solution: write the mcpServers block from
-    // ~/.claude.json into a scratch file at ~/.tokenicode/mcp-session-<id>.json
-    // and pass it via --mcp-config. Cleaned up on process exit.
+    // Build a per-session MCP scratch config only for explicit opt-in. Keeping
+    // the default empty preserves fast desktop startup and prevents unrelated
+    // global MCP servers from blocking the first stream event.
     let mcp_scratch_path = build_mcp_scratch_config(&session_id);
     if let Some(ref scratch) = mcp_scratch_path {
         args.push("--mcp-config".to_string());
@@ -1795,8 +1908,15 @@ async fn start_claude_session(
     // api.anthropic.com endpoint.
     let (mut resolved_env, inherited_keys_to_remove, provider_extra_args, provider_caps) =
         resolve_provider_env(params.provider_id.as_deref())?;
+    apply_claude_cli_runtime_defaults(&mut resolved_env);
 
-    // Append provider-specific CLI args (e.g. --setting-sources project,local)
+    // Append provider-specific CLI args. Do NOT force a blanket
+    // `--setting-sources local` here: in the Claude CLI that flag also gates
+    // CLAUDE.md memory loading, so forcing "local" drops the user
+    // (~/.claude/CLAUDE.md) and parent-workspace CLAUDE.md that the desktop
+    // session is expected to honor (only the cwd's own CLAUDE.md survives).
+    // Startup-hook isolation is handled separately via runtime env defaults and
+    // MCP opt-out; providers may still inject their own --setting-sources.
     args.extend(provider_extra_args);
 
     // Keep partial text/thinking deltas for known-compatible providers; degrade
@@ -1860,9 +1980,7 @@ async fn start_claude_session(
     // `claude-opus-4-8`) deliberately do not match.
     if let Some(model_name) = params.model.as_deref() {
         let m = model_name.to_lowercase();
-        let is_1m_model = m.contains("mimo")
-            || m.contains("[1m]")
-            || m.ends_with("-1m");
+        let is_1m_model = m.contains("mimo") || m.contains("[1m]") || m.ends_with("-1m");
         if is_1m_model {
             resolved_env.insert(
                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW".to_string(),
@@ -2182,6 +2300,8 @@ async fn start_claude_session(
     let exit_notify_clone = exit_notify.clone();
     let state_clone = state.inner().clone();
     let stdin_mgr_clone = stdin_mgr.inner().clone();
+    let stdin_mgr_for_wechat = stdin_mgr.inner().clone();
+    let wechat_runtime_clone = wechat_runtime.inner().clone();
     let bypass_modes_clone = bypass_modes.inner().clone();
     let bypass_flag = bypass_modes
         .register(&sid, permission_mode == "bypassPermissions")
@@ -2243,6 +2363,14 @@ async fn start_claude_session(
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
+
+            dispatch_wechat_stream_event(
+                &wechat_runtime_clone,
+                &stdin_mgr_for_wechat,
+                &sid_clone,
+                &json,
+            )
+            .await;
 
             // Intercept control_request messages for SDK control protocol routing.
             // All modes use --permission-prompt-tool stdio. In bypass mode, we
@@ -2343,6 +2471,13 @@ async fn start_claude_session(
                                 "parent_tool_use_id": parent_tool_use_id,
                                 "agent_id": agent_id,
                             });
+                            dispatch_wechat_stream_event(
+                                &wechat_runtime_clone,
+                                &stdin_mgr_for_wechat,
+                                &sid_clone,
+                                &perm_payload,
+                            )
+                            .await;
                             let _ = emit_to_frontend(&app_clone, &stream_event, perm_payload);
                             continue; // Don't forward to stream as normal msg
                         }
@@ -7812,6 +7947,8 @@ async fn generate_session_title(
         "1".to_string(),
         "--dangerously-skip-permissions".to_string(),
     ];
+    // Title generation is a throwaway one-shot; for third-party providers limit
+    // setting sources to avoid pulling user settings into the helper call.
     if provider_id.is_some() {
         args.extend(["--setting-sources".to_string(), "project,local".to_string()]);
     }
@@ -8036,6 +8173,10 @@ pub fn run() {
         .manage(BypassModeMap::new())
         .manage(WatcherManager::default())
         .manage(PathAccessManager::new())
+        .manage(wechat::runtime::WechatRuntimeHandle::new(
+            wechat::store::default_wechat_state_store(),
+        ))
+        .manage(wechat::poller::WechatPollingTask::default())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // titleBarStyle: "Overlay" in tauri.conf.json handles macOS traffic lights
@@ -8162,6 +8303,15 @@ pub fn run() {
             send_control_request,
             commands::feedback::submit_feedback,
             commands::feedback::feedback_is_configured,
+            wechat::commands::wechat_get_status,
+            wechat::commands::wechat_get_preferences,
+            wechat::commands::wechat_set_preferences,
+            wechat::commands::wechat_start_qr_login,
+            wechat::commands::wechat_poll_qr_login,
+            wechat::commands::wechat_disconnect,
+            wechat::commands::wechat_start_polling,
+            wechat::commands::wechat_stop_polling,
+            wechat::commands::wechat_set_desktop_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:cua": "node scripts/launch-cua-dev.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

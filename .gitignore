@@ -76,3 +76,11 @@ screenshots/slash-commands.png
 
 # Test run outputs
 .test/runs/
+
+# CodeGraph (local index)
+.codegraph/
+.lsp-mcp/
+.mcp.json
+
+# Codex goal tracking state (local only)
+.goal/

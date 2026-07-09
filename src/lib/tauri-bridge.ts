@@ -128,6 +128,64 @@ export interface AuthStatus {
   unknown?: boolean;
 }
 
+export interface WechatAccountInfo {
+  accountId: string;
+  userId: string;
+  baseUrl: string;
+}
+
+export interface WechatStatus {
+  connected: boolean;
+  polling: boolean;
+  account: WechatAccountInfo | null;
+}
+
+export interface WechatPreferences {
+  splitOutboundTextByLineBreaks: boolean;
+}
+
+export interface WechatStatusEvent {
+  status: 'sessionExpired' | string;
+  connected: boolean;
+  message: string;
+  retryAfterMs?: number | null;
+}
+
+export interface WechatQrStart {
+  qrcodeId: string;
+  qrcodeImage: string;
+  qrcodeUrl: string;
+}
+
+export interface WechatQrPoll {
+  status: string;
+  connected: boolean;
+  message?: string | null;
+  account?: WechatAccountInfo | null;
+  redirectBaseUrl?: string | null;
+}
+
+export interface WechatDesktopAttachment {
+  name: string;
+  path: string;
+  isImage: boolean;
+}
+
+export interface WechatDesktopUserMessageEvent {
+  desktopSessionId: string;
+  content: string;
+  attachments?: WechatDesktopAttachment[];
+}
+
+export interface WechatDesktopClearConversationEvent {
+  desktopSessionId: string;
+}
+
+export interface WechatDesktopStopEvent {
+  desktopSessionId: string;
+  source: 'wechat' | string;
+}
+
 export interface StepResult {
   ok: boolean;
   message: string;
@@ -412,6 +470,39 @@ export const bridge = {
   openTerminalLogin: () =>
     invoke<void>('open_terminal_login'),
 
+  wechatGetStatus: () =>
+    invoke<WechatStatus>('wechat_get_status'),
+
+  wechatGetPreferences: () =>
+    invoke<WechatPreferences>('wechat_get_preferences'),
+
+  wechatSetPreferences: (splitOutboundTextByLineBreaks: boolean) =>
+    invoke<WechatPreferences>('wechat_set_preferences', {
+      splitOutboundTextByLineBreaks,
+    }),
+
+  wechatStartQrLogin: () =>
+    invoke<WechatQrStart>('wechat_start_qr_login'),
+
+  wechatPollQrLogin: (qrcodeId: string, verifyCode?: string, baseUrl?: string) =>
+    invoke<WechatQrPoll>('wechat_poll_qr_login', {
+      qrcodeId,
+      verifyCode: verifyCode || null,
+      baseUrl: baseUrl || null,
+    }),
+
+  wechatDisconnect: () =>
+    invoke<void>('wechat_disconnect'),
+
+  wechatStartPolling: (sessionId: string) =>
+    invoke<void>('wechat_start_polling', { sessionId }),
+
+  wechatStopPolling: () =>
+    invoke<void>('wechat_stop_polling'),
+
+  wechatSetDesktopSession: (sessionId: string | null) =>
+    invoke<void>('wechat_set_desktop_session', { sessionId }),
+
   // Session custom names (persisted to ~/.claude/tokenicode_session_names.json)
   loadCustomPreviews: () =>
     invoke<Record<string, string>>('load_custom_previews'),
@@ -561,6 +652,42 @@ export function onSessionExit(
 ): Promise<UnlistenFn> {
   return listen<number | null>(
     `claude:exit:${stdinId}`,
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopUserMessage(
+  callback: (message: WechatDesktopUserMessageEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopUserMessageEvent>(
+    'wechat:desktop_user_message',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopClearConversation(
+  callback: (message: WechatDesktopClearConversationEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopClearConversationEvent>(
+    'wechat:clear_desktop_conversation',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatDesktopStop(
+  callback: (message: WechatDesktopStopEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatDesktopStopEvent>(
+    'wechat:desktop_stop',
+    (event) => callback(event.payload),
+  );
+}
+
+export function onWechatStatus(
+  callback: (status: WechatStatusEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<WechatStatusEvent>(
+    'wechat:status',
     (event) => callback(event.payload),
   );
 }
