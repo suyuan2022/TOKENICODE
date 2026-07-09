@@ -85,6 +85,74 @@ impl PathMapper {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContainerSummary {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub state: String,
+}
+
+pub fn parse_docker_ps(output: &str) -> Vec<ContainerSummary> {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter_map(|v| {
+            Some(ContainerSummary {
+                id: v.get("ID")?.as_str()?.to_string(),
+                name: v.get("Names")?.as_str()?.to_string(),
+                image: v.get("Image")?.as_str()?.to_string(),
+                state: v.get("State")?.as_str().unwrap_or("unknown").to_string(),
+            })
+        })
+        .collect()
+}
+
+fn inspect_first(inspect_json: &str) -> Result<serde_json::Value, String> {
+    let v: serde_json::Value = serde_json::from_str(inspect_json)
+        .map_err(|e| format!("docker inspect: invalid JSON: {}", e))?;
+    v.as_array()
+        .and_then(|a| a.first().cloned())
+        .ok_or_else(|| "docker inspect: container not found".to_string())
+}
+
+pub fn parse_inspect_mounts(inspect_json: &str) -> Result<Vec<MountEntry>, String> {
+    let first = inspect_first(inspect_json)?;
+    let mounts = first.get("Mounts").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    Ok(mounts
+        .iter()
+        .filter(|m| m.get("Type").and_then(|t| t.as_str()) == Some("bind"))
+        .filter_map(|m| {
+            Some(MountEntry {
+                source: m.get("Source")?.as_str()?.to_string(),
+                destination: m.get("Destination")?.as_str()?.to_string(),
+            })
+        })
+        .collect())
+}
+
+pub fn parse_inspect_running(inspect_json: &str) -> Result<bool, String> {
+    let first = inspect_first(inspect_json)?;
+    Ok(first
+        .pointer("/State/Running")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false))
+}
+
+/// Run `docker <args>` and capture stdout; Err carries a stderr summary.
+pub async fn docker_capture(args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("docker not available: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("docker {} failed: {}", args.first().unwrap_or(&""), stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +236,46 @@ mod tests {
             m.to_host("/workspace/a").unwrap(),
             std::path::PathBuf::from("/Users/me/proj/a")
         );
+    }
+
+    const PS_FIXTURE: &str = r#"{"ID":"abc123","Names":"dev-box","Image":"ubuntu:24.04","State":"running"}
+{"ID":"def456","Names":"db","Image":"postgres:16","State":"running"}"#;
+
+    const INSPECT_FIXTURE: &str = r#"[{
+      "State": {"Running": true},
+      "Mounts": [
+        {"Type": "bind", "Source": "/Users/me/proj", "Destination": "/workspace"},
+        {"Type": "volume", "Source": "/var/lib/docker/volumes/v1/_data", "Destination": "/data"}
+      ]
+    }]"#;
+
+    #[test]
+    fn parse_ps_lines() {
+        let list = parse_docker_ps(PS_FIXTURE);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "dev-box");
+        assert_eq!(list[0].image, "ubuntu:24.04");
+    }
+
+    #[test]
+    fn parse_ps_ignores_garbage_lines() {
+        assert_eq!(parse_docker_ps("not json\n").len(), 0);
+    }
+
+    #[test]
+    fn inspect_mounts_keeps_only_binds() {
+        let mounts = parse_inspect_mounts(INSPECT_FIXTURE).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].destination, "/workspace");
+    }
+
+    #[test]
+    fn inspect_running_state() {
+        assert!(parse_inspect_running(INSPECT_FIXTURE).unwrap());
+    }
+
+    #[test]
+    fn inspect_bad_json_is_err() {
+        assert!(parse_inspect_mounts("[]").is_err()); // 空数组=容器不存在
     }
 }
