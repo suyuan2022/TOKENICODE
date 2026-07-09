@@ -1511,7 +1511,14 @@ async fn claude_projects_dirs(
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".claude").join("projects"));
     }
-    roots.extend(backends.extra_claude_projects_dirs().await);
+    // Dedupe: a container may bind-mount the host home, so its extra projects
+    // dir can equal (or already be covered by) a root already present. Skipping
+    // exact duplicates prevents duplicate session rows.
+    for dir in backends.extra_claude_projects_dirs().await {
+        if !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    }
     roots
 }
 
@@ -1827,12 +1834,14 @@ async fn start_claude_session(
         .register_cwd(&backends.to_host_or_passthrough(&params.cwd).await)
         .await;
 
-    // Resolve the docker backend for this session, if any. An explicit
-    // container name wins; otherwise infer from the (container) cwd. `None`
-    // means a normal local spawn.
+    // Resolve the docker backend for this session, if any. Selection is driven
+    // solely by the explicit `docker_container` field the frontend sends for
+    // docker sessions; we do NOT infer from cwd. Inference could misroute a
+    // deliberately-local session into a container when host/container paths are
+    // identical (e.g. `-v $PWD:$PWD`). `None` means a normal local spawn.
     let docker_backend_proj = match params.docker_container {
         Some(ref c) => backends.project_by_container(c).await,
-        None => backends.backend_for_cwd(&params.cwd).await,
+        None => None,
     };
 
     let session_id = params
@@ -3796,7 +3805,12 @@ unsafe fn create_nsurl_from_path(path: &str) -> *mut objc::runtime::Object {
 
 /// Show the macOS native share sheet for a file at the current mouse position.
 #[tauri::command]
-async fn share_file(path: String, app: AppHandle) -> Result<(), String> {
+async fn share_file(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     #[cfg(target_os = "macos")]
     {
         app.run_on_main_thread(move || {
@@ -3887,7 +3901,12 @@ async fn share_file(path: String, app: AppHandle) -> Result<(), String> {
 ///   Copy file to clipboard via PowerShell, then open WeChat via `weixin://`.
 #[tauri::command]
 #[allow(deprecated)]
-async fn share_to_wechat(path: String, app: AppHandle) -> Result<String, String> {
+async fn share_to_wechat(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     if !std::path::Path::new(&path).exists() {
         return Err("File not found".to_string());
     }
@@ -8393,15 +8412,24 @@ async fn generate_session_title(
 /// On Windows: opens cmd.exe with enriched PATH.
 #[tauri::command]
 async fn open_terminal_login(container: Option<String>) -> Result<(), String> {
-    let claude_bin = find_claude_binary().ok_or_else(|| {
-        "Claude CLI not found. Please install it first via the Setup Wizard.".to_string()
-    })?;
+    // Only the local (None) login needs a host `claude` binary. A container
+    // login runs `docker exec ... claude login` inside the container, so hosts
+    // without claude installed must not be blocked by find_claude_binary.
+    let claude_bin: Option<String> = match container {
+        Some(_) => None,
+        None => Some(find_claude_binary().ok_or_else(|| {
+            "Claude CLI not found. Please install it first via the Setup Wizard.".to_string()
+        })?),
+    };
 
     #[cfg(target_os = "macos")]
     {
         let command = match container {
             Some(ref c) => format!("docker exec -it {} claude login", shell_single_quote(c)),
-            None => format!("{} login", shell_single_quote(&claude_bin)),
+            None => format!(
+                "{} login",
+                shell_single_quote(claude_bin.as_deref().unwrap_or_default())
+            ),
         };
         let script = format!(
             r#"tell application "Terminal"
@@ -8421,12 +8449,15 @@ end tell"#,
         // Try common terminal emulators in order of preference
         let xterm_cmd = match container {
             Some(ref c) => format!("docker exec -it {} claude login", shell_single_quote(c)),
-            None => format!("{} login", shell_single_quote(&claude_bin)),
+            None => format!(
+                "{} login",
+                shell_single_quote(claude_bin.as_deref().unwrap_or_default())
+            ),
         };
         // Argv fragment for the emulators that exec the program directly.
         let prog_args: Vec<&str> = match container {
             Some(ref c) => vec!["docker", "exec", "-it", c.as_str(), "claude", "login"],
-            None => vec![claude_bin.as_str(), "login"],
+            None => vec![claude_bin.as_deref().unwrap_or_default(), "login"],
         };
         let gnome_args: Vec<&str> =
             std::iter::once("--").chain(prog_args.iter().copied()).collect();
@@ -8460,7 +8491,7 @@ end tell"#,
         let enriched_path = build_enriched_path();
         let win_cmd = match container {
             Some(ref c) => format!("docker exec -it {} claude login", c),
-            None => format!("\"{}\" login", claude_bin),
+            None => format!("\"{}\" login", claude_bin.as_deref().unwrap_or_default()),
         };
         std::process::Command::new("cmd")
             .arg("/k")

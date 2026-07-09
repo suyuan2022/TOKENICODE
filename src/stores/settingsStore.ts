@@ -349,8 +349,10 @@ export const useSettingsStore = create<SettingsState>()(
         colorTheme: state.colorTheme,
         sidebarOpen: state.sidebarOpen,
         secondaryPanelWidth: state.secondaryPanelWidth,
-        // workingDirectory intentionally NOT persisted — app starts at WelcomeScreen
-        workingBackend: state.workingBackend,
+        // workingDirectory intentionally NOT persisted — app starts at WelcomeScreen.
+        // workingBackend is likewise NOT persisted: BackendManager is in-memory,
+        // so a persisted docker backend would be a phantom after restart (wrong
+        // badge, wrong history banner, misrouted spawn).
         selectedModel: state.selectedModel,
         sessionMode: state.sessionMode,
         locale: state.locale,

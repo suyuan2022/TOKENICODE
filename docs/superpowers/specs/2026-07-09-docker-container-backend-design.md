@@ -113,13 +113,13 @@ type WorkspaceBackend =
                         "-w", containerCwd,
                         "-e", "KEY=VAL", ...   // provider env 注入改为 -e
                         container,
-                        claude_bin_in_container])  // 默认 "claude"，设置可覆盖
+                        claude_bin_in_container])  // v1 固定为 PATH 中的 "claude"（设置覆盖为 future）
                  .args(原有 claude args)
 ```
 
 - stdin/stdout/stderr 仍为 `Stdio::piped()`；下游 NDJSON 处理零改动。
 - 跳过 `find_claude_binary()`（那是本机发现逻辑）；容器内默认假定 PATH 中有
-  `claude`，设置项允许指定容器内绝对路径。
+  `claude`。v1 固定使用 PATH 中的 `claude`，通过设置指定容器内绝对路径列为 future。
 - 无需 `env_remove("CLAUDECODE")` 等本机环境清理（docker exec 不继承本机 env）。
 - 为支持精确停止（§4.2），容器内命令包一层 shell 以捕获进程号：
   `sh -c 'echo "__TOKENICODE_PID__$$" >&2; exec claude <args...>'`。
@@ -195,7 +195,12 @@ bind mount 下时，`BackendManager::extra_claude_projects_dirs()` 把它翻译�
 最近项目列表混合展示，容器项目带容器图标 + 容器名徽标；工作区顶部常驻显示当前
 连接的容器名。
 
-### 7.2 环境预检（连接时 + 每次新会话前轻量复查）
+> v1 未实现：最近项目的容器徽标/恢复。recents 目前恢复为本机模式（不持久化
+> workingBackend），容器徽标与从 recents 恢复容器连接列为 future。
+
+### 7.2 环境预检（连接时预检 + 退出后探测）
+
+> v1 未实现：「每次新会话前轻量复查」。当前由连接时预检 + 退出后探测覆盖。
 
 | 检查 | 失败提示 |
 |---|---|
@@ -219,6 +224,9 @@ bind mount 下时，`BackendManager::extra_claude_projects_dirs()` 把它翻译�
   需要权限。建议容器使用与本机 uid 匹配的用户运行。
 - **Windows**：宿主机路径格式（`C:\`、Docker Desktop 的 `/host_mnt/...`）需要
   单独适配。第一版保证 macOS / Linux 完整可用，Windows 映射列为已知限制。
+- **会话后端选择**：docker 会话仅由前端显式传入的 `docker_container` 字段选择，
+  绝不从 cwd 推断。当宿主机与容器路径相同（如 `-v $PWD:$PWD`）时，cwd 推断会把
+  一个刻意的本机会话误路由进容器，故已移除该回退。
 
 ## 10. 测试策略
 

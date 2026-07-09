@@ -32,18 +32,24 @@ export function DockerConnectDialog({ open, onClose }: DockerConnectDialogProps)
   const [connecting, setConnecting] = useState(false);
   /** i18n key of the current error, or null. */
   const [errorKey, setErrorKey] = useState<string | null>(null);
+  /** Raw Rust error string, shown alongside the generic `docker.error` fallback. */
+  const [rawError, setRawError] = useState<string | null>(null);
   /** Whether the error offers a one-click `docker start`. */
   const [canStart, setCanStart] = useState(false);
 
   /** Map a raw Rust error string to an i18n key. */
   const mapError = useCallback((err: unknown): string => {
     const msg = String((err as { message?: string })?.message ?? err ?? '');
+    setRawError(null);
     if (msg.includes('docker not available')) return 'docker.notInstalled';
     if (msg.startsWith('CONTAINER_NOT_RUNNING')) return 'docker.notRunning';
     if (msg.startsWith('PATH_NOT_MOUNTED') || msg.startsWith('HOST_PATH_MISSING'))
       return 'docker.notMounted';
     if (msg.startsWith('CLAUDE_NOT_FOUND_IN_CONTAINER')) return 'docker.claudeMissing';
-    return 'docker.notInstalled';
+    // Unknown error: generic fallback plus the raw string for context, rather
+    // than misleadingly claiming Docker is not installed.
+    setRawError(msg || null);
+    return 'docker.error';
   }, []);
 
   const loadContainers = useCallback(async () => {
@@ -218,7 +224,10 @@ export function DockerConnectDialog({ open, onClose }: DockerConnectDialogProps)
         {/* Error */}
         {errorKey && (
           <div className="mt-3 flex items-center justify-between gap-2">
-            <p className="text-xs text-error">{t(errorKey)}</p>
+            <p className="text-xs text-error">
+              {t(errorKey)}
+              {errorKey === 'docker.error' && rawError ? `: ${rawError}` : ''}
+            </p>
             {canStart && selected && (
               <button
                 onClick={handleStart}
