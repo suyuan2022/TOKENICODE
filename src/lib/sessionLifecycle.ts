@@ -21,6 +21,7 @@ import type { SessionStatus } from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { streamController } from '../stream/instance';
 import type { CliPermissionMode, SessionMode, ThinkingLevel } from '../stores/settingsStore';
+import { useSettingsStore } from '../stores/settingsStore';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -265,8 +266,19 @@ export async function spawnSession(params: SpawnParams): Promise<SpawnResult> {
     };
     (window as any).__claudeUnlisteners[stdinId] = combinedUnlisten;
 
-    // STEP 4: Start CLI process
-    const session = await bridge.startSession(sessionParams);
+    // STEP 4: Start CLI process.
+    // Authoritative injection point for the docker backend: every spawn path
+    // (InputBar / ChatPanel / useStreamProcessor / useRemoteSession) funnels
+    // through spawnSession, so we resolve the container from settingsStore here
+    // rather than at each call site. Local backend leaves docker_container unset.
+    const workingBackend = useSettingsStore.getState().workingBackend;
+    const session = await bridge.startSession({
+      ...sessionParams,
+      docker_container:
+        workingBackend.kind === 'docker'
+          ? workingBackend.container
+          : sessionParams.docker_container,
+    });
 
     // STEP 4b: Set sessionStatus to running. This is critical for switch/plan-approve
     // paths where teardownSession set 'stopped' before we got here. Without this, the

@@ -4844,6 +4844,52 @@ async fn get_file_size(
     Ok(metadata.len())
 }
 
+/// Ensure `{dir}/.tokenicode/tmp/` exists and `.tokenicode` is gitignored,
+/// returning the tmp dir. Shared by `save_temp_file` and `stage_external_file`
+/// so the dir-creation + gitignore logic lives in one place.
+fn ensure_tokenicode_tmp(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let tmp = dir.join(".tokenicode").join("tmp");
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+    // Ensure .tokenicode is gitignored in the user's project.
+    let gitignore = dir.join(".tokenicode").join(".gitignore");
+    if !gitignore.exists() {
+        let _ = std::fs::write(&gitignore, "*\n");
+    }
+    Ok(tmp)
+}
+
+/// Copy an external (host) file dragged in from the OS into the docker project's
+/// bind-mounted `.tokenicode/tmp/` so the in-container CLI can read it, returning
+/// the CONTAINER-space path. `cwd` is the container working dir; `src` is a host
+/// OS path.
+#[tauri::command]
+async fn stage_external_file(
+    backends: State<'_, docker_backend::BackendManager>,
+    path_access: State<'_, PathAccessManager>,
+    cwd: String,
+    src: String,
+) -> Result<String, String> {
+    // Translate the container cwd to its host mount so the copy lands in the
+    // bind-mounted project directory that the container sees.
+    let host_cwd = backends.to_host_or_passthrough(&cwd).await;
+    let tmp = ensure_tokenicode_tmp(&host_cwd)?;
+
+    // Dragging a file in from the OS is an explicit authorization — register it
+    // so follow-up frontend reads of the same path are permitted.
+    path_access.register_cwd(std::path::Path::new(&src)).await;
+
+    let filename = std::path::Path::new(&src)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    // uuid prefix keeps concurrent drops of same-named files from colliding.
+    let stamp = uuid::Uuid::new_v4().to_string();
+    let dest = tmp.join(format!("{}-{}", stamp, filename));
+    std::fs::copy(&src, &dest).map_err(|e| format!("Failed to stage file: {}", e))?;
+
+    Ok(docker_backend::staged_attachment_container_path(&cwd, &filename, &stamp))
+}
+
 /// Save a file to a temp directory and return its path.
 /// Uses a unique suffix to avoid name collisions (e.g. multiple pasted images all named "image.png").
 #[tauri::command]
@@ -4867,21 +4913,8 @@ async fn save_temp_file(
     // If a working directory is provided, save inside it so Claude CLI can access the file.
     // Falls back to system temp if cwd is not set.
     let tmp = if let Some(ref dir) = cwd {
-        let p = std::path::PathBuf::from(dir)
-            .join(".tokenicode")
-            .join("tmp");
-        if std::fs::create_dir_all(&p).is_ok() {
-            // Ensure .tokenicode is gitignored in user's project
-            let gitignore = std::path::PathBuf::from(dir)
-                .join(".tokenicode")
-                .join(".gitignore");
-            if !gitignore.exists() {
-                let _ = std::fs::write(&gitignore, "*\n");
-            }
-            p
-        } else {
-            std::env::temp_dir().join("tokenicode")
-        }
+        ensure_tokenicode_tmp(std::path::Path::new(dir))
+            .unwrap_or_else(|_| std::env::temp_dir().join("tokenicode"))
     } else {
         std::env::temp_dir().join("tokenicode")
     };
@@ -8359,14 +8392,17 @@ async fn generate_session_title(
 /// On Linux: tries common terminal emulators.
 /// On Windows: opens cmd.exe with enriched PATH.
 #[tauri::command]
-async fn open_terminal_login() -> Result<(), String> {
+async fn open_terminal_login(container: Option<String>) -> Result<(), String> {
     let claude_bin = find_claude_binary().ok_or_else(|| {
         "Claude CLI not found. Please install it first via the Setup Wizard.".to_string()
     })?;
 
     #[cfg(target_os = "macos")]
     {
-        let command = format!("{} login", shell_single_quote(&claude_bin));
+        let command = match container {
+            Some(ref c) => format!("docker exec -it {} claude login", shell_single_quote(c)),
+            None => format!("{} login", shell_single_quote(&claude_bin)),
+        };
         let script = format!(
             r#"tell application "Terminal"
     activate
@@ -8383,10 +8419,22 @@ end tell"#,
     #[cfg(target_os = "linux")]
     {
         // Try common terminal emulators in order of preference
-        let xterm_cmd = format!("{} login", shell_single_quote(&claude_bin));
+        let xterm_cmd = match container {
+            Some(ref c) => format!("docker exec -it {} claude login", shell_single_quote(c)),
+            None => format!("{} login", shell_single_quote(&claude_bin)),
+        };
+        // Argv fragment for the emulators that exec the program directly.
+        let prog_args: Vec<&str> = match container {
+            Some(ref c) => vec!["docker", "exec", "-it", c.as_str(), "claude", "login"],
+            None => vec![claude_bin.as_str(), "login"],
+        };
+        let gnome_args: Vec<&str> =
+            std::iter::once("--").chain(prog_args.iter().copied()).collect();
+        let konsole_args: Vec<&str> =
+            std::iter::once("-e").chain(prog_args.iter().copied()).collect();
         let terminals = [
-            ("gnome-terminal", vec!["--", &claude_bin, "login"]),
-            ("konsole", vec!["-e", &claude_bin, "login"]),
+            ("gnome-terminal", gnome_args),
+            ("konsole", konsole_args),
             ("xterm", vec!["-e", xterm_cmd.as_str()]),
         ];
         let mut opened = false;
@@ -8410,9 +8458,13 @@ end tell"#,
         // Spawn cmd /k with CREATE_NEW_CONSOLE to open a visible terminal window.
         // This avoids the `start` command's tricky quoting rules.
         let enriched_path = build_enriched_path();
+        let win_cmd = match container {
+            Some(ref c) => format!("docker exec -it {} claude login", c),
+            None => format!("\"{}\" login", claude_bin),
+        };
         std::process::Command::new("cmd")
             .arg("/k")
-            .arg(&format!("\"{}\" login", claude_bin))
+            .arg(&win_cmd)
             .env("PATH", &enriched_path)
             .creation_flags(0x00000010) // CREATE_NEW_CONSOLE
             .spawn()
@@ -8568,6 +8620,7 @@ pub fn run() {
             watch_directory,
             unwatch_directory,
             save_temp_file,
+            stage_external_file,
             get_file_size,
             check_file_access,
             read_file_base64,

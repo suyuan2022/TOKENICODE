@@ -112,6 +112,30 @@ export function ConversationList() {
   const ensureWechatRemoteSession = useSessionStore((s) => s.ensureWechatRemoteSession);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const wechatWorkspacePath = useSettingsStore((s) => s.wechatWorkspacePath);
+  const workingBackend = useSettingsStore((s) => s.workingBackend);
+
+  // Non-blocking notice when a connected container's ~/.claude history is not
+  // readable from the host (home dir not bind-mounted). Session history for
+  // such projects simply won't appear; warn rather than fail silently.
+  const [dockerHistoryUnavailable, setDockerHistoryUnavailable] = useState(false);
+  useEffect(() => {
+    if (workingBackend.kind !== 'docker') {
+      setDockerHistoryUnavailable(false);
+      return;
+    }
+    let cancelled = false;
+    bridge
+      .dockerHistoryAvailable(workingBackend.container)
+      .then((available) => {
+        if (!cancelled) setDockerHistoryUnavailable(!available);
+      })
+      .catch(() => {
+        if (!cancelled) setDockerHistoryUnavailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workingBackend]);
 
   // Context menus
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -736,6 +760,14 @@ export function ConversationList() {
           </div>
         </div>
       </div>
+
+      {/* Docker history unavailable notice (home dir not mounted) */}
+      {dockerHistoryUnavailable && (
+        <div className="mx-1 mb-2 rounded-lg border border-warning/30 bg-warning/10
+          px-3 py-2 text-[12px] text-warning">
+          {t('docker.historyUnavailable')}
+        </div>
+      )}
 
       {/* Loading */}
       {isLoading && sessions.length === 0 && (

@@ -222,10 +222,21 @@ export function useFileAttachments() {
             }
           }
 
+          // For docker projects the dropped file lives on the host but the
+          // in-container CLI can't see it — stage a copy into the project's
+          // bind-mounted .tokenicode/tmp/ and hand the CLI the container path.
+          // Thumbnail/size above still read the original host path directly.
+          let attachPath = filePath;
+          const backend = useSettingsStore.getState().workingBackend;
+          if (backend.kind === 'docker') {
+            const cwd = useSettingsStore.getState().workingDirectory;
+            attachPath = await bridge.stageExternalFile(cwd, filePath);
+          }
+
           newFiles.push({
             id: generateFileId(),
             name,
-            path: filePath,
+            path: attachPath,
             size: fileSize,
             type: mime,
             isImage: isImg,

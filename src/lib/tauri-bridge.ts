@@ -389,6 +389,12 @@ export const bridge = {
   saveTempFile: (name: string, data: number[], cwd?: string) =>
     invoke<string>('save_temp_file', { name, data, cwd: cwd || null }),
 
+  /** Copy an OS-dragged external file into a docker project's bind-mounted
+   *  `.tokenicode/tmp/` and return the CONTAINER path the in-container CLI can
+   *  read. `cwd` is the container working dir; `src` is a host OS path. */
+  stageExternalFile: (cwd: string, src: string) =>
+    invoke<string>('stage_external_file', { cwd, src }),
+
   getFileSize: (path: string, tabId?: string) =>
     invoke<number>('get_file_size', { path, tabId: tabId ?? null }),
 
@@ -493,8 +499,10 @@ export const bridge = {
   checkClaudeAuth: () =>
     invoke<AuthStatus>('check_claude_auth'),
 
-  openTerminalLogin: () =>
-    invoke<void>('open_terminal_login'),
+  /** Open a native terminal running `claude login`. When `container` is set the
+   *  command becomes `docker exec -it <container> claude login`. */
+  openTerminalLogin: (container?: string) =>
+    invoke<void>('open_terminal_login', { container: container ?? null }),
 
   wechatGetStatus: () =>
     invoke<WechatStatus>('wechat_get_status'),

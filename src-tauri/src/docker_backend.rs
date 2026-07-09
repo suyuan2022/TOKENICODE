@@ -238,6 +238,14 @@ pub fn remap_path_out(mapper: &Option<PathMapper>, host: &str) -> String {
     }
 }
 
+/// Container-space path for a staged external attachment. Mirrors where
+/// `stage_external_file` copies the file on the host (`.tokenicode/tmp/`), but
+/// expressed in the container's cwd so the path can be handed straight to the
+/// in-container CLI.
+pub fn staged_attachment_container_path(cwd: &str, filename: &str, stamp: &str) -> String {
+    format!("{}/.tokenicode/tmp/{}-{}", cwd, stamp, filename)
+}
+
 /// A ready-to-spawn `docker exec` invocation: program plus full argv.
 #[derive(Debug)]
 pub struct DockerExecSpec {
@@ -563,6 +571,12 @@ mod tests {
                 "c".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn staged_container_path_shape() {
+        let p = staged_attachment_container_path("/workspace", "photo.png", "abcd1234");
+        assert_eq!(p, "/workspace/.tokenicode/tmp/abcd1234-photo.png");
     }
 
     #[test]
