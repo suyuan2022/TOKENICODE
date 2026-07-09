@@ -1,4 +1,5 @@
 mod commands;
+pub mod docker_backend;
 pub mod env_manager;
 mod events;
 pub mod path_access;
