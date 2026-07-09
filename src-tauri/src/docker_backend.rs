@@ -188,6 +188,30 @@ impl BackendManager {
         let projects = self.projects.lock().await;
         projects.iter().find(|p| p.mapper.to_host(cwd).is_some()).cloned()
     }
+
+    /// Returns a clone of the mapper of whichever project maps the given
+    /// container path, or None if no project owns it. Used by fs commands
+    /// (file tree DFS, watcher callback) to remap host paths back to container
+    /// space synchronously after snapshotting the mapper.
+    pub async fn mapper_for_container_path(&self, path: &str) -> Option<PathMapper> {
+        let projects = self.projects.lock().await;
+        projects
+            .iter()
+            .find(|p| p.mapper.to_host(path).is_some())
+            .map(|p| p.mapper.clone())
+    }
+}
+
+/// Host path string → container path string. Passthrough (returns `host`
+/// unchanged) when there is no mapper or the host path is under no mount.
+/// Shared by the file-tree DFS and the watcher callback.
+pub fn remap_path_out(mapper: &Option<PathMapper>, host: &str) -> String {
+    match mapper {
+        Some(m) => m
+            .to_container(Path::new(host))
+            .unwrap_or_else(|| host.to_string()),
+        None => host.to_string(),
+    }
 }
 
 /// Run `docker <args>` and capture stdout; Err carries a stderr summary.
@@ -378,5 +402,42 @@ mod tests {
         mgr.register(docker_proj()).await;
         mgr.register(docker_proj()).await;
         assert_eq!(mgr.projects.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn remap_tree_paths_rewrites_prefix() {
+        let mapper = PathMapper::new(vec![MountEntry {
+            source: "/Users/me/proj".into(),
+            destination: "/workspace".into(),
+        }]);
+        // remap_path_out: host path string → container path string (passthrough if unmapped)
+        assert_eq!(
+            remap_path_out(&Some(mapper.clone()), "/Users/me/proj/src"),
+            "/workspace/src"
+        );
+        assert_eq!(remap_path_out(&None, "/tmp/x"), "/tmp/x");
+    }
+
+    #[test]
+    fn remap_path_out_passes_through_unmapped_host() {
+        let mapper = PathMapper::new(vec![MountEntry {
+            source: "/Users/me/proj".into(),
+            destination: "/workspace".into(),
+        }]);
+        // Host path outside any mount stays as-is even with a mapper present.
+        assert_eq!(remap_path_out(&Some(mapper), "/tmp/x"), "/tmp/x");
+    }
+
+    #[tokio::test]
+    async fn mapper_for_container_path_returns_matching_project_mapper() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await;
+        let m = mgr.mapper_for_container_path("/workspace/x").await;
+        assert!(m.is_some());
+        assert_eq!(
+            m.unwrap().to_host("/workspace/x").unwrap(),
+            std::path::PathBuf::from("/Users/me/proj/x")
+        );
+        assert!(mgr.mapper_for_container_path("/tmp/x").await.is_none());
     }
 }

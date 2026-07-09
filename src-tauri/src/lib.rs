@@ -3549,7 +3549,11 @@ async fn load_session(path: String) -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
-async fn open_in_vscode(path: String) -> Result<(), String> {
+async fn open_in_vscode(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let mut cmd = Command::new("code");
     cmd.arg(&path);
     #[cfg(target_os = "windows")]
@@ -3560,7 +3564,11 @@ async fn open_in_vscode(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn reveal_in_finder(path: String) -> Result<(), String> {
+async fn reveal_in_finder(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     #[cfg(target_os = "macos")]
     {
         // Use 'open -R' to reveal (select) the file in Finder
@@ -3593,7 +3601,11 @@ async fn reveal_in_finder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn open_with_default_app(path: String) -> Result<(), String> {
+async fn open_with_default_app(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     #[cfg(target_os = "macos")]
     {
         Command::new("open")
@@ -4046,18 +4058,37 @@ async fn docker_preflight(container: String) -> Result<(), String> {
 #[tauri::command]
 async fn read_file_tree(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
     depth: Option<u32>,
 ) -> Result<Vec<FileNode>, String> {
+    // Keep the original (possibly container-space) path so we can look up the
+    // mapper and remap the produced host paths back to container space.
+    let original_path = path.clone();
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let mapper = backends.mapper_for_container_path(&original_path).await;
     // Register the browsed directory as a fixed root so file operations
     // (preview, read) work even before the first CLI session is started.
+    // Registers the TRANSLATED host path (fs operations run against host).
     path_access.register_cwd(std::path::Path::new(&path)).await;
     let max_depth = depth.unwrap_or(5);
     let root = std::path::Path::new(&path);
     if !root.exists() {
         return Err("Directory does not exist".to_string());
     }
-    Ok(read_dir_recursive(root, 0, max_depth))
+    let mut nodes = read_dir_recursive(root, 0, max_depth);
+    if mapper.is_some() {
+        fn remap(nodes: &mut Vec<FileNode>, mapper: &Option<docker_backend::PathMapper>) {
+            for n in nodes.iter_mut() {
+                n.path = docker_backend::remap_path_out(mapper, &n.path);
+                if let Some(ref mut ch) = n.children {
+                    remap(ch, mapper);
+                }
+            }
+        }
+        remap(&mut nodes, &mapper);
+    }
+    Ok(nodes)
 }
 
 fn read_dir_recursive(dir: &std::path::Path, current_depth: u32, max_depth: u32) -> Vec<FileNode> {
@@ -4134,9 +4165,11 @@ fn read_dir_recursive(dir: &std::path::Path, current_depth: u32, max_depth: u32)
 #[tauri::command]
 async fn read_file_content(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
     tab_id: Option<String>,
 ) -> Result<String, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let p = path_access
         .validate(
             std::path::Path::new(&path),
@@ -4156,7 +4189,11 @@ async fn read_file_content(
 /// Returns Ok(true) if readable, Ok(false) if not, Err on other failures.
 /// Used at startup to detect macOS TCC restrictions.
 #[tauri::command]
-async fn check_file_access(path: String) -> Result<bool, String> {
+async fn check_file_access(
+    backends: State<'_, docker_backend::BackendManager>,
+    path: String,
+) -> Result<bool, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     match std::fs::read_dir(&path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
@@ -4170,11 +4207,13 @@ async fn check_file_access(path: String) -> Result<bool, String> {
 #[tauri::command]
 async fn read_file_base64(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
     tab_id: Option<String>,
 ) -> Result<String, String> {
     use base64::Engine as _;
 
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let p = path_access
         .validate(
             std::path::Path::new(&path),
@@ -4221,10 +4260,12 @@ async fn read_file_base64(
 #[tauri::command]
 async fn write_file_content(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
     content: String,
     tab_id: Option<String>,
 ) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let p = path_access
         .validate(
             std::path::Path::new(&path),
@@ -4238,10 +4279,13 @@ async fn write_file_content(
 #[tauri::command]
 async fn copy_file(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     src: String,
     dest: String,
     tab_id: Option<String>,
 ) -> Result<(), String> {
+    let src = backends.to_host_or_passthrough(&src).await.to_string_lossy().to_string();
+    let dest = backends.to_host_or_passthrough(&dest).await.to_string_lossy().to_string();
     let s = path_access
         .validate(
             std::path::Path::new(&src),
@@ -4264,10 +4308,13 @@ async fn copy_file(
 #[tauri::command]
 async fn rename_file(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     src: String,
     dest: String,
     tab_id: Option<String>,
 ) -> Result<(), String> {
+    let src = backends.to_host_or_passthrough(&src).await.to_string_lossy().to_string();
+    let dest = backends.to_host_or_passthrough(&dest).await.to_string_lossy().to_string();
     let s = path_access
         .validate(
             std::path::Path::new(&src),
@@ -4288,9 +4335,11 @@ async fn rename_file(
 #[tauri::command]
 async fn delete_file(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
     tab_id: Option<String>,
 ) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let p = path_access
         .validate(
             std::path::Path::new(&path),
@@ -4305,9 +4354,11 @@ async fn delete_file(
 #[tauri::command]
 async fn create_directory(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
     tab_id: Option<String>,
 ) -> Result<(), String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let p = path_access
         .validate(
             std::path::Path::new(&path),
@@ -4510,9 +4561,17 @@ async fn list_recent_projects() -> Result<Vec<Value>, String> {
 async fn watch_directory(
     app: AppHandle,
     state: State<'_, WatcherManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
 ) -> Result<(), String> {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
+
+    // The frontend-supplied `path` (container space) stays the map key and the
+    // "root" reported in events so unwatch_directory with the same key works.
+    // notify watches the translated host path; the callback remaps event paths
+    // back to container space using a synchronous snapshot of the mapper.
+    let host_path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
+    let mapper = backends.mapper_for_container_path(&path).await;
 
     // Stop existing watcher for this path if any
     {
@@ -4550,7 +4609,7 @@ async fn watch_directory(
                     !p.components()
                         .any(|c| IGNORED_SEGMENTS.iter().any(|seg| c.as_os_str() == *seg))
                 })
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|p| docker_backend::remap_path_out(&mapper, &p.to_string_lossy()))
                 .collect();
             if paths.is_empty() {
                 return;
@@ -4569,7 +4628,7 @@ async fn watch_directory(
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
     watcher
-        .watch(std::path::Path::new(&path), RecursiveMode::Recursive)
+        .watch(std::path::Path::new(&host_path), RecursiveMode::Recursive)
         .map_err(|e| format!("Failed to watch: {}", e))?;
 
     let mut watchers = state.watchers.lock().await;
@@ -4589,9 +4648,11 @@ async fn unwatch_directory(state: State<'_, WatcherManager>, path: String) -> Re
 #[tauri::command]
 async fn get_file_size(
     path_access: State<'_, PathAccessManager>,
+    backends: State<'_, docker_backend::BackendManager>,
     path: String,
     tab_id: Option<String>,
 ) -> Result<u64, String> {
+    let path = backends.to_host_or_passthrough(&path).await.to_string_lossy().to_string();
     let p = path_access
         .validate(
             std::path::Path::new(&path),
@@ -4608,10 +4669,22 @@ async fn get_file_size(
 /// Uses a unique suffix to avoid name collisions (e.g. multiple pasted images all named "image.png").
 #[tauri::command]
 async fn save_temp_file(
+    backends: State<'_, docker_backend::BackendManager>,
     name: String,
     data: Vec<u8>,
     cwd: Option<String>,
 ) -> Result<String, String> {
+    // Translate the container cwd to a host path so the file lands in the
+    // bind-mounted project dir; snapshot the mapper so the returned path can be
+    // mapped back to container space (the frontend forwards it to the CLI).
+    let mapper = match cwd {
+        Some(ref c) => backends.mapper_for_container_path(c).await,
+        None => None,
+    };
+    let cwd = match cwd {
+        Some(c) => Some(backends.to_host_or_passthrough(&c).await.to_string_lossy().to_string()),
+        None => None,
+    };
     // If a working directory is provided, save inside it so Claude CLI can access the file.
     // Falls back to system temp if cwd is not set.
     let tmp = if let Some(ref dir) = cwd {
@@ -4658,7 +4731,9 @@ async fn save_temp_file(
     let unique_name = format!("{}_{}{}{}", stem, ts, count, ext);
     let path = tmp.join(&unique_name);
     std::fs::write(&path, &data).map_err(|e| format!("Failed to write temp file: {}", e))?;
-    Ok(path.to_string_lossy().to_string())
+    // When the cwd was container-mapped, return the container-space path so the
+    // frontend can hand it to the in-container CLI.
+    Ok(docker_backend::remap_path_out(&mapper, &path.to_string_lossy()))
 }
 
 // ── Slash Commands & Skills ──────────────────────────────────────────────
