@@ -196,6 +196,23 @@ impl BackendManager {
         projects.iter().find(|p| p.container == name).cloned()
     }
 
+    /// Host paths of each docker project's `~/.claude/projects` directory, but
+    /// only when the container's home is bind-mounted AND the host directory
+    /// exists. Session history for those containers can then be read through the
+    /// existing host-side scanners with zero extra machinery. Unmounted
+    /// containers contribute nothing (Task 7 shows a "history unavailable" hint).
+    pub async fn extra_claude_projects_dirs(&self) -> Vec<PathBuf> {
+        let projects = self.projects.lock().await;
+        projects
+            .iter()
+            .filter_map(|p| {
+                let home = p.home.as_deref()?;
+                let host = p.mapper.to_host(&format!("{}/.claude/projects", home))?;
+                host.exists().then_some(host)
+            })
+            .collect()
+    }
+
     /// Returns a clone of the mapper of whichever project maps the given
     /// container path, or None if no project owns it. Used by fs commands
     /// (file tree DFS, watcher callback) to remap host paths back to container
@@ -560,6 +577,30 @@ mod tests {
         mgr.register(docker_proj()).await;
         assert_eq!(mgr.project_by_container("dev-box").await.unwrap().container, "dev-box");
         assert!(mgr.project_by_container("nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn extra_claude_dirs_only_when_mounted_and_exists() {
+        let tmp = std::env::temp_dir().join(format!("tok-test-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".claude/projects")).unwrap();
+        let mgr = BackendManager::default();
+        mgr.register(DockerProject {
+            container: "c1".into(),
+            mapper: PathMapper::new(vec![MountEntry {
+                source: tmp.to_string_lossy().into(), destination: "/root".into() }]),
+            home: Some("/root".into()),
+        }).await;
+        // 家目录挂载且 host 侧存在 → 收集
+        assert_eq!(mgr.extra_claude_projects_dirs().await,
+            vec![tmp.join(".claude/projects")]);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn extra_claude_dirs_empty_when_unmounted() {
+        let mgr = BackendManager::default();
+        mgr.register(docker_proj()).await; // home=/root 未在挂载表
+        assert!(mgr.extra_claude_projects_dirs().await.is_empty());
     }
 
     #[tokio::test]

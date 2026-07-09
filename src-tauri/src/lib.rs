@@ -1501,10 +1501,32 @@ mod provider_capability_tests {
     }
 }
 
+/// All roots to scan for Claude CLI session history: the host
+/// `~/.claude/projects` first (may not exist — scanners tolerate that), then
+/// any bind-mounted container project dirs surfaced by the backend manager.
+async fn claude_projects_dirs(
+    backends: &docker_backend::BackendManager,
+) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".claude").join("projects"));
+    }
+    roots.extend(backends.extra_claude_projects_dirs().await);
+    roots
+}
+
 /// Find the JSONL file for a given session UUID by scanning ~/.claude/projects/*/.
 /// Returns the path if found, None otherwise.
 /// Validates that session_id looks like a UUID to prevent path traversal.
-fn find_session_jsonl(session_id: &str) -> Option<std::path::PathBuf> {
+///
+/// `extra_roots` lets callers with access to the docker `BackendManager` also
+/// search bind-mounted container history dirs; sync callers without state pass
+/// `&[]` (host-only, unchanged behaviour). The host `~/.claude/projects` is
+/// always searched first, then each extra root in order — first hit wins.
+fn find_session_jsonl(
+    session_id: &str,
+    extra_roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
     // Reject non-UUID session IDs to prevent path traversal (e.g. "../../../etc/passwd")
     if uuid::Uuid::parse_str(session_id).is_err() {
         eprintln!(
@@ -1514,19 +1536,24 @@ fn find_session_jsonl(session_id: &str) -> Option<std::path::PathBuf> {
         return None;
     }
 
-    let home = dirs::home_dir()?;
-    let claude_projects = home.join(".claude").join("projects");
-    if !claude_projects.exists() {
-        return None;
-    }
-
     let target_filename = format!("{}.jsonl", session_id);
-    if let Ok(entries) = std::fs::read_dir(&claude_projects) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                let candidate = entry.path().join(&target_filename);
-                if candidate.exists() {
-                    return Some(candidate);
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".claude").join("projects"));
+    }
+    roots.extend(extra_roots.iter().cloned());
+
+    for claude_projects in &roots {
+        if !claude_projects.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(claude_projects) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let candidate = entry.path().join(&target_filename);
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
                 }
             }
         }
@@ -1542,10 +1569,13 @@ fn find_session_jsonl(session_id: &str) -> Option<std::path::PathBuf> {
 /// Returns Ok(blocks_stripped) on success, or Err with a description on failure.
 /// The caller should NOT block the session resume on failure — let the auto-retry
 /// path handle it as a safety net.
-fn strip_thinking_blocks_from_session(session_id: &str) -> Result<usize, String> {
+fn strip_thinking_blocks_from_session(
+    session_id: &str,
+    extra_roots: &[std::path::PathBuf],
+) -> Result<usize, String> {
     use std::io::{BufRead, Write};
 
-    let jsonl_path = find_session_jsonl(session_id)
+    let jsonl_path = find_session_jsonl(session_id, extra_roots)
         .ok_or_else(|| format!("Session JSONL not found for id: {}", session_id))?;
 
     eprintln!(
@@ -1853,7 +1883,8 @@ async fn start_claude_session(
     // The auto-retry path in useStreamProcessor.ts will catch any remaining errors.
     if params.model_switch.unwrap_or(false) {
         if let Some(ref resume_id) = params.resume_session_id {
-            match strip_thinking_blocks_from_session(resume_id) {
+            let extra_roots = backends.extra_claude_projects_dirs().await;
+            match strip_thinking_blocks_from_session(resume_id, &extra_roots) {
                 Ok(n) => eprintln!("[TOKENICODE] model_switch: stripped {} thinking blocks before resume", n),
                 Err(e) => eprintln!("[TOKENICODE] model_switch: thinking-block strip failed ({}), attempting resume anyway", e),
             }
@@ -2917,7 +2948,7 @@ fn tracked_sessions_path() -> std::path::PathBuf {
 /// Load the set of tracked session IDs.
 /// If the tracking file is missing or empty, rebuild from ~/.claude/projects/
 /// to recover from index loss (e.g., after update, disk issue, new machine).
-fn load_tracked_sessions() -> std::collections::HashSet<String> {
+fn load_tracked_sessions(extra_roots: &[std::path::PathBuf]) -> std::collections::HashSet<String> {
     use std::io::BufRead;
     let path = tracked_sessions_path();
     let mut set = std::collections::HashSet::new();
@@ -2936,8 +2967,10 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
     // missing do we fall back to importing all sessions (better than losing data).
     if set.is_empty() {
         if let Some(home) = dirs::home_dir() {
-            let claude_projects = home.join(".claude").join("projects");
-            if !claude_projects.exists() {
+            // Scan the host projects dir first, then any mounted container dirs.
+            let mut roots = vec![home.join(".claude").join("projects")];
+            roots.extend(extra_roots.iter().cloned());
+            if !roots.iter().any(|r| r.exists()) {
                 return set;
             }
 
@@ -2955,7 +2988,8 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
                     })
                 });
 
-            if let Ok(entries) = std::fs::read_dir(&claude_projects) {
+            for claude_projects in &roots {
+            if let Ok(entries) = std::fs::read_dir(claude_projects) {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         if let Ok(files) = std::fs::read_dir(entry.path()) {
@@ -2980,6 +3014,7 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
                         }
                     }
                 }
+            }
             }
             if !set.is_empty() {
                 if let Some(parent) = path.parent() {
@@ -3064,7 +3099,11 @@ fn cleanup_tracked_sessions() {
 
 /// Delete a session: remove from tracking file and delete the .jsonl file
 #[tauri::command]
-async fn delete_session(session_id: String, session_path: String) -> Result<(), String> {
+async fn delete_session(
+    backends: State<'_, docker_backend::BackendManager>,
+    session_id: String,
+    session_path: String,
+) -> Result<(), String> {
     // Remove from tracking file
     let track_path = tracked_sessions_path();
     if track_path.exists() {
@@ -3092,9 +3131,13 @@ async fn delete_session(session_id: String, session_path: String) -> Result<(), 
             let canonical = target
                 .canonicalize()
                 .map_err(|e| format!("Failed to canonicalize path: {}", e))?;
+            // Allow the host `~/.claude/projects/` plus any bind-mounted container
+            // history dir (so docker sessions surfaced by list_sessions can be
+            // deleted). Everything else is refused to prevent path traversal.
             let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-            let allowed_dir = home.join(".claude").join("projects");
-            if !canonical.starts_with(&allowed_dir) {
+            let mut allowed = vec![home.join(".claude").join("projects")];
+            allowed.extend(backends.extra_claude_projects_dirs().await);
+            if !allowed.iter().any(|dir| canonical.starts_with(dir)) {
                 return Err(format!(
                     "Refusing to delete file outside ~/.claude/projects/: {:?}",
                     canonical
@@ -3108,19 +3151,22 @@ async fn delete_session(session_id: String, session_path: String) -> Result<(), 
 }
 
 #[tauri::command]
-async fn list_sessions() -> Result<Vec<Value>, String> {
-    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-    let claude_dir = home.join(".claude").join("projects");
+async fn list_sessions(
+    backends: State<'_, docker_backend::BackendManager>,
+) -> Result<Vec<Value>, String> {
+    // Host `~/.claude/projects` first, then any mounted container history dirs.
+    let roots = claude_projects_dirs(&backends).await;
 
-    if !claude_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    // Only show sessions tracked by TOKENICODE
-    let tracked = load_tracked_sessions();
+    // Only show sessions tracked by TOKENICODE. The rebuild fallback also scans
+    // mounted container dirs (roots[1..]) so docker history can be recovered.
+    let tracked = load_tracked_sessions(&roots[1.min(roots.len())..]);
 
     let mut sessions = vec![];
-    if let Ok(entries) = std::fs::read_dir(&claude_dir) {
+    for claude_dir in &roots {
+        if !claude_dir.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(claude_dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 if let Ok(files) = std::fs::read_dir(entry.path()) {
@@ -3169,6 +3215,7 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
                 }
             }
         }
+        }
     }
 
     // Sort by modified time, newest first
@@ -3184,24 +3231,27 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
 /// Search across tracked session JSONL files for a query string.
 /// Returns matching sessions with snippets, sorted by match_count descending (max 50).
 #[tauri::command]
-async fn search_sessions(query: String) -> Result<Vec<Value>, String> {
+async fn search_sessions(
+    backends: State<'_, docker_backend::BackendManager>,
+    query: String,
+) -> Result<Vec<Value>, String> {
     if query.len() < 2 {
         return Ok(vec![]);
     }
 
-    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-    let claude_dir = home.join(".claude").join("projects");
+    // Host `~/.claude/projects` first, then any mounted container history dirs.
+    let roots = claude_projects_dirs(&backends).await;
 
-    if !claude_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let tracked = load_tracked_sessions();
+    let tracked = load_tracked_sessions(&roots[1.min(roots.len())..]);
     let query_lower = query.to_lowercase();
 
     let mut results: Vec<Value> = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(&claude_dir) {
+    for claude_dir in &roots {
+        if !claude_dir.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(claude_dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 if let Ok(files) = std::fs::read_dir(entry.path()) {
@@ -3221,6 +3271,7 @@ async fn search_sessions(query: String) -> Result<Vec<Value>, String> {
                     }
                 }
             }
+        }
         }
     }
 
@@ -4139,6 +4190,29 @@ async fn docker_preflight(container: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the given container's `~/.claude/projects` is readable from the host,
+/// i.e. its home directory is bind-mounted and the projects dir exists on disk.
+/// The frontend shows a "history unavailable" hint for docker projects where
+/// this is false (Task 7). `--resume` is unaffected — the in-container CLI reads
+/// its own history regardless.
+#[tauri::command]
+async fn docker_history_available(
+    backends: State<'_, docker_backend::BackendManager>,
+    container: String,
+) -> Result<bool, String> {
+    let proj = match backends.project_by_container(&container).await {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let available = proj
+        .home
+        .as_deref()
+        .and_then(|home| proj.mapper.to_host(&format!("{}/.claude/projects", home)))
+        .map(|host| host.exists())
+        .unwrap_or(false);
+    Ok(available)
+}
+
 #[tauri::command]
 async fn read_file_tree(
     path_access: State<'_, PathAccessManager>,
@@ -4559,17 +4633,19 @@ async fn export_session_json(path: String, output_path: String) -> Result<(), St
 
 /// List recent projects by scanning ~/.claude/projects/ directory names
 #[tauri::command]
-async fn list_recent_projects() -> Result<Vec<Value>, String> {
-    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
-    let projects_dir = home.join(".claude").join("projects");
-
-    if !projects_dir.exists() {
-        return Ok(vec![]);
-    }
+async fn list_recent_projects(
+    backends: State<'_, docker_backend::BackendManager>,
+) -> Result<Vec<Value>, String> {
+    // Host `~/.claude/projects` first, then any mounted container history dirs.
+    let roots = claude_projects_dirs(&backends).await;
 
     let mut projects: HashMap<String, u64> = HashMap::new();
 
-    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+    for projects_dir in &roots {
+        if !projects_dir.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(projects_dir) {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 let dir_name = entry.file_name().to_string_lossy().to_string();
@@ -4592,11 +4668,16 @@ async fn list_recent_projects() -> Result<Vec<Value>, String> {
                     }
                 }
 
-                // Only include if the actual directory exists
-                if std::path::Path::new(&actual_path).exists() {
+                // Only include if the actual directory exists. `actual_path` may be
+                // a container path (e.g. /workspace); translate it to its host
+                // path via the backend mapper before probing so mounted docker
+                // projects are recognised. Local paths pass through unchanged.
+                let host_path = backends.to_host_or_passthrough(&actual_path).await;
+                if host_path.exists() {
                     projects.insert(actual_path.clone(), latest);
                 }
             }
+        }
         }
     }
 
@@ -8439,6 +8520,7 @@ pub fn run() {
             list_docker_containers,
             connect_docker_project,
             docker_preflight,
+            docker_history_available,
             start_claude_session,
             send_stdin,
             send_raw_stdin,
