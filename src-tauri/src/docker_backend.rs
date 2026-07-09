@@ -269,6 +269,27 @@ pub fn parse_pid_marker(line: &str) -> Option<u32> {
     line.trim().strip_prefix("__TOKENICODE_PID__")?.parse().ok()
 }
 
+/// Return a copy of `args` with env values redacted: any element that follows a
+/// `-e` flag has the part after the first `=` replaced with `***`, keeping the
+/// KEY name (e.g. `A=secret` → `A=***`). Non-env args pass through unchanged.
+pub fn redact_env_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut prev_was_e = false;
+    for arg in args {
+        if prev_was_e {
+            if let Some((key, _)) = arg.split_once('=') {
+                out.push(format!("{}=***", key));
+            } else {
+                out.push(arg.clone());
+            }
+        } else {
+            out.push(arg.clone());
+        }
+        prev_was_e = arg == "-e";
+    }
+    out
+}
+
 /// Run `docker <args>` and capture stdout; Err carries a stderr summary.
 pub async fn docker_capture(args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("docker")
@@ -509,6 +530,22 @@ mod tests {
         // Empty env → script is the final arg (index 7): exec -i -w /w c sh -c <script>.
         // (Brief's literal `args[9]` assumed the one-env-var layout; corrected here.)
         assert!(spec.args[7].contains(r#"'it'\''s'"#));
+    }
+
+    #[test]
+    fn redact_env_args_masks_env_values() {
+        let args: Vec<String> =
+            ["exec", "-e", "A=secret", "c"].iter().map(|s| s.to_string()).collect();
+        let redacted = redact_env_args(&args);
+        assert_eq!(
+            redacted,
+            vec![
+                "exec".to_string(),
+                "-e".to_string(),
+                "A=***".to_string(),
+                "c".to_string()
+            ]
+        );
     }
 
     #[test]

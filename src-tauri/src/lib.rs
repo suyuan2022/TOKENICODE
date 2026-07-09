@@ -2094,7 +2094,8 @@ async fn start_claude_session(
         );
         eprintln!(
             "[TOKENICODE] docker exec spawn: container={} args={:?}",
-            proj.container, &spec.args
+            proj.container,
+            docker_backend::redact_env_args(&spec.args)
         );
         Command::new(&spec.program)
             .args(&spec.args)
