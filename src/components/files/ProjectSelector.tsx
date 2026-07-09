@@ -1,8 +1,9 @@
-import { useEffect, useCallback } from 'react';
+import { useEffect, useCallback, useState } from 'react';
 import { useFileStore } from '../../stores/fileStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useT } from '../../lib/i18n';
+import { DockerConnectDialog } from './DockerConnectDialog';
 
 /**
  * One-time project selector shown before a project is chosen.
@@ -13,6 +14,7 @@ export function ProjectSelector() {
   const setWorkingDirectory = useSettingsStore((s) => s.setWorkingDirectory);
   const recentProjects = useFileStore((s) => s.recentProjects);
   const fetchProjects = useFileStore((s) => s.fetchRecentProjects);
+  const [dockerOpen, setDockerOpen] = useState(false);
 
   useEffect(() => {
     fetchProjects();
@@ -48,6 +50,19 @@ export function ProjectSelector() {
         {t('project.selectBtn')}
       </button>
 
+      {/* Connect Docker container chip */}
+      <button
+        onClick={() => setDockerOpen(true)}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5
+          rounded-lg border border-dashed border-border-subtle
+          text-xs text-text-tertiary
+          hover:border-accent hover:text-accent
+          hover:bg-accent/5 transition-smooth"
+      >
+        <span aria-hidden className="flex-shrink-0">🐳</span>
+        {t('docker.connectBtn')}
+      </button>
+
       {/* Recent project chips */}
       {recentProjects.slice(0, 4).map((project) => (
         <button
@@ -67,6 +82,8 @@ export function ProjectSelector() {
           {project.name}
         </button>
       ))}
+
+      <DockerConnectDialog open={dockerOpen} onClose={() => setDockerOpen(false)} />
     </div>
   );
 }

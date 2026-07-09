@@ -164,6 +164,22 @@ const messages: Record<Locale, Record<string, string>> = {
     'project.directoryMissing': '项目文件夹已被移动或删除，请重新选择',
     'project.reselect': '重新选择',
 
+    // Docker container connect
+    'docker.connectBtn': '连接 Docker 容器',
+    'docker.title': '连接 Docker 容器',
+    'docker.noContainers': '没有正在运行的容器',
+    'docker.notInstalled': '未检测到 Docker，请先安装并启动 Docker。',
+    'docker.notRunning': '容器未在运行',
+    'docker.startContainer': '启动容器',
+    'docker.notMounted': '该路径未挂载到宿主机，无法访问。',
+    'docker.claudeMissing': '容器内未找到 claude 命令，请先在容器中安装 Claude CLI。',
+    'docker.historyUnavailable': '容器会话历史不可用（主目录未挂载）。',
+    'docker.pickMount': '选择要打开的挂载目录',
+    'docker.badge': 'Docker 容器',
+    'docker.connecting': '连接中...',
+    'docker.refresh': '刷新',
+    'docker.back': '返回',
+
     // Error classification
     'error.technicalSummary': '遇到了一个技术问题，通常重试即可解决。',
     'error.showDetails': '查看详情',
@@ -922,6 +938,22 @@ const messages: Record<Locale, Record<string, string>> = {
     'project.selectBtn': 'Select project...',
     'project.directoryMissing': 'Project folder has been moved or deleted. Please select a new one.',
     'project.reselect': 'Reselect',
+
+    // Docker container connect
+    'docker.connectBtn': 'Connect Docker container',
+    'docker.title': 'Connect Docker container',
+    'docker.noContainers': 'No running containers',
+    'docker.notInstalled': 'Docker not detected. Please install and start Docker first.',
+    'docker.notRunning': 'Container is not running',
+    'docker.startContainer': 'Start container',
+    'docker.notMounted': 'This path is not bind-mounted to the host and cannot be accessed.',
+    'docker.claudeMissing': 'The claude command was not found in the container. Please install the Claude CLI inside it.',
+    'docker.historyUnavailable': 'Container session history is unavailable (home directory not mounted).',
+    'docker.pickMount': 'Pick a mounted directory to open',
+    'docker.badge': 'Docker container',
+    'docker.connecting': 'Connecting...',
+    'docker.refresh': 'Refresh',
+    'docker.back': 'Back',
 
     // Error classification
     'error.technicalSummary': 'A technical issue occurred. Retrying usually resolves it.',

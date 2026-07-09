@@ -27,7 +27,33 @@ export interface StartSessionParams {
    *  before resuming. This prevents "invalid thinking signature" 400 errors when switching
    *  to a different model that can't verify the old model's cryptographic signatures. */
   model_switch?: boolean;
+  /** When set, the session runs inside this Docker container (via `docker exec`).
+   *  Maps to the Rust `StartSessionParams.docker_container` serde field. */
+  docker_container?: string;
 }
+
+// --- Docker backend ---
+
+/** A running Docker container as reported by `docker ps`. */
+export interface ContainerSummary {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+}
+
+/** A bind mount of a container (docker inspect .Mounts[] with Type=="bind"). */
+export interface MountEntry {
+  /** Host-side path (.Source) */
+  source: string;
+  /** Container-side path (.Destination) */
+  destination: string;
+}
+
+/** Backend hosting the current working project. */
+export type WorkspaceBackend =
+  | { kind: 'local' }
+  | { kind: 'docker'; container: string; containerCwd: string };
 
 export interface SessionInfo {
   /** Desk-generated process key used as routing/stdin identifier.
@@ -579,6 +605,32 @@ export const bridge = {
 
   /** Check whether FEISHU_* env vars were baked in at build time. */
   feedbackIsConfigured: () => invoke<boolean>('feedback_is_configured'),
+
+  // --- Docker backend ---
+
+  /** List running Docker containers (docker ps). */
+  listDockerContainers: () =>
+    invoke<ContainerSummary[]>('list_docker_containers'),
+
+  /** List a container's bind mounts (docker inspect + parse). */
+  listContainerMounts: (container: string) =>
+    invoke<MountEntry[]>('list_container_mounts', { container }),
+
+  /** Register a docker-backed project rooted at the given container path. */
+  connectDockerProject: (container: string, containerCwd: string) =>
+    invoke<void>('connect_docker_project', { container, containerCwd }),
+
+  /** Verify the container is running and has the `claude` binary installed. */
+  dockerPreflight: (container: string) =>
+    invoke<void>('docker_preflight', { container }),
+
+  /** Whether the container's ~/.claude/projects history is readable from the host. */
+  dockerHistoryAvailable: (container: string) =>
+    invoke<boolean>('docker_history_available', { container }),
+
+  /** Start a stopped container (docker start). */
+  startContainer: (container: string) =>
+    invoke<void>('docker_start', { container }),
 };
 
 /** Metadata collected alongside user feedback for server-side diagnostics.

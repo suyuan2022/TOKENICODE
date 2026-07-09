@@ -339,6 +339,7 @@ export function ChatPanel() {
   const toggleAgentPanel = useSettingsStore((s) => s.toggleAgentPanel);
   const sessionMode = useSettingsStore((s) => s.sessionMode);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
+  const workingBackend = useSettingsStore((s) => s.workingBackend);
   const directoryMissing = useFileStore((s) => s.directoryMissing);
   const activeProvider = useProviderStore((s) => {
     if (!s.activeProviderId) return null;
@@ -496,6 +497,14 @@ export function ChatPanel() {
             <span className="text-[10px] text-text-tertiary truncate max-w-[160px]"
               title={workingDirectory}>
               {workingDirectory.split(/[\\/]/).pop()}
+            </span>
+          )}
+          {workingBackend.kind === 'docker' && (
+            <span
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded
+                text-[10px] text-accent bg-accent/10 flex-shrink-0"
+              title={`${t('docker.badge')}: ${workingBackend.container}`}>
+              🐳 {workingBackend.container}
             </span>
           )}
         </div>

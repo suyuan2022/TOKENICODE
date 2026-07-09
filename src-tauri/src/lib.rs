@@ -4146,6 +4146,20 @@ async fn list_docker_containers() -> Result<Vec<docker_backend::ContainerSummary
     Ok(docker_backend::parse_docker_ps(&out))
 }
 
+/// List a container's bind mounts (docker inspect + parse). Thin wrapper reusing
+/// the Task 2/3 parsing helpers; used by the connect dialog to offer mount roots.
+#[tauri::command]
+async fn list_container_mounts(container: String) -> Result<Vec<docker_backend::MountEntry>, String> {
+    let inspect = docker_backend::docker_capture(&["inspect", &container]).await?;
+    docker_backend::parse_inspect_mounts(&inspect)
+}
+
+/// Start a stopped container (docker start).
+#[tauri::command]
+async fn docker_start(container: String) -> Result<(), String> {
+    docker_backend::docker_capture(&["start", &container]).await.map(|_| ())
+}
+
 #[tauri::command]
 async fn connect_docker_project(
     backends: State<'_, docker_backend::BackendManager>,
@@ -8518,9 +8532,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_docker_containers,
+            list_container_mounts,
             connect_docker_project,
             docker_preflight,
             docker_history_available,
+            docker_start,
             start_claude_session,
             send_stdin,
             send_raw_stdin,

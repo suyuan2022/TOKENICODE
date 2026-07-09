@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { settingsEvents } from '../lib/settingsEvents';
+import type { WorkspaceBackend } from '../lib/tauri-bridge';
 
 // --- Types ---
 
@@ -59,6 +60,8 @@ interface SettingsState {
   secondaryPanelWidth: number;
   settingsOpen: boolean;
   workingDirectory: string;
+  /** Backend hosting the current working project: local filesystem or a Docker container. */
+  workingBackend: WorkspaceBackend;
   wechatWorkspacePath: string;
   selectedModel: string;
   sessionMode: SessionMode;
@@ -104,7 +107,10 @@ interface SettingsState {
   setSecondaryTab: (tab: SecondaryPanelTab) => void;
   setSecondaryPanelWidth: (width: number) => void;
   toggleSettings: () => void;
+  /** Set a local-filesystem working directory; always resets backend to local. */
   setWorkingDirectory: (dir: string) => void;
+  /** Set the working project together with its backend (local or docker). */
+  setWorkingProject: (dir: string, backend: WorkspaceBackend) => void;
   setWechatWorkspacePath: (dir: string) => void;
   setSelectedModel: (model: string) => void;
   setSessionMode: (mode: SessionMode) => void;
@@ -148,6 +154,7 @@ export const useSettingsStore = create<SettingsState>()(
       settingsOpen: false,
       agentPanelOpen: false,
       workingDirectory: '',
+      workingBackend: { kind: 'local' },
       wechatWorkspacePath: '',
       selectedModel: 'claude-sonnet-4-6',
       sessionMode: 'bypass',
@@ -202,7 +209,10 @@ export const useSettingsStore = create<SettingsState>()(
         })),
 
       setWorkingDirectory: (dir) =>
-        set(() => ({ workingDirectory: dir })),
+        set(() => ({ workingDirectory: dir, workingBackend: { kind: 'local' } })),
+
+      setWorkingProject: (dir, backend) =>
+        set(() => ({ workingDirectory: dir, workingBackend: backend })),
 
       setWechatWorkspacePath: (dir) =>
         set(() => ({ wechatWorkspacePath: dir.trim() })),
@@ -340,6 +350,7 @@ export const useSettingsStore = create<SettingsState>()(
         sidebarOpen: state.sidebarOpen,
         secondaryPanelWidth: state.secondaryPanelWidth,
         // workingDirectory intentionally NOT persisted — app starts at WelcomeScreen
+        workingBackend: state.workingBackend,
         selectedModel: state.selectedModel,
         sessionMode: state.sessionMode,
         locale: state.locale,
